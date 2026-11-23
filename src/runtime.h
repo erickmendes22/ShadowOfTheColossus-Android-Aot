@@ -98,6 +98,8 @@ void runtime_mp3_reset(Mp3Decoder *decoder);
 int runtime_mp3_decode(Mp3Decoder *decoder, const unsigned char *data, int size, float *pcm, int max_samples, int *channels);
 uintptr_t runtime_videodec_resolve(const char *name);
 uintptr_t runtime_audio_resolve(const char *name);
+uintptr_t runtime_ngs2_resolve(const char *name);
+int runtime_ngs2_native(void);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
