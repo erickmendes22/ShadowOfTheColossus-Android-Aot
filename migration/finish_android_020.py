@@ -44,6 +44,17 @@ assert "AjncSystem e colaboradores" in (ROOT/ui).read_text()
 assert "EU 1.01" not in (ROOT/ui).read_text()
 assert "ContentScale.Fit" in (ROOT/ui).read_text()
 assert 'versionCode = 20000' in (ROOT/"android-launcher/app/build.gradle.kts").read_text()
+# Retain source-drift tests but bind expectations to the 0.2.0 UI and version.
+oldtest=(ROOT/"tests/test_sotc_ux_074.py").read_text()
+newtest=(oldtest.replace("Sotc074","Sotc020")
+    .replace("0.1.74","0.2.0")
+    .replace("10074","20000")
+    .replace("0.2.0-video-aot-hud-icons","0.2.0")
+    .replace('manifestPlaceholders["appLabel"] = "Shadow of the Colossus"',
+             'manifestPlaceholders["appLabel"] = "Shadow of the Colossus Android"')
+    .replace("ContentScale.Crop","ContentScale.Fit"))
+(ROOT/"tests/test_sotc_ux_020.py").write_text(newtest)
+assert 'versionName = "0.2.0"' in newtest
 assert (ROOT/"LICENSE").is_file()
 assert (ROOT/"AGENTS.md").is_file()
 print("PASS Android AOT 0.2.0 metadata, both CUSA 1.00, compact original artwork and credits")
