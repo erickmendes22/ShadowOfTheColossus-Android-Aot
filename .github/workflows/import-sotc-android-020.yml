@@ -1,0 +1,80 @@
+name: Import Shadow of the Colossus Android AOT source into dedicated fork
+on:
+  push:
+    branches: [feature/android-aot-0.2.0]
+    paths:
+      - '.github/workflows/import-sotc-android-020.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: sotc-android-aot-020-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout NEW fork
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+      - name: Import tested Android 0.1.74 source (NO game data or secrets)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth=1 --single-branch --branch feature/sotc-074-display-aot-icons-hud \
+            https://github.com/erickmendes22/gow3_android_daedalus_fork.git /tmp/old-sotc-aot
+          # Keep the new repository's dedicated README, license, credits,
+          # import script and workflow while copying every source component
+          # needed to reproduce the working ARM64 native Android 0.1.74 port.
+          rsync -a \
+            --exclude='/.git/' \
+            --exclude='/migration/' \
+            --exclude='/README.md' \
+            --exclude='/README.en.md' \
+            --exclude='/README.pt-BR.md' \
+            --exclude='/CREDITS.md' \
+            --exclude='/LICENSE' \
+            --exclude='/.github/workflows/' \
+            /tmp/old-sotc-aot/ ./
+          mkdir -p .github/workflows
+          cp /tmp/old-sotc-aot/.github/workflows/sotc-074-fast-apk.yml \
+             .github/workflows/sotc-074-fast-apk.yml
+          # The source tree contains neither eboot.bin nor signing private key;
+          # deliberately exclude all prebuilt APK files.
+          if find . -type f \( -name '*.apk' -o -name '*.jks' -o -name '*.p12' \) | grep -q .; then
+            echo "Unexpected game/signing artifact in source import" >&2
+            exit 1
+          fi
+          python3 migration/finish_android_020.py
+          python3 -m unittest discover -s tests -p 'test_sotc_ux_020.py' -v
+          python3 -m unittest discover -s tests -p 'test_sotc_low_resolution.py' -v
+          python3 -m py_compile \
+            ports/sotc/android/prepare_game.py \
+            ports/sotc/android/bachata_perf.py \
+            ports/sotc/android/repack_sotc_020.py \
+            ports/sotc/android/vendor_turnip.py
+          bash -n ports/sotc/android/run-sotc-bionic.sh
+          git diff --check
+          test -s LICENSE
+          test -s CREDITS.md
+          test -s android-launcher/app/src/main/java/com/gow3/android/ui/SotcScreen.kt
+          test -s .github/workflows/sotc-020-apk.yml
+          test -s ports/sotc/android/verify_sotc_link.py
+          test -s tools/android/bridges/provenance.json
+      - name: Commit complete verified source to the NEW fork
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Daedalus Android AOT migration'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'Source already imported'
+          else
+            git commit -m 'port(android): migrate native SotC ARM64 AOT sources and UI version 0.2.0'
+            git push origin HEAD:feature/android-aot-0.2.0
+          fi
+          git log -1 --format='%h %s'
