@@ -20,7 +20,7 @@ class SotcAboutCredits020(unittest.TestCase):
     def test_historical_credits_and_runtime_policy_preserved(self):
         credits=read("CREDITS.md")
         self.assertIn("cobrabm12/fexdroid",credits)
-        self.assertIn("sem FEX",credits)
+        self.assertIn("O runtime FEX não é distribuído nem executa o código do jogo neste APK",credits)
         launcher=read("ports/sotc/android/run-sotc-bionic.sh")
         self.assertIn("NO-FEX NO-TSO",launcher)
         self.assertIn("gamehub-dd",launcher)
