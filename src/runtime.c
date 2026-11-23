@@ -305,6 +305,14 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (videodec) return videodec;
     uintptr_t audio = runtime_audio_resolve(legacy);
     if (audio) return audio;
+    /* SotC's NGS2 music/effects engine: the old runtime_sotc.c
+     * returned zeroed PCM by design. Resolve the upstream v0.75+
+     * software mixer before that compatibility stub; never ship
+     * a silent substitute for a working mixer. */
+    if (is_sotc) {
+        uintptr_t ngs2=runtime_ngs2_resolve(legacy);
+        if (ngs2) return ngs2;
+    }
     uintptr_t pad = runtime_pad_resolve(legacy);
     if (pad) return pad;
     uintptr_t rtc = runtime_rtc_resolve(legacy);

@@ -42,6 +42,7 @@ Os patches exigem validação do executável original, inclusive **hash e bytes 
 
 **Execução e desempenho**
 - Compilação AOT **no próprio aparelho** na primeira utilização.
+- **Áudio nativo:** mixer NGS2 embutido, adaptado do port de PC 0.75+ (Oussama268 / HayatoG), com mixagem de música e efeitos sem exigir módulos proprietários do firmware. A saída usa PCM estéreo 48 kHz no Android. A reprodução real depende de teste no aparelho.
 - Cache de perfis AOT: compilações ainda válidas podem ser reutilizadas após atualizar o APK; alterações nos patches, na resolução ou no executável podem exigir nova compilação.
 - Resolução interna **720p, 540p ou 360p**, com apresentação do jogo em 720p.
 - Tela cheia opcional: proporção original ou preenchimento da tela.
