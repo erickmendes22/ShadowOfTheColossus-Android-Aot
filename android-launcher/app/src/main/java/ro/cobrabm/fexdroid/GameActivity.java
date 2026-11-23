@@ -67,6 +67,7 @@ public final class GameActivity extends Activity {
     private boolean framesPollScheduled;
     private View resume;
     private LinearLayout gameSettingsItem, cheatsItem, graphicsItem, controllerItem, swapFaceItem;
+    private LinearLayout sotcResolutionItem, sotcFullscreenItem, sotcHudItem;
     private TouchControllerOverlay controllerOverlay;
     private PadBridge pad;
     private AudioBridge audio;
@@ -314,7 +315,7 @@ public final class GameActivity extends Activity {
             .setTitle(sotcRuntime() ? "Restart Shadow of the Colossus?" : UiText.get(this, "Restart God of War III?")).setMessage(UiText.get(this, "Any unsaved progress will be lost."))
             .setNegativeButton(UiText.get(this, "Cancel"),null).setPositiveButton(UiText.get(this, "Restart"),(dialog,which) -> restartGame()).show());
 
-        section("Graphics");
+        section(sotcRuntime() ? (UiText.portuguese(this) ? "VÍDEO E DESEMPENHO" : "Video & performance") : "Graphics");
         // Graphics 入口只保留运行时真正消费的那几项：upscaler / preset / sharpen / sharpness /
         // show_fps / fps_limit。原来的 CPU 核心（thor_cpus）、特效（effect_*）、模型细节
         // （model_lod）在本仓库启动链路没有消费方，已在 SettingsDialog.show() 里注释掉。
@@ -326,11 +327,17 @@ public final class GameActivity extends Activity {
                 new SettingsDialog(this,new File(BASE,SotcPaths.iniName(this)),this::restartGame).show();
             });
         } else {
-            graphicsItem=menuItem("ic_tune","Shadow of the Colossus patches","Edit patches in launcher",() -> {
-                closeDrawer();
-                android.widget.Toast.makeText(this,
-                    "Change game patches in the launcher's Patches tab.",android.widget.Toast.LENGTH_LONG).show();
-            });
+            final boolean pt=UiText.portuguese(this);
+            sotcResolutionItem=menuItem("ic_tune",
+                pt ? "Resolução interna" : "Internal resolution","",this::chooseSotcResolution);
+            sotcFullscreenItem=menuItem("ic_tune",
+                pt ? "Modo de tela" : "Screen mode","",this::chooseSotcFullscreen);
+            sotcHudItem=menuItem("ic_tune",
+                pt ? "HUD de desempenho" : "Performance HUD","",this::chooseSotcHud);
+            graphicsItem=menuItem("ic_tune",
+                pt ? "Patches do Shadow of the Colossus" : "Shadow of the Colossus patches",
+                pt ? "Alterar e reiniciar com validação AOT" : "Change and restart with AOT validation",
+                this::chooseSotcPatches);
         }
 
         section("Controls");
@@ -421,7 +428,149 @@ public final class GameActivity extends Activity {
     private void restartGame() {
         closeDrawer(); status.setText(sotcRuntime() ? "Restarting Shadow of the Colossus…" : UiText.get(this, "Restarting God of War III…")); status.setVisibility(View.VISIBLE);
         if (!runtimeReady) { startPending(); return; }
+        if (sotcRuntime()) { restartSotcWithAot(); return; }
         worker.execute(() -> { stopGame(); startGame(); });
+    }
+
+    private java.util.Map<String,String> sotcChanges(String key,String value) {
+        java.util.Map<String,String> values=new java.util.LinkedHashMap<>();
+        values.put(key,value);
+        return values;
+    }
+
+    private boolean persistSotcOptions(java.util.Map<String,String> changes) {
+        if (SotcSettingsStore.write(new File(BASE,SotcPaths.iniName(this)),changes)) return true;
+        new AlertDialog.Builder(this)
+            .setMessage(UiText.portuguese(this)
+                ? "Não foi possível salvar as configurações do jogo."
+                : "Could not save the game settings.")
+            .setPositiveButton("OK",null).show();
+        return false;
+    }
+
+    /**
+     * Never start the guest directly after changing AOT inputs. Go through
+     * MainActivity.ensureReadyThen() so the new resolution/patches are checked
+     * against the prepared AOT before starting a new game process.
+     */
+    private void restartSotcWithAot() {
+        if (!sotcRuntime()) return;
+        closeDrawer();
+        status.setText(UiText.portuguese(this)
+            ? "Verificando a compilação ARM64 dos novos ajustes…"
+            : "Verifying ARM64 AOT for updated settings…");
+        status.setVisibility(View.VISIBLE);
+        worker.execute(() -> {
+            stopGame();
+            main.post(() -> {
+                if (destroyed) return;
+                Intent restart=new Intent(this,com.gow3.android.MainActivity.class);
+                restart.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                restart.putExtra("sotc_apply_restart",true);
+                startActivity(restart);
+                finish();
+            });
+        });
+    }
+
+    private void confirmSotcRestart(String description,java.util.Map<String,String> changes) {
+        if (changes.isEmpty()) { closeDrawer(); return; }
+        final boolean pt=UiText.portuguese(this);
+        new AlertDialog.Builder(this)
+            .setTitle(description)
+            .setMessage(pt
+                ? "Aplicar alterações e reiniciar o jogo? O progresso não salvo será perdido. O AOT será validado e só será recompilado se o novo perfil exigir."
+                : "Apply settings and restart the game? Unsaved progress will be lost. AOT will be validated, and recompiled only if the new profile needs it.")
+            .setNegativeButton(pt ? "Cancelar" : "Cancel",null)
+            .setPositiveButton(pt ? "Aplicar e reiniciar" : "Apply and restart",(d,w) -> {
+                if (persistSotcOptions(changes)) restartSotcWithAot();
+            }).show();
+    }
+
+    private void chooseSotcResolution() {
+        final boolean pt=UiText.portuguese(this);
+        final String[] keys={"720p","540p","360p"};
+        final String[] labels={"720p (1280 × 720)","540p (960 × 540)","360p (640 × 360)"};
+        String current=setting("sotc_resolution");
+        int chosen="540p".equals(current)?1:"360p".equals(current)?2:0;
+        new AlertDialog.Builder(this)
+            .setTitle(pt ? "Resolução interna" : "Internal rendering resolution")
+            .setSingleChoiceItems(labels,chosen,(dialog,which) -> {
+                dialog.dismiss();
+                if (keys[which].equals(current==null?"720p":current)) return;
+                confirmSotcRestart(pt ? "Alterar resolução" : "Change resolution",
+                    sotcChanges("sotc_resolution",keys[which]));
+            })
+            .setNegativeButton(pt ? "Cancelar" : "Cancel",null).show();
+    }
+
+    private void chooseSotcPatches() {
+        final boolean pt=UiText.portuguese(this);
+        final String[] keys={"sotc_bachata_bloom","sotc_blur_suppression",
+            "sotc_bachata_ssr","sotc_bachata_fog","sotc_bachata_shadows","sotc_af16"};
+        final String[] labels=pt
+            ? new String[]{"Desativar Bloom","Desativar Motion Blur","Desativar reflexos SSR",
+                "Desativar névoa","Desativar sombras dinâmicas","Filtragem anisotrópica 16×"}
+            : new String[]{"Disable Bloom","Disable Motion Blur","Disable SSR reflections",
+                "Disable fog","Disable dynamic shadows","16× anisotropic filtering"};
+        final boolean[] selected=new boolean[keys.length];
+        final boolean[] original=new boolean[keys.length];
+        for(int i=0;i<keys.length;i++) {
+            String value=setting(keys[i]);
+            boolean on="1".equals(value==null?(i<2?"1":"0"):value);
+            selected[i]=on;
+            original[i]=on;
+        }
+        new AlertDialog.Builder(this)
+            .setTitle(pt?"Patches do jogo":"Game patches")
+            .setMultiChoiceItems(labels,selected,(dialog,which,checked)->selected[which]=checked)
+            .setNegativeButton(pt?"Cancelar":"Cancel",null)
+            .setPositiveButton(pt?"Aplicar":"Apply",(dialog,which)->{
+                java.util.Map<String,String> changes=new java.util.LinkedHashMap<>();
+                for(int i=0;i<keys.length;i++) if(selected[i]!=original[i])
+                    changes.put(keys[i],selected[i]?"1":"0");
+                confirmSotcRestart(pt?"Atualizar patches":"Update patches",changes);
+            }).show();
+    }
+
+    private void chooseSotcFullscreen() {
+        final boolean pt=UiText.portuguese(this);
+        final String[] labels=pt
+            ? new String[]{"Manter proporção 16:9","Preencher a tela"}
+            : new String[]{"Keep 16:9 aspect ratio","Fill entire screen"};
+        final boolean original="1".equals(setting("android_fullscreen"));
+        new AlertDialog.Builder(this)
+            .setTitle(pt?"Modo de tela (aplicação imediata)":"Screen mode (live)")
+            .setSingleChoiceItems(labels,original?1:0,(dialog,which)->{
+                dialog.dismiss();
+                boolean fill=which==1;
+                if(fill==original || !persistSotcOptions(sotcChanges("android_fullscreen",fill?"1":"0")))return;
+                if(bionicRuntime()) Gow3Present.setFullscreen(fill);
+                fitSurface(screen.getWidth(),screen.getHeight());
+                refreshDrawer();
+                closeDrawer();
+            })
+            .setNegativeButton(pt?"Cancelar":"Cancel",null).show();
+    }
+
+    private void chooseSotcHud() {
+        final boolean pt=UiText.portuguese(this);
+        final String[] keys={"full","fps","off"};
+        final String[] labels=pt
+            ? new String[]{"FPS + GPU + CPU","Somente FPS","Ocultar HUD"}
+            : new String[]{"FPS + GPU + CPU","FPS only","Hide HUD"};
+        String previous=setting("sotc_hud_mode");
+        int choice="fps".equals(previous)?1:"off".equals(previous)?2:0;
+        new AlertDialog.Builder(this)
+            .setTitle(pt?"HUD de desempenho (tempo real)":"Performance HUD (live)")
+            .setSingleChoiceItems(labels,choice,(dialog,which)->{
+                dialog.dismiss();
+                if(!persistSotcOptions(sotcChanges("sotc_hud_mode",keys[which])))return;
+                if(sotcFpsHud!=null) sotcFpsHud.setVisibility(which==2?View.GONE:View.VISIBLE);
+                refreshDrawer();
+                closeDrawer();
+            })
+            .setNegativeButton(pt?"Cancelar":"Cancel",null).show();
     }
 
     /** A small gold heading above a group of menu rows. */
@@ -493,8 +642,18 @@ public final class GameActivity extends Activity {
         setDetail(cheatsItem,cheats.isEmpty() ? "Off" : String.join(" · ",cheats));
          */
         if (sotcRuntime()) {
-            setDetail(graphicsItem,UiText.portuguese(this) ?
-                "720p · 30 FPS do jogo · patches no launcher" : "720p · 30 FPS game · patches on launcher");
+            final boolean pt=UiText.portuguese(this);
+            String res=setting("sotc_resolution");
+            setDetail(sotcResolutionItem,res==null?"720p":res);
+            setDetail(sotcFullscreenItem,"1".equals(setting("android_fullscreen"))
+                ? (pt?"Preencher tela":"Fill screen") : (pt?"Manter 16:9":"Keep 16:9"));
+            String hud=setting("sotc_hud_mode");
+            setDetail(sotcHudItem,"off".equals(hud)
+                ? (pt?"Desativada":"Off") : "fps".equals(hud)
+                ? (pt?"Somente FPS":"FPS only") : "FPS + GPU + CPU");
+            setDetail(graphicsItem,pt
+                ? "Patches verificados; reinício AOT quando necessário"
+                : "Verified patches; AOT restart when needed");
             setDetail(controllerItem,controllerEnabled() ? "On" : "Off");
             setDetail(swapFaceItem,getSharedPreferences(SotcPaths.prefsName(this),MODE_PRIVATE).getBoolean("swap_square_triangle",false) ? "On" : "Off");
             return;
