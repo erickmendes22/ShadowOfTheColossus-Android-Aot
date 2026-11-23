@@ -10,7 +10,8 @@ jobs:
   signer:
     runs-on: ubuntu-24.04
     steps:
-      - uses: android-actions/setup-android@v3
+      # Hosted Ubuntu runners already provide command-line Android SDK tools.
+      # Avoid setup-android's deprecated attempt to install the removed 'tools' package.
       - name: Install Android build-tools 35 apksigner library
         shell: bash
         run: |
