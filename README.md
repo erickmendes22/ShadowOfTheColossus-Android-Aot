@@ -56,7 +56,7 @@ Os patches exigem validação do executável original, inclusive **hash e bytes 
 ## Instalação
 
 > [!NOTE]
-> **Ainda não há um Release público do APK assinado neste repositório.** A página [GitHub Actions](../../actions) contém builds de desenvolvimento; os artefatos publicados pelo workflow são **não assinados** e não devem ser confundidos com um APK pronto para atualizar uma instalação existente.
+> **Ainda não há um Release público do APK assinado neste repositório.** A página [GitHub Actions](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/actions) contém builds de desenvolvimento; os artefatos publicados pelo workflow são **não assinados** e não devem ser confundidos com um APK pronto para atualizar uma instalação existente.
 
 1. Utilize um APK **assinado com o mesmo certificado** do aplicativo que já está instalado. Ao atualizar, não desinstale o aplicativo: isso pode apagar saves e caches.
 2. Abra o launcher e selecione a pasta da sua cópia do jogo, contendo `eboot.bin` e `sce_sys/param.sfo`. Alternativamente, use a opção **Instalar PKG** para extrair seu PKG base em uma nova subpasta.
