@@ -252,6 +252,19 @@ public:
     Id vertex_index{};
     Id instance_id{};
     Id push_data_block{};
+    // gow3: object motion vectors (runtime_info.h, MotionVectors).
+    Id motion_out_cur{};
+    Id motion_out_prev{};
+    Id motion_in_cur{};
+    Id motion_in_prev{};
+    Id motion_frag_out{};
+    [[nodiscard]] bool VertexMotion() const {
+        return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
+               runtime_info.hw.vs.motion_vectors && MotionVectors::positions_address != 0;
+    }
+    [[nodiscard]] bool FragmentMotion() const {
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
+    }
     Id base_vertex{};
     Id base_instance{};
     Id frag_coord{};
@@ -307,8 +320,6 @@ public:
         bool is_integer = false;
         bool is_storage = false;
         MipStorageFallbackMode mip_fallback_mode{};
-        /// Descriptor array size (0 = single image), see ImageResource::array_size
-        u32 array_size{};
     };
 
     enum class PointerType : u32 {
@@ -361,7 +372,6 @@ public:
     size_t flatbuf_index{};
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
-    size_t lod_feedback_index{};
     Id physical_pointer_type_u32;
 
     Id sampler_type{};
@@ -395,9 +405,6 @@ public:
     Id read_const{};
     Id read_const_dynamic{};
 
-    /// sotc: void lod_feedback(u32 tsharp_dw2, u32 tsharp_dw3, u32 tsharp_dw6, vec2 uv)
-    Id lod_feedback{};
-
 private:
     void DefineArithmeticTypes();
     void DefineInterfaces();
@@ -422,8 +429,6 @@ private:
     Id DefineGetBdaPointer();
 
     Id DefineReadConst(bool dynamic);
-
-    Id DefineLodFeedback();
 
     Id GetBufferSize(u32 sharp_idx);
 };

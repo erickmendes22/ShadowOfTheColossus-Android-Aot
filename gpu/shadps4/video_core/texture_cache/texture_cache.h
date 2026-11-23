@@ -3,12 +3,18 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include "video_core/texture_cache/readback_queue.h"
+#include "video_core/texture_cache/readback_sources.h"
 #include <chrono>
-#include <condition_variable>
-#include <cstdlib>
-#include <deque>
-#include <unordered_map>
+#include "gow3_toggles.h"
 #include <optional>
+#include <cstdlib>
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -17,10 +23,9 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
-#include "video_core/sotc_stats.h"
-#include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -40,224 +45,21 @@ namespace VideoCore {
 class BufferCache;
 class PageManager;
 
-/// sotc: SOTC_MIP_TAIL: 0 off, 1 mip-tail images for T#s with LOD streaming counters, 2 (default)
-/// for every read-only colour T# whose base_level is above 0 (TextureCache::DecideRebase). Mode 2
-/// left out 2.5 GB of never-sampled mips in the attract demo: peak video memory 6.1 -> 3.3-3.5 GB
-/// on a 6 GB card, frames over 50 ms 150 -> 102-112, the worst streaming frame 460 -> 250-310 ms.
-inline u32 MipTailMode() {
-    static const u32 mode = [] {
-        const char* v = std::getenv("SOTC_MIP_TAIL");
-        return v && (v[0] == '0' || v[0] == '1' || v[0] == '2') ? static_cast<u32>(v[0] - '0')
-                                                                  : 2u;
-    }();
-    return mode;
-}
-
-/// sotc: the texture cache lock, re-entrant on its owner thread. The command processor holds it
-/// over a whole binding pass (Rasterizer::BindTextures, BeginRendering, PrepareRenderState), so the
-/// FindImage and UpdateImage calls inside (two per texture, ~62,000 per frame at the Shrine) only
-/// count their depth. SOTC_TC_BATCH=0 drops the outer holds (every call locks as before).
-///
-/// It is also biased to the command processor (the first thread to take a batch hold): there it
-/// is a plain store and load. Any atomic read-modify-write on that thread waits for its pending
-/// stores to drain (write-combined staging copies among them): the uncontended std::mutex, and
-/// then a spinlock's xchg, each cost ~5% of the thread at ~10,000 holds per frame. Other threads
-/// (guest write faults, ~200 per frame) take a spinlock, announce themselves and run an
-/// asymmetric barrier (FlushProcessWriteBuffers) before waiting for the command processor to
-/// leave: either its store of fast_held is visible to them after the barrier, or its following
-/// load of slow_wants sees theirs. SOTC_TC_BIASED=0: every thread takes the spinlock.
-class alignas(64) ReentrantMutex {
-public:
-    /// Makes the calling thread the biased owner (once).
-    void SetFastThread() {
-        if (!fast_token.load(std::memory_order_relaxed) && Biased() && !HeldByThisThread()) {
-            // Under the spinlock: a thread holding it read fast_token as null and skipped the
-            // announcement, so the biased path must not start before it leaves.
-            RawLock();
-            fast_token.store(Token(), std::memory_order_relaxed);
-            word.store(0, std::memory_order_release);
-        }
-    }
-    void lock() {
-        const void* self = Token();
-        if (owner.load(std::memory_order_relaxed) == self) {
-            ++depth;
-            return;
-        }
-        if (self == fast_token.load(std::memory_order_relaxed)) {
-            if (FastTryAcquire()) {
-                mode = Mode::Fast;
-            } else {
-                RawLock(); // a guest holds it or is waiting for us: queue behind it
-                mode = Mode::FastSlow;
-            }
-        } else {
-            RawLock();
-            AnnounceAndWait();
-            mode = Mode::Slow;
-        }
-        owner.store(self, std::memory_order_relaxed);
-        depth = 1;
-    }
-    bool try_lock() {
-        const void* self = Token();
-        if (owner.load(std::memory_order_relaxed) == self) {
-            ++depth;
-            return true;
-        }
-        if (self == fast_token.load(std::memory_order_relaxed)) {
-            if (!FastTryAcquire()) {
-                return false;
-            }
-            mode = Mode::Fast;
-        } else {
-            if (!RawTryLock()) {
-                return false;
-            }
-            if (!AnnounceAndTry()) {
-                return false;
-            }
-            mode = Mode::Slow;
-        }
-        owner.store(self, std::memory_order_relaxed);
-        depth = 1;
-        return true;
-    }
-    bool HeldByThisThread() const {
-        return owner.load(std::memory_order_relaxed) == Token();
-    }
-    void unlock() {
-        if (--depth != 0) {
-            return;
-        }
-        owner.store(nullptr, std::memory_order_relaxed);
-        switch (mode) {
-        case Mode::Fast:
-            fast_held.store(0, std::memory_order_release);
-            break;
-        case Mode::Slow:
-            slow_wants.store(0, std::memory_order_release);
-            word.store(0, std::memory_order_release);
-            break;
-        case Mode::FastSlow:
-            word.store(0, std::memory_order_release);
-            break;
-        }
-    }
-
-private:
-    enum class Mode : u8 { Fast, Slow, FastSlow };
-
-    static bool Biased() {
-        static const bool on = [] {
-            const char* v = std::getenv("SOTC_TC_BIASED");
-            return !v || v[0] != '0';
-        }();
-        return on;
-    }
-    /// Only the owner stores its own token, and clears it before unlocking, so a thread reads
-    /// its token back exactly while it holds the lock.
-    static const void* Token() {
-        static thread_local char token;
-        return &token;
-    }
-    /// FlushProcessWriteBuffers on Windows, a full fence elsewhere (texture_cache.cpp).
-    static void AsymmetricBarrier();
-    static void Pause(u32& spins) {
-        if (++spins < 4096) {
-            __builtin_ia32_pause();
-        } else {
-            std::this_thread::yield();
-        }
-    }
-    bool FastTryAcquire() {
-        fast_held.store(1, std::memory_order_relaxed);
-#ifdef _WIN32
-        std::atomic_signal_fence(std::memory_order_seq_cst); // the barrier is on the other side
-#else
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-#endif
-        if (slow_wants.load(std::memory_order_acquire) == 0) {
-            return true;
-        }
-        fast_held.store(0, std::memory_order_release);
-        return false;
-    }
-    void AnnounceAndWait() {
-        if (!fast_token.load(std::memory_order_relaxed)) {
-            return; // no biased owner (SOTC_TC_BIASED=0, or before the first batch hold)
-        }
-        slow_wants.store(1, std::memory_order_relaxed);
-        AsymmetricBarrier();
-        for (u32 spins = 0; fast_held.load(std::memory_order_acquire);) {
-            Pause(spins);
-        }
-    }
-    bool AnnounceAndTry() {
-        if (!fast_token.load(std::memory_order_relaxed)) {
-            return true;
-        }
-        slow_wants.store(1, std::memory_order_relaxed);
-        AsymmetricBarrier();
-        if (!fast_held.load(std::memory_order_acquire)) {
-            return true;
-        }
-        slow_wants.store(0, std::memory_order_release);
-        word.store(0, std::memory_order_release);
-        return false;
-    }
-    void RawLock() {
-        if (!word.exchange(1, std::memory_order_acquire)) {
-            return;
-        }
-        for (u32 spins = 0;;) {
-            while (word.load(std::memory_order_relaxed)) {
-                Pause(spins);
-            }
-            if (!word.exchange(1, std::memory_order_acquire)) {
-                return;
-            }
-        }
-    }
-    bool RawTryLock() {
-        return !word.load(std::memory_order_relaxed) &&
-               !word.exchange(1, std::memory_order_acquire);
-    }
-    std::atomic<u32> word{0};       ///< spinlock of the other threads (and of the biased owner
-                                    ///< when it had to queue behind them)
-    std::atomic<u32> slow_wants{0}; ///< a thread holding `word` waits for or holds the lock
-    std::atomic<const void*> fast_token{nullptr};
-    std::atomic<const void*> owner{nullptr};
-    u32 depth = 0;
-    Mode mode = Mode::Fast;
-    alignas(64) std::atomic<u32> fast_held{0}; ///< the biased owner holds it (written by it only)
-};
-
-inline bool TextureLockBatching() {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_TC_BATCH");
-        return !v || v[0] != '0';
-    }();
-    return on;
-}
-
 class TextureCache {
-    // sotc: fallback thresholds when the driver cannot report a memory budget (V14 derives the
-    // normal ones from the budget, see the constructor).
+    // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
-    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB; // sotc: upstream pressure/critical thresholds
+    static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
     struct Traits {
         using Entry = ImageIds;
-        static constexpr size_t ADDRESS_SPACE_BITS = 40;
-        static constexpr size_t L1_BITS = 10;
-        static constexpr size_t PAGE_BITS = 20;
-        static constexpr bool NULL_CHECK = true;
+        static constexpr size_t AddressSpaceBits = 40;
+        static constexpr size_t FirstLevelBits = 10;
+        static constexpr size_t PageBits = 20;
     };
-    using PageTable = Common::MultiLevelPageTable<Traits>;
+    using PageTable = MultiLevelPageTable<Traits>;
 
 public:
     enum class BindingType : u32 {
@@ -272,22 +74,15 @@ public:
         ImageInfo info;
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
-
-        // sotc: mip-tail candidate (SOTC_MIP_TAIL, DecideRebase): the T#'s base_level (0: not a
-        // candidate) and min_lod, whether `info` holds the tail now, and the other info (the
-        // tail while `info` is the full chain, the full chain while `info` is the tail).
-        u8 rebase_mip{};
-        bool rebased_now{};
-        u16 orig_min_lod{};
-        std::optional<ImageInfo> other_info;
+        /// gow3: the shader reads with integer coordinates (ImageResource::needs_native), not
+        /// normalized sampling. Gates ResolveOverlap's partial height views.
+        bool needs_native{true};
 
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {
-            InitMipTail(image, desc);
-        }
-        void InitMipTail(const AmdGpu::Image& image, const Shader::ImageResource& resource);
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture},
+              needs_native{desc.needs_native} {}
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -305,39 +100,40 @@ public:
                  PageManager& tracker);
     ~TextureCache();
 
+    /// gow3: changes whenever an image is registered or unregistered.
+    [[nodiscard]] u64 RegistryGeneration() const noexcept {
+        return registry_generation.load(std::memory_order_acquire);
+    }
+
+    /// gow3: FindImage's access tick for an image found by a memoized lookup. The LRU touch
+    /// FindImage also does happens in UpdateImage (FindTexture), which every binding reaches.
+    void MarkFound(ImageId image_id) {
+        slot_images[image_id].tick_accessed_last = scheduler.CurrentTick();
+    }
+
     TileManager& GetTileManager() noexcept {
         return tile_manager;
     }
 
-    /// sotc: changes when an image is registered/unregistered or a sampler is destroyed, i.e.
-    /// when a previously bound texture descriptor may hold a stale handle (SOTC_FAST_BIND).
-    u64 BindGeneration() const noexcept {
-        return image_set_generation ^
-               (sampler_epoch.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ULL);
-    }
-
-    /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
-    /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
-    /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096
-    /// last used 2 or more ticks ago, level 2 every image not used in the current tick.
-    void EmergencyCollect(u32 level = 0);
-
-    /// sotc: EmergencyCollect, unless this thread is inside RefreshImage (holding `mutex`): then
-    /// the collection is deferred to the next RunGarbageCollector and false is returned.
-    bool TryEmergencyCollect(u32 level);
-
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
 
+    /// gow3 (#138): guest memory written through the backing view (readbacks, buffer
+    /// downloads), which bypasses page tracking. Any lock may be held: images over the range
+    /// are marked CPU-dirty at the next UpdateImage or GC tick (ApplyBackingWrites).
+    void NoteBackingWrite(VAddr address, u64 size);
+
     /// Marks an image as dirty if it exists at the provided address.
-    /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
     /// Schedules a copy of pending images for download back to CPU memory.
     void ProcessDownloadImages();
+    bool ResolveReadbacks(VAddr address, u64 size, bool assume_locks = true,
+                          ReadbackSource source = ReadbackSource::Unknown);
+    void CancelReadbacks(VAddr address, u64 size);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -345,106 +141,80 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// gow3: a FindView result remembered by the caller for the same image and view info.
+    struct ViewMemo {
+        ImageId image_id{};
+        const void* backing = nullptr;
+        ImageViewId view_id{};
+    };
+
     /// Retrieves an image view with the properties of the specified image id.
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
-
-    /// sotc: FindTexture from the parts of the descriptor it reads (the draw bind memo keeps only
-    /// those, not the ImageInfo).
-    [[nodiscard]] ImageView& FindTexture(ImageId image_id, BindingType type,
-                                         const ImageViewInfo& view_info);
-
-    /// sotc: what FindImage does for an image it found by memo: marks it used this tick. For
-    /// callers that already know the image (Rasterizer draw bind memo).
-    void NoteFound(Image& image);
-
-    /// sotc: true when `image_id` (what FindImage returned for `desc`) covers exactly the guest
-    /// range the descriptor asks for, i.e. FindImage matched it as a whole and not as a part of a
-    /// larger image or after an overlap was resolved.
-    [[nodiscard]] bool FoundExactly(ImageId image_id, const ImageDesc& desc) const {
-        const ImageInfo& found = slot_images[image_id].info;
-        const ImageInfo& asked = desc.info;
-        return found.guest_address == asked.guest_address &&
-               found.guest_size == asked.guest_size && found.size == asked.size;
-    }
-
-    /// sotc: the image with this id, without the LRU touch GetImage does (callers that touch it
-    /// otherwise: NoteFound, UpdateImage).
-    [[nodiscard]] Image& PeekImage(ImageId id) {
-        return slot_images[id];
-    }
-
-    /// sotc: moves on every RegisterImage/UnregisterImage: while it stays, a lookup that found an
-    /// image for the same descriptor finds it again (see the draw bind memo, vk_rasterizer.cpp).
-    [[nodiscard]] u64 ImageSetGeneration() const noexcept {
-        return image_set_generation;
-    }
-
-    /// sotc: FindImage's own per-address generation (MemoGeneration): moves when an image is
-    /// registered or unregistered at `address`. While it stays, a lookup that matched an image
-    /// exactly at `address` matches it again.
-    [[nodiscard]] u64 FindGeneration(VAddr address) const {
-        return MemoGeneration(address);
-    }
+    /// `refresh` false: an image found out of date is used as is (the texture binding helper
+    /// checked it beforehand; only a guest write racing with the draw can make it so).
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc,
+                                         ViewMemo* memo = nullptr, bool refresh = true);
 
     /// Retrieves the render target with specified properties
-    /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
-    /// caller has just run it and the image needs no upload or re-tracking since.
-    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
-                                              bool update = true);
-
-    /// sotc: holds the cache lock over a binding pass (ReentrantMutex); empty with
-    /// SOTC_TC_BATCH=0.
-    [[nodiscard]] std::unique_lock<ReentrantMutex> BatchLock() {
-        mutex.SetFastThread();
-        if (!TextureLockBatching()) {
-            return {};
-        }
-        std::unique_lock lk{mutex, std::defer_lock};
-        LockCounted(lk);
-        return lk;
-    }
-
-    /// sotc: locks `mutex`, counting contention (SOTC_CMD_STATS, SOTC sys line).
-    static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
-        if (SotcStats::kCmdStats && !lk.mutex()->HeldByThisThread()) {
-            SotcStats::sys_tc_locks.fetch_add(1, std::memory_order_relaxed);
-            if (lk.try_lock()) return;
-            SotcStats::sys_tc_contended.fetch_add(1, std::memory_order_relaxed);
-            const auto start = std::chrono::steady_clock::now();
-            lk.lock();
-            SotcStats::sys_tc_wait_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start).count(),
-                std::memory_order_relaxed);
-            return;
-        }
-        lk.lock();
-    }
+    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
+    /// gow3: whether UpdateImage has nothing to do for this image (its fast path).
+    [[nodiscard]] bool IsUpToDate(ImageId image_id) const {
+        const Image& image = slot_images[image_id];
+        const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
+                              .load(std::memory_order_acquire);
+        constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
+        constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
+        constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
+        return (flags & (Dirty | Registered | Aliased)) == Registered &&
+               !has_backing_writes.load(std::memory_order_acquire) &&
+               image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
+               image.lru_touched_tick == gc_tick;
+    }
+
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::unique_lock lk{mutex, std::defer_lock};
-        {
-            const SotcStats::SplitTimer lock_split{SotcStats::SplitTexLock};
-            LockCounted(lk);
+        // gow3: a clean image already tracked and touched in this GC period needs nothing.
+        // Every texture binding comes here; the mutex (shared with the fault handlers of the
+        // guest threads) was ~3% of the GPU thread. Flags are read atomically: an invalidation
+        // racing with this check races the same way with the locked path.
+        if (!Gow3Toggle::Disabled(Gow3Toggle::UpdateImageFastPath)) {
+            const Image& image = slot_images[image_id];
+            const u32 flags = std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(image.flags)))
+                                  .load(std::memory_order_acquire);
+            constexpr u32 Dirty = static_cast<u32>(ImageFlagBits::Dirty);
+            constexpr u32 Registered = static_cast<u32>(ImageFlagBits::Registered);
+            // Images sharing memory with another take the locked path: SynchronizeAlias.
+            constexpr u32 Aliased = static_cast<u32>(ImageFlagBits::Aliased);
+            if ((flags & (Dirty | Registered | Aliased)) == Registered &&
+                !has_backing_writes.load(std::memory_order_acquire) &&
+                image.track_addr == image.guest_begin && image.track_addr_end == image.guest_end &&
+                image.lru_touched_tick == gc_tick) {
+                return;
+            }
         }
+        std::scoped_lock lock{mutex};
+        ApplyBackingWrites();
         Image& image = slot_images[image_id];
-        {
-            const SotcStats::SplitTimer track_split{SotcStats::SplitTexTrack};
-            TrackImage(image_id);
-        }
+        TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        SynchronizeAlias(image_id);
     }
+
+    /// gow3: a GPU write to the image (render target, storage): images sharing its memory
+    /// copy from it before their next read. From cuesta4/shadPS4 (eltutz), which fixed God of
+    /// War III's exposure: it is measured into a small image and read through an alias.
+    void PublishAliasWrite(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
                                                                BindingType binding,
                                                                ImageId cache_img_id,
-                                                               ImageId merged_image_id);
+                                                               ImageId merged_image_id,
+                                                               bool native_reads);
 
     /// Resolves depth overlap and either re-creates the image or returns existing one
     [[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested_info, BindingType binding,
@@ -457,32 +227,21 @@ public:
     void RefreshImage(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
+    /// extra_lod_bias: gow3, added to the S#'s bias (reduced scene rendering).
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth);
+                                         bool is_depth, float extra_lod_bias = 0.0f);
 
     /// Retrieves the image with the specified id.
+    Image* TryGetImage(ImageId id, u64 uid) {
+        if (!slot_images.is_allocated(id)) return nullptr;
+        auto& image = slot_images[id];
+        return !uid || image.image_uid == uid ? &image : nullptr;
+    }
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
-        // sotc: the LRU is only safe under `mutex`: unlocked, a guest unmap can unregister the
-        // image (freeing its LRU node) between TouchImage's Registered check and the touch. Calls
-        // outside a batch hold skip it; the locked FindImage/UpdateImage of a bound image touch it.
-        if (mutex.HeldByThisThread()) {
-            TouchImage(image);
-        }
+        TouchImage(image);
         return image;
-    }
-
-    /// sotc: the image with this id if it is still the registered image `uid`, else nullptr.
-    [[nodiscard]] Image* TryGetImage(ImageId id, u64 uid) {
-        if (!id || !slot_images.is_allocated(id)) {
-            return nullptr;
-        }
-        auto& image = slot_images[id];
-        if (image.image_uid != uid || !(image.flags & ImageFlagBits::Registered)) {
-            return nullptr;
-        }
-        return &image;
     }
 
     /// Retrieves the image view with the specified id.
@@ -531,26 +290,11 @@ public:
         return false;
     }
 
-    /// sotc: IsMetaCleared + TouchMeta(address, slice, false) with a single lookup
-    /// (SOTC_RT_FAST): returns the old clear bit of the slice (false when the address is not a
-    /// metadata surface, like IsMetaCleared) and clears it.
-    bool TestAndTouchMeta(VAddr address, u32 slice) {
-        auto it = surface_metas.find(address);
-        if (it == surface_metas.end()) {
-            return false;
-        }
-        auto& clear_mask = it.value().clear_mask;
-        const bool was_clear = (clear_mask & (1u << slice)) != 0;
-        clear_mask &= ~(1u << slice);
-        return was_clear;
-    }
-
     /// Clears all slices of the specified metadata surface.
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             it.value().clear_mask = u32(-1);
-            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
             return true;
         }
         return false;
@@ -562,58 +306,12 @@ public:
         if (it != surface_metas.end()) {
             if (is_clear) {
                 it.value().clear_mask |= 1u << slice;
-                meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
             } else {
                 it.value().clear_mask &= ~(1u << slice);
             }
             return true;
         }
         return false;
-    }
-
-    /// sotc: BbToggle::DepthFastPath. Moves whenever a metadata surface (HTile/CMask/FMask entry)
-    /// is added, removed or gets a clear bit set; while it stays, the clear bit TestAndTouchMeta
-    /// left cleared for a slice is still clear and a missing entry is still missing.
-    [[nodiscard]] u64 MetaEpoch() const noexcept {
-        return meta_epoch.load(std::memory_order_relaxed);
-    }
-    /// sotc: the stencil image FindDepthTarget linked to the depth target of its last call (and
-    /// touched in the LRU), or the null id.
-    [[nodiscard]] ImageId LastDepthStencil() const noexcept {
-        return last_depth_stencil_id;
-    }
-    /// sotc: SOTC_DEPTHFAST_VERIFY: the tick an image was last touched in the LRU with (0 when it
-    /// has no LRU node), and the clear mask of a metadata surface (0 when there is none).
-    [[nodiscard]] u64 LruTickOf(ImageId id) {
-        const Image& image = slot_images[id];
-        return True(image.flags & ImageFlagBits::Registered) ? lru_cache.TickOf(image.lru_id) : 0;
-    }
-    [[nodiscard]] u32 MetaClearMask(VAddr address) const {
-        const auto it = surface_metas.find(address);
-        return it != surface_metas.end() ? it->second.clear_mask : 0;
-    }
-    /// sotc: BbToggle::GBufferFastPath. True when FindRenderTarget(image) has no side effect that
-    /// a repeated call would have to redo (its download_images queueing, only for linear or
-    /// narrow images under readback_linear_images).
-    [[nodiscard]] bool RenderTargetReplayable(const Image& image) const noexcept {
-        return !readback_linear_images ||
-               (image.info.props.is_tiled && image.info.size.width > 8);
-    }
-    /// sotc: the LRU touch FindDepthTarget gives the stencil image it links, for a caller that
-    /// replays the call (needs the batch hold like GetImage).
-    void TouchLinked(ImageId id) {
-        if (id) {
-            TouchImage(slot_images[id]);
-        }
-    }
-    /// sotc: UpdateImage(image_id) apart from its LRU touch changes nothing: the image is not
-    /// Dirty (RefreshImage returns at once) and is tracked over its whole range (TrackImage
-    /// returns at once). The same test FindRenderTarget(update=false) makes.
-    [[nodiscard]] static bool UpdateIsNoop(const Image& image) noexcept {
-        return False(image.flags & ImageFlagBits::Dirty) && image.info.num_samples <= 1 &&
-               (False(image.flags & ImageFlagBits::Registered) ||
-                (image.track_addr == image.info.guest_address &&
-                 image.track_addr_end == image.info.guest_address + image.info.guest_size));
     }
 
     /// Runs the garbage collector.
@@ -660,18 +358,13 @@ public:
         }
     }
 
-    /// sotc: SOTC_RB_TEX_WATCH=1: a GPU readback about to be written over a block-compressed
-    /// texture the GPU never wrote (a material texture) is logged: the colour garbage after loads.
-    static bool ReadbackWatchEnabled();
-    void NoteReadbackOverTexture(VAddr addr, u64 size, bool hot);
-
 private:
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
         static constexpr bool RETURNS_BOOL = std::is_same_v<std::invoke_result<Func, u64>, bool>;
-        const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
-        for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+        const u64 page_end = (addr + size - 1) >> Traits::PageBits;
+        for (u64 page = addr >> Traits::PageBits; page <= page_end; ++page) {
             if constexpr (RETURNS_BOOL) {
                 if (func(page)) {
                     break;
@@ -685,15 +378,14 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
-public:
-    /// Diagnostic (SOTC_DUMP): copies every layer/slice of mip 0 to a raw file once the GPU is done.
-    void DumpImage(ImageId image_id, const std::filesystem::path& path);
-
-    /// sotc: SOTC_TEX_DUMP=1 saves each small sampled texture once (user/texdump), keyed by the
-    /// hash of its guest bytes, to find the game's controller glyphs.
-    void SotcGlyphHook(Image& image);
-
-private:
+    /// gow3: a recorded image-to-staging copy, written to guest memory after a GPU wait.
+    struct PendingDownload {
+        VAddr guest_address;
+        u32 size;
+        Vulkan::StagingBufferRef staging;
+    };
+    /// Records the copy of a GPU-modified image into a deferred staging allocation.
+    std::optional<PendingDownload> RecordImageDownload(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -726,48 +418,15 @@ private:
     void TouchImage(const Image& image);
 
     void FreeImage(ImageId image_id) {
+        const auto& image = slot_images[image_id];
+        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
+                         ReadbackSource::ImageFree);
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
     }
 
-    /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
-    /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
-    void ParkImage(ImageId image_id);
-    void UnparkImage(ImageId image_id);
-    /// sotc: SOTC_RT_STASH. The game's transient allocator places render targets of one frame in
-    /// the same memory, so a target's next use finds another image there and each frame freed and
-    /// recreated the same targets. Stash: FreeImage for such an image, keeping its Vulkan objects
-    /// parked. Take: the parked image with exactly this layout, as new, or nothing.
-    void StashOrFreeImage(ImageId image_id);
-    ImageId TakeStashedImage(const ImageInfo& info);
-    void ClearImageStash();
-    void ReclaimImage(ImageId image_id);
-
     void GarbageCollectImages();
-
-    /// sotc: ColdImageSweep (MEMORIA-PLAN.md), see the definitions.
-    /// The newest gc_tick whose wall time is at least `seconds` ago; false when the cache has not
-    /// run that long.
-
-    /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
-    void Census();
-    /// sotc: SOTC_POOL_WATCH=1: logs game page pool pages freed under images still in use.
-    void PoolWatch();
-    static bool PoolWatchEnabled();
-    /// sotc: SOTC_POOL_FREEZE=1: images the game freed pool pages under while drawing them keep
-    /// their uploaded contents for SOTC_POOL_FREEZE_TICKS (T51).
-    void PoolFreeze();
-    /// sotc: SOTC_POOL_WATCH: an image the game freed pages under is looked up again (drawn).
-    void PoolWatchLookup(ImageId image_id, const Image& image, const ImageViewInfo& view);
-
-    /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
-    bool IsSafeToDelete(const Image& image) const;
-    bool DecideRebase(ImageDesc& desc, bool exact_fmt);
-    void MipTailCreated(ImageId image_id, const ImageDesc& desc);
-    void FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& counter);
-    /// First GPU write of a target or storage image (FindTexture/RenderTarget/DepthTarget).
-    void MarkWritten(Image& image);
     void GarbageCollectSamplers();
 
 private:
@@ -781,11 +440,11 @@ private:
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
-    std::vector<ImageId> image_stash; ///< sotc: oldest first, see StashOrFreeImage
-    u64 image_stash_bytes = 0;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
+    u64 gc_evictions = 0, gc_downloads = 0; ///< gow3: pressure report
+    std::chrono::steady_clock::time_point gc_report_time{};
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
@@ -796,70 +455,117 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
-    /// sotc: (gc_tick, wall time) about once a second, newest last: the LRU counts submits, the
-    /// cold sweep and the idle census need seconds.
-    struct TickMark {
-        u64 tick;
-        std::chrono::steady_clock::time_point time;
-    };
-    std::deque<TickMark> tick_marks;
-    std::chrono::steady_clock::time_point next_sweep{};
-    std::chrono::steady_clock::time_point next_mem_census{};
-    /// sotc: guest address -> (time, host bytes) of the images the cold sweep freed, to count the
-    /// ones that came back.
-    struct SweptImage {
-        std::chrono::steady_clock::time_point time;
-        u64 bytes;
-    };
-    std::unordered_map<VAddr, SweptImage> swept_images;
     const bool readback_linear_images;
-    PageTable page_table;
-    /// sotc: images registered per page_table page (1 MiB), read without the lock by
-    /// InvalidateMemory (guest write faults).
-    static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
-    std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
-    ReentrantMutex mutex;
-    /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
-    static inline thread_local u32 refresh_depth = 0;
-    /// sotc: deferred EmergencyCollect level + 1 (0: none).
-    std::atomic<u32> pending_emergency{0};
-    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered
-    /// (a mip-tail image's also while gpu_modified_epoch stays). `writer`: stored by a writer
-    /// lookup (with mip tails on, writers only take those).
-    struct FindMemo {
-        VAddr guest_address{};
-        u64 guest_size{};
-        Extent3D size{};
-        vk::Format pixel_format{};
-        AmdGpu::ImageType type{};
-        bool exact_fmt{};
-        bool writer{};
-        u64 generation{~0ULL};
-        ImageId image_id{};
-        u64 gpu_epoch{};
-        u64 image_uid{}; ///< sotc: the image the slot held when memoized (slots are reused)
+    const bool deferred_readbacks = [] {
+        const char* value = std::getenv("GOW3_DEFERRED_READBACK");
+        return value && value[0] == '1';
+    }();
+    /// gow3: GOW3_STALE_READBACK=1 (needs deferred readbacks). A pending copy only blocks CPU
+    /// writes: CPU reads see the version the GPU published last (one frame late) instead of
+    /// waiting for the GPU. Writes still wait, so no byte is lost.
+    const bool stale_readbacks = deferred_readbacks && [] {
+        const char* value = std::getenv("GOW3_STALE_READBACK");
+        return value && value[0] == '1';
+    }();
+    template <bool track>
+    void WatchReadback(VAddr address, u64 size);
+    struct ReadbackImageStat {
+        VAddr address;
+        u32 width, height, bits, copies, cpu_accesses;
+        vk::Format format;
+        u64 Bytes() const { return u64{width} * height * bits / 8; }
     };
-    static constexpr size_t NumFindMemos = 1024;
-    std::array<FindMemo, NumFindMemos> find_memos{};
-    FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);
-    /// The memoized perfect match for a lookup, or none (SOTC_FIND_MEMO=0: always none).
-    ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);
-    /// The generation a memo for `address` is valid in (per-address unless SOTC_MEMO_ADDR_GEN=0).
-    u64 MemoGeneration(VAddr address) const;
-    u64 image_set_generation{};
-    std::atomic<u64> meta_epoch{0};  ///< sotc: see MetaEpoch
-    ImageId last_depth_stencil_id{}; ///< sotc: see LastDepthStencil
-    /// sotc: per-address generations for FindMemo. A perfect match needs the same
-    /// guest_address, so only (un)registering an image at that address can change the
-    /// result; bumped in RegisterImage/UnregisterImage at the image's guest_address.
-    static constexpr size_t NumAddrGens = 4096;
-    std::array<u32, NumAddrGens> addr_gens{};
-    static size_t AddrGenSlot(VAddr addr) {
-        return static_cast<size_t>((u64{addr >> 8} * 0x9E3779B97F4A7C15ULL) >> 52);
+    std::array<ReadbackImageStat, 16> readback_images{};
+    /// gow3 (GOW3_PERF_DIAG): images FindImage had to create, by request, and the image that was
+    /// cached at that memory before (none: nothing overlapped). Printed with the readback report.
+    struct CreateStat {
+        VAddr address;
+        u32 width, height, count;
+        vk::Format format;
+        BindingType binding;
+        const char* reason;
+        VAddr prev_address;
+        u32 prev_width, prev_height, overlaps;
+        vk::Format prev_format;
+        u32 pitch, tile, prev_pitch, prev_tile;
+        bool needs_native;
+    };
+    std::array<CreateStat, 16> create_stats{};
+    u64 images_created = 0;
+    std::chrono::steady_clock::time_point create_report = std::chrono::steady_clock::now();
+    void ReportImageCreates();
+    /// gow3 (GOW3_PERF_DIAG): requests answered by Gow3Toggle::PartialHeightViews.
+    struct PartialViewStat {
+        VAddr address;
+        vk::Format format, used_format;
+        u32 used_width, used_height, min_height, max_height, count;
+        BindingType binding;
+    };
+    std::array<PartialViewStat, 16> partial_view_stats{};
+    u64 partial_views = 0;
+    void NotePartialView(const ImageInfo& request, const ImageInfo& used, BindingType binding);
+    u64 readbacks_released = 0;
+    ReadbackQueue<Vulkan::StagingBufferRef> pending_readbacks;
+    std::mutex readback_mutex;
+    std::atomic<bool> has_pending_readbacks{false};
+    u64 readbacks_queued = 0, readbacks_completed = 0, readbacks_waited = 0;
+    u64 readbacks_canceled = 0, readbacks_peak_bytes = 0;
+    std::chrono::steady_clock::time_point readback_report = std::chrono::steady_clock::now();
+    ReadbackSourceStats readback_sources;
+    void RetireReadbacks();
+    PageTable page_table;
+    std::mutex mutex;
+    /// gow3 (#138): under `mutex`. GPU-modified images hold the written data themselves.
+    void ApplyBackingWrites();
+    std::mutex backing_writes_mutex;
+    std::vector<std::pair<VAddr, u64>> backing_writes;
+    std::atomic<bool> has_backing_writes{false};
+    /// gow3: images with the same guest address (guarded by `mutex`). `backing` holds the
+    /// complete contents; `writer` is a newer write not yet copied into it.
+    struct AliasState {
+        u64 backing_uid{};
+        u64 writer_uid{};
+        ImageId backing{};
+        ImageId writer{};
+        u32 members{};
+        void ResetAuthority() {
+            const u32 count = members;
+            *this = {};
+            members = count;
+        }
+    };
+    tsl::robin_map<VAddr, AliasState> alias_states;
+    std::atomic<u64> alias_generation{};
+    [[nodiscard]] bool IsLiveImage(ImageId image_id, u64 image_uid) const {
+        return image_id && slot_images.is_allocated(image_id) &&
+               slot_images[image_id].image_uid == image_uid;
     }
+    template <typename Func>
+    void ForEachAlias(const Image& image, Func&& func);
+    void SynchronizeAlias(ImageId image_id);
+    [[nodiscard]] bool CommitAliasWriter(AliasState& state);
+    void CopyAlias(ImageId src_id, ImageId dst_id, const Extent3D& extent);
+    void InvalidateAlias(Image& image);
+    // gow3: FindImage results for unchanged image registrations (guarded by `mutex`).
+    struct FindImageCacheEntry {
+        VAddr address = 0;
+        u64 size = 0;
+        Extent3D extent{};
+        vk::Format format{};
+        AmdGpu::ImageType type{};
+        bool exact_fmt = false;
+        BindingType binding{};
+        bool needs_native = true;
+        u32 levels = 0;
+        u32 layers = 0;
+        u64 generation = ~0ULL;
+        ImageId image_id{};
+        int view_mip = -1;
+        int view_slice = -1;
+    };
+    std::array<FindImageCacheEntry, 1024> find_image_cache{};
+    std::atomic<u64> registry_generation{0};
     std::mutex samplers_mutex;
-    // sotc: bumped whenever a sampler is erased (GetSampler's per-thread memo).
-    std::atomic<u64> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

@@ -1,13 +1,16 @@
-#ifndef BB_RUNTIME_H
-#define BB_RUNTIME_H
+#ifndef GOW3_RUNTIME_H
+#define GOW3_RUNTIME_H
+#ifdef __ANDROID__
+#define GOW3_NO_SDL 1
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #ifdef _WIN32
 #include "compat_win.h"
-/* No signals on Windows: the exception handler resumes the thread in bb_longjmp
- * (gpu/shim/bbport_toggles.h uses the same buffer type). */
-typedef bb_jmp_buf sigjmp_buf;
-#define sigsetjmp(buffer, save) bb_setjmp(buffer)
+/* No signals on Windows: the exception handler resumes the thread in gow3_longjmp
+ * (gpu/shim/gow3_toggles.h uses the same buffer type). */
+typedef gow3_jmp_buf sigjmp_buf;
+#define sigsetjmp(buffer, save) gow3_setjmp(buffer)
 #else
 #include <setjmp.h>
 #endif
@@ -15,10 +18,18 @@ typedef bb_jmp_buf sigjmp_buf;
 extern __thread sigjmp_buf *runtime_fault_recover;
 /* Restarts the game (in-game settings menu, render resolution change). */
 void runtime_restart(void);
+/* The guest's calling convention for host functions it calls. Elsewhere than x86-64 the guest CPU
+ * (guest_cpu.h) converts guest calls to the host's convention. */
+#if defined(__x86_64__)
 #define ABI __attribute__((sysv_abi))
+#else
+#define ABI
+#endif
 typedef void (ABI *GuestCallback)(void);
 void runtime_start(uint64_t capabilities);
 uintptr_t runtime_resolve(const char *name, int is_data);
+/* Convert SotC numeric module scopes to the legacy HLE key; returns NULL for invalid NIDs. */
+const char *runtime_sotc_legacy_import(const char *scoped, char fallback[64]);
 void runtime_report(void);
 void runtime_finalize(void *dso);
 uintptr_t runtime_mutex_resolve(const char *name);
@@ -43,7 +54,6 @@ void runtime_sema_report(void);
 unsigned runtime_sema_waiters(uint32_t id);
 uintptr_t runtime_time_resolve(const char *name);
 void runtime_content_configure(const uint32_t values[5]);
-void runtime_content_title(const char *id);
 uintptr_t runtime_content_resolve(const char *name);
 void runtime_content_report(void);
 typedef struct { const char *name; void *function; } RuntimeExport;
@@ -51,8 +61,6 @@ typedef struct { const char *name; void *function; } RuntimeExport;
 const char *runtime_symbol(const char *nid);
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
 uintptr_t runtime_kernel_resolve(const char *name);
-/* sceKernelReadTsc/GetTscFrequency read QPC instead of the TSC (cores out of step). */
-void runtime_tsc_use_qpc(void);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
 void runtime_file_report(void);
@@ -77,23 +85,30 @@ void *runtime_low_map(size_t size, int prot);
 void runtime_memory_reserve(void);
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
+/* AjmDecMp3ParseFrame (guest layout). */
+typedef struct {
+    uint64_t frame_size;
+    uint32_t num_channels, samples_per_channel, bitrate, sample_rate, encoder_delay, num_frames, total_samples, ofl_type;
+} Mp3Frame;
+typedef struct Mp3Decoder Mp3Decoder;
+int runtime_mp3_parse(const unsigned char *data, uint32_t size, int parse_ofl, int layer3_only, Mp3Frame *frame);
+Mp3Decoder *runtime_mp3_open(void);
+void runtime_mp3_close(Mp3Decoder *decoder);
+void runtime_mp3_reset(Mp3Decoder *decoder);
+int runtime_mp3_decode(Mp3Decoder *decoder, const unsigned char *data, int size, float *pcm, int max_samples, int *channels);
+uintptr_t runtime_videodec_resolve(const char *name);
 uintptr_t runtime_audio_resolve(const char *name);
 void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
-uintptr_t runtime_sotc_resolve(const char *name);
-/* sotc: software libSceNgs2 (runtime_ngs2.c, from HayatoG/tlg_pc); SOTC_NGS2=native turns it off. */
-uintptr_t runtime_ngs2_resolve(const char *name);
-int runtime_ngs2_native(void);
-void *runtime_ngs2_function(const char *symbol);
-int runtime_thread_is_guest(void);
-uintptr_t runtime_fiber_resolve(const char *name);
-void runtime_fiber_thread_exit(void);
-void runtime_fiber_report(void);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
+/* OrbisSaveDataParam (1328 bytes) of a save directory of the current title. */
+#define RUNTIME_SAVE_PARAM_SIZE 1328
+int runtime_savedata_param(int32_t user, const char *dir, void *param);
+int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
 void runtime_thread_attach_host(const char *name);
 #endif

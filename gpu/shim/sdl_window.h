@@ -1,4 +1,4 @@
-// bbport: the game window. Created by the VideoOut driver on first open; the
+// gow3: the game window. Created by the VideoOut driver on first open; the
 // event pump runs on the port's window thread (see window.cpp).
 #pragma once
 #include <atomic>
@@ -19,6 +19,22 @@ struct WindowSystemInfo {
     WindowSystemType type = WindowSystemType::Headless;
 };
 
+#ifdef __ANDROID__
+class WindowSDL {
+public:
+    WindowSDL(s32 width, s32 height, const char* title);
+    s32 GetWidth() const { return width.load(std::memory_order_relaxed); }
+    s32 GetHeight() const { return height.load(std::memory_order_relaxed); }
+    WindowSystemInfo GetWindowInfo() const { return window_info; }
+    bool IsOpen() const { return true; }
+    bool PollEvents();
+    void BeginTextInput(const std::string& initial, const std::string& prompt);
+    int PollTextInput(std::string& text);
+private:
+    std::atomic<s32> width, height;
+    WindowSystemInfo window_info{};
+};
+#else
 class WindowSDL {
 public:
     WindowSDL(s32 width, s32 height, const char* title);
@@ -28,8 +44,6 @@ public:
     SDL_Window* GetSDLWindow() const { return window; }
     WindowSystemInfo GetWindowInfo() const { return window_info; }
     bool IsOpen() const { return is_open.load(std::memory_order_relaxed); }
-    void SetFullscreen(bool fs);
-    bool IsFullscreen() const;
     /// Processes pending window events. Returns false once the user closed the window.
     bool PollEvents();
     /// Keyboard text entry for the system IME dialog; typed text shows in the title bar.
@@ -38,19 +52,23 @@ public:
     int PollTextInput(std::string& text);
 
 private:
+    /// Hides the OS cursor while the touch overlay mouse is off (overlay_mouse=0), so the game
+    /// picture shows no stuck X11 pointer. Called every frame; only toggles on state changes.
+    void UpdateCursor();
     std::atomic<s32> width, height;
     std::atomic<bool> is_open{true};
     std::mutex text_mutex;
     bool text_requested{}, text_active{};
+    bool cursor_hidden{}; ///< OS cursor visibility applied last (window thread)
+    int display_mode = -1; ///< applied Gow3Settings display mode (window thread)
+    void ApplyDisplayMode(int mode);
     int text_state{};
     std::string text, text_prompt, base_title;
-    std::string title_suffix; ///< sotc: " · v01.01 · 60 FPS" (game version and frame rate)
-    u64 title_flips{};
-    u64 title_ticks{};
-    void UpdateTitleStats();
     void UpdateTextTitle();
     SDL_Window* window{};
     WindowSystemInfo window_info{};
 };
+
+#endif
 
 } // namespace Frontend

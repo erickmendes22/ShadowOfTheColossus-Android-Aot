@@ -1,6 +1,7 @@
 //  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "gow3_graphics.h"
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fsr_easu_comp.h"
@@ -129,85 +130,13 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
     }
 }
 
-vk::ImageView FsrPass::Sharpen(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D size,
-                               float attenuation) {
-    if (size != cur_size) {
-        ResizeAndInvalidate(size.width, size.height);
-    }
-    auto& img = available_imgs[cur_image];
-    if (++cur_image >= available_imgs.size()) {
-        cur_image = 0;
-    }
-    if (img.dirty) {
-        CreateImages(img);
-    }
-
-    constexpr vk::ImageSubresourceRange simple_subresource = {
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .levelCount = 1,
-        .layerCount = 1,
-    };
-    const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::PipelineStageFlags2 src,
-                             vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst,
-                             vk::AccessFlags2 dst_access) {
-        const vk::ImageMemoryBarrier2 b{
-            .srcStageMask = src,
-            .srcAccessMask = src_access,
-            .dstStageMask = dst,
-            .dstAccessMask = dst_access,
-            .oldLayout = from,
-            .newLayout = to,
-            .image = img.output_image,
-            .subresourceRange = simple_subresource,
-        };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
-    };
-    barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
-            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
-            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite);
-
-    FSRConstants consts{};
-    FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), attenuation);
-    std::array<vk::DescriptorImageInfo, 3> img_info{{
-        {.imageView = input, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal},
-        {.imageView = img.output_image_view.get(), .imageLayout = vk::ImageLayout::eGeneral},
-        {.sampler = sampler.get()},
-    }};
-    std::array<vk::WriteDescriptorSet, 3> set_writes{{
-        {.dstBinding = 0,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eSampledImage,
-         .pImageInfo = &img_info[0]},
-        {.dstBinding = 1,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eStorageImage,
-         .pImageInfo = &img_info[1]},
-        {.dstBinding = 2,
-         .descriptorCount = 1,
-         .descriptorType = vk::DescriptorType::eSampler,
-         .pImageInfo = &img_info[2]},
-    }};
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rcas_pipeline.get());
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline_layout.get(), 0,
-                                set_writes);
-    cmdbuf.pushConstants(pipeline_layout.get(), vk::ShaderStageFlagBits::eCompute, 0,
-                         sizeof(FSRConstants), &consts);
-    cmdbuf.dispatch((size.width + 15) / 16, (size.height + 15) / 16, 1);
-
-    barrier(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
-            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
-            vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
-    return img.output_image_view.get();
-}
-
 vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                               vk::Extent2D input_size, vk::Extent2D output_size, Settings settings,
                               bool hdr) {
-    if (!settings.enable) {
-        DebugState.is_using_fsr = false;
-        return input;
-    }
-    if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
+    // gow3: FSR 1 upscales when the window is larger; RCAS alone also runs at the same size.
+    if (!Gow3Graphics::FsrPassRuns(settings.enable, settings.use_rcas, int(input_size.width),
+                                   int(input_size.height), int(output_size.width),
+                                   int(output_size.height))) {
         DebugState.is_using_fsr = false;
         return input;
     }
@@ -266,7 +195,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height),
                static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height), (AF1)width,
                (AF1)height);
-    consts.Sample[0] = 0; // sotc: not squared for HDR, see the rcas pass
+    consts.Sample[0] = hdr && !settings.use_rcas ? 1 : 0;
 
     if (settings.use_rcas) {
 
@@ -344,9 +273,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         { // rcas
             consts = {};
             FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
-            // sotc: no squaring of the output for HDR (AMD's sample assumes gamma 2 input); the game's
-            // HDR buffer is PQ encoded and squaring it made the picture far too dark.
-            consts.Sample[0] = 0;
+            consts.Sample[0] = hdr ? 1 : 0;
 
             std::array<vk::DescriptorImageInfo, 3> img_info{{
                 {

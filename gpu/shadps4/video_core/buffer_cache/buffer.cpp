@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <array>
+#include <cstdlib>
 #include <numeric>
+#include <string_view>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -32,12 +35,50 @@ std::string_view BufferTypeName(MemoryType type) {
     }
 }
 
+/// gow3: where the stream buffer lives (GOW3_STREAM_MEMORY). Every draw copies its small
+/// read-only buffers from guest memory into it on the Vulkan recording thread. "device"
+/// (shadPS4's choice) is VRAM written through the PCIe BAR: cheap with AMD Smart Access Memory
+/// on a desktop, but on a laptop NVIDIA GPU these writes took half of that thread's time and
+/// limited the frame rate. "cached" is cached system memory the GPU reads over PCIe instead;
+/// "host" is uncached system memory. The default follows the vendor: NVIDIA benefits from
+/// "cached", AMD keeps "device" (UMA / discrete SAM) unless overridden.
+enum class StreamPlacement { Device, Host, Cached };
+static StreamPlacement StreamMemory() {
+    static const StreamPlacement placement = [] {
+        const char* env = std::getenv("GOW3_STREAM_MEMORY");
+        StreamPlacement placement;
+        if (env) {
+            const std::string_view value = env;
+            placement = value == "device"  ? StreamPlacement::Device
+                        : value == "host"  ? StreamPlacement::Host
+                                           : StreamPlacement::Cached;
+        } else {
+            // PCI vendor ID 0x10DE is NVIDIA; everything else keeps shadPS4's device placement.
+            placement =
+                Gow3GpuVendorId() == 0x10DE ? StreamPlacement::Cached : StreamPlacement::Device;
+        }
+        LOG_INFO(Render_Vulkan, "Stream buffers: {} memory{}",
+                 placement == StreamPlacement::Device    ? "device-local"
+                 : placement == StreamPlacement::Cached  ? "cached host"
+                                                         : "uncached host",
+                 env ? " (GOW3_STREAM_MEMORY)" : " (vendor default)");
+        return placement;
+    }();
+    return placement;
+}
+
 [[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
+        return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
     return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                                            : VkMemoryPropertyFlagBits{};
 }
 
 [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
+        return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    }
     switch (type) {
     case MemoryType::HostUncached:
     case MemoryType::Stream:
@@ -52,6 +93,9 @@ std::string_view BufferTypeName(MemoryType type) {
 }
 
 [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() != StreamPlacement::Device) {
+        return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    }
     switch (type) {
     case MemoryType::DeviceLocal:
     case MemoryType::Stream:
@@ -102,29 +146,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-            // Same as images: going over the video memory budget beats aborting.
-            VmaAllocationCreateInfo over_budget_ci = alloc_ci;
-            over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci,
-                                     &unsafe_buffer, &allocation, out_alloc_info);
-        }
-        if (result != VK_SUCCESS) {
-            const VkPhysicalDeviceMemoryProperties* props{};
-            vmaGetMemoryProperties(allocator, &props);
-            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
-            vmaGetHeapBudgets(allocator, budgets.data());
-            for (u32 heap = 0; heap < props->memoryHeapCount; ++heap) {
-                LOG_CRITICAL(Render, "Heap {} ({}): usage {} MB, budget {} MB, ours {} MB", heap,
-                             props->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-                                 ? "video"
-                                 : "system",
-                             budgets[heap].usage >> 20, budgets[heap].budget >> 20,
-                             budgets[heap].statistics.blockBytes >> 20);
-            }
-        }
-        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating {} buffer of {} KB with error {}",
-                   BufferTypeName(mem_type), buffer_ci.size >> 10,
+        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
     } else {
@@ -144,13 +166,13 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
 }
 
 Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
-               MemoryType mem_type_, std::string_view debug_name)
+               MemoryType mem_type_, std::string_view debug_name, vk::BufferUsageFlags usage)
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
-        .usage = AllFlags,
+        .usage = usage,
         .sharingMode = vk::SharingMode::eExclusive,
     };
     VmaAllocationInfo alloc_info{};
@@ -221,7 +243,6 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
         offset = 0;
-        ++wrap_generation;
 
         // Swap watches and reset waiting cursors.
         std::swap(previous_watches, current_watches);

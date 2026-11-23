@@ -3,19 +3,29 @@
 
 #pragma once
 
-
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <span>
+#include <source_location>
+#include <utility>
+#include <vector>
 #include <mutex>
 #include <thread>
 #include <queue>
 
+#include "gow3_toggles.h"
+#include "common/assert.h"
 #include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
-#include "vulkan/vulkan.hpp"
 
 namespace tracy {
 class VkCtxScope;
@@ -24,7 +34,6 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
-class CommandRecorder;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -64,21 +73,10 @@ struct SubmitInfo {
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
-    /// sotc: the stage each wait blocks (by default the first two as before: all commands, then
-    /// color attachment output). SOTC_CULL_QUEUE passes all commands for its own waits.
-    std::array<vk::PipelineStageFlags, 4> wait_stages{
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eColorAttachmentOutput,
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands};
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
-    }
-
-    /// sotc: a wait that blocks every command of the submission.
-    void AddWaitAll(vk::Semaphore semaphore, u64 tick) {
-        wait_stages[num_wait_semas] = vk::PipelineStageFlagBits::eAllCommands;
-        AddWait(semaphore, tick);
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
@@ -177,18 +175,230 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
-    /// Commits the dynamic state to the provided command buffer.
+    /// Commits the dynamic state to the provided command buffer (a null one only clears the
+    /// flags that committing clears).
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
+
+    /// gow3: passes each dirty state change to `emit` as a small command closure holding only
+    /// its own values (recording a copy of the whole state per draw was a hot spot), and clears
+    /// the flags it emitted. Flags whose test is disabled stay dirty, as in Commit.
+    template <typename Emit>
+    void CommitWith(bool depth_bounds_supported, bool color_write_mask_supported,
+                    bool feedback_loop_supported, Emit&& emit) {
+        using Face = vk::StencilFaceFlagBits;
+        if (dirty_state.viewports) {
+            dirty_state.viewports = false;
+            emit([v = viewports](vk::CommandBuffer c) { c.setViewportWithCount(v); });
+        }
+        if (dirty_state.scissors) {
+            dirty_state.scissors = false;
+            emit([v = scissors](vk::CommandBuffer c) { c.setScissorWithCount(v); });
+        }
+        if (dirty_state.depth_test_enabled) {
+            dirty_state.depth_test_enabled = false;
+            emit([v = depth_test_enabled](vk::CommandBuffer c) { c.setDepthTestEnable(v); });
+        }
+        if (dirty_state.depth_write_enabled) {
+            // Must be set in a command buffer even if depth test is disabled.
+            dirty_state.depth_write_enabled = false;
+            emit([v = depth_write_enabled](vk::CommandBuffer c) { c.setDepthWriteEnable(v); });
+        }
+        if (depth_test_enabled && dirty_state.depth_compare_op) {
+            dirty_state.depth_compare_op = false;
+            emit([v = depth_compare_op](vk::CommandBuffer c) { c.setDepthCompareOp(v); });
+        }
+        if (dirty_state.depth_bounds_test_enabled) {
+            dirty_state.depth_bounds_test_enabled = false;
+            if (depth_bounds_supported) {
+                emit([v = depth_bounds_test_enabled](vk::CommandBuffer c) {
+                    c.setDepthBoundsTestEnable(v);
+                });
+            }
+        }
+        if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
+            dirty_state.depth_bounds = false;
+            if (depth_bounds_supported) {
+                emit([lo = depth_bounds_min, hi = depth_bounds_max](vk::CommandBuffer c) {
+                    c.setDepthBounds(lo, hi);
+                });
+            }
+        }
+        if (dirty_state.depth_bias_enabled) {
+            dirty_state.depth_bias_enabled = false;
+            emit([v = depth_bias_enabled](vk::CommandBuffer c) { c.setDepthBiasEnable(v); });
+        }
+        if (depth_bias_enabled && dirty_state.depth_bias) {
+            dirty_state.depth_bias = false;
+            emit([k = depth_bias_constant, clamp = depth_bias_clamp,
+                  slope = depth_bias_slope](vk::CommandBuffer c) { c.setDepthBias(k, clamp, slope); });
+        }
+        if (dirty_state.stencil_test_enabled) {
+            dirty_state.stencil_test_enabled = false;
+            emit([v = stencil_test_enabled](vk::CommandBuffer c) { c.setStencilTestEnable(v); });
+        }
+        if (stencil_test_enabled) {
+            const auto ops = [&](Face face, const StencilOps& o) {
+                emit([face, o](vk::CommandBuffer c) {
+                    c.setStencilOp(face, o.fail_op, o.pass_op, o.depth_fail_op, o.compare_op);
+                });
+            };
+            if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
+                stencil_front_ops == stencil_back_ops) {
+                ops(Face::eFrontAndBack, stencil_front_ops);
+            } else {
+                if (dirty_state.stencil_front_ops) {
+                    ops(Face::eFront, stencil_front_ops);
+                }
+                if (dirty_state.stencil_back_ops) {
+                    ops(Face::eBack, stencil_back_ops);
+                }
+            }
+            dirty_state.stencil_front_ops = dirty_state.stencil_back_ops = false;
+
+            const auto reference = [&](Face face, u32 v) {
+                emit([face, v](vk::CommandBuffer c) { c.setStencilReference(face, v); });
+            };
+            if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
+                stencil_front_reference == stencil_back_reference) {
+                reference(Face::eFrontAndBack, stencil_front_reference);
+            } else {
+                if (dirty_state.stencil_front_reference) {
+                    reference(Face::eFront, stencil_front_reference);
+                }
+                if (dirty_state.stencil_back_reference) {
+                    reference(Face::eBack, stencil_back_reference);
+                }
+            }
+            dirty_state.stencil_front_reference = dirty_state.stencil_back_reference = false;
+
+            const auto write_mask = [&](Face face, u32 v) {
+                emit([face, v](vk::CommandBuffer c) { c.setStencilWriteMask(face, v); });
+            };
+            if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
+                stencil_front_write_mask == stencil_back_write_mask) {
+                write_mask(Face::eFrontAndBack, stencil_front_write_mask);
+            } else {
+                if (dirty_state.stencil_front_write_mask) {
+                    write_mask(Face::eFront, stencil_front_write_mask);
+                }
+                if (dirty_state.stencil_back_write_mask) {
+                    write_mask(Face::eBack, stencil_back_write_mask);
+                }
+            }
+            dirty_state.stencil_front_write_mask = dirty_state.stencil_back_write_mask = false;
+
+            const auto compare_mask = [&](Face face, u32 v) {
+                emit([face, v](vk::CommandBuffer c) { c.setStencilCompareMask(face, v); });
+            };
+            if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
+                stencil_front_compare_mask == stencil_back_compare_mask) {
+                compare_mask(Face::eFrontAndBack, stencil_front_compare_mask);
+            } else {
+                if (dirty_state.stencil_front_compare_mask) {
+                    compare_mask(Face::eFront, stencil_front_compare_mask);
+                }
+                if (dirty_state.stencil_back_compare_mask) {
+                    compare_mask(Face::eBack, stencil_back_compare_mask);
+                }
+            }
+            dirty_state.stencil_front_compare_mask = dirty_state.stencil_back_compare_mask = false;
+        }
+        if (dirty_state.primitive_restart_enable) {
+            dirty_state.primitive_restart_enable = false;
+            emit([v = primitive_restart_enable](vk::CommandBuffer c) {
+                c.setPrimitiveRestartEnable(v);
+            });
+        }
+        if (dirty_state.rasterizer_discard_enable) {
+            dirty_state.rasterizer_discard_enable = false;
+            emit([v = rasterizer_discard_enable](vk::CommandBuffer c) {
+                c.setRasterizerDiscardEnable(v);
+            });
+        }
+        if (dirty_state.cull_mode) {
+            dirty_state.cull_mode = false;
+            emit([v = cull_mode](vk::CommandBuffer c) { c.setCullMode(v); });
+        }
+        if (dirty_state.front_face) {
+            dirty_state.front_face = false;
+            emit([v = front_face](vk::CommandBuffer c) { c.setFrontFace(v); });
+        }
+        if (dirty_state.blend_constants) {
+            dirty_state.blend_constants = false;
+            emit([v = blend_constants](vk::CommandBuffer c) { c.setBlendConstants(v.data()); });
+        }
+        if (dirty_state.color_write_masks) {
+            dirty_state.color_write_masks = false;
+            if (color_write_mask_supported) {
+                emit([v = color_write_masks](vk::CommandBuffer c) { c.setColorWriteMaskEXT(0, v); });
+            }
+        }
+        if (dirty_state.line_width) {
+            dirty_state.line_width = false;
+            emit([v = line_width](vk::CommandBuffer c) { c.setLineWidth(v); });
+        }
+        if (dirty_state.feedback_loop_enabled && feedback_loop_supported) {
+            dirty_state.feedback_loop_enabled = false;
+            emit([v = feedback_loop_enabled](vk::CommandBuffer c) {
+                c.setAttachmentFeedbackLoopEnableEXT(v ? vk::ImageAspectFlagBits::eColor
+                                                       : vk::ImageAspectFlagBits::eNone);
+            });
+        }
+    }
+
+    /// gow3: true when Commit() would record anything. Flags that Commit() defers (their
+    /// test is disabled) do not count.
+    [[nodiscard]] bool AnyDirty() const noexcept {
+        auto pending = dirty_state;
+        if (!depth_test_enabled) {
+            pending.depth_compare_op = false;
+        }
+        if (!depth_bounds_test_enabled) {
+            pending.depth_bounds = false;
+        }
+        if (!depth_bias_enabled) {
+            pending.depth_bias = false;
+        }
+        if (!stencil_test_enabled) {
+            pending.stencil_front_ops = pending.stencil_back_ops = false;
+            pending.stencil_front_reference = pending.stencil_back_reference = false;
+            pending.stencil_front_write_mask = pending.stencil_back_write_mask = false;
+            pending.stencil_front_compare_mask = pending.stencil_back_compare_mask = false;
+        }
+        static constexpr decltype(dirty_state) clean{};
+        return std::memcmp(&pending, &clean, sizeof(pending)) != 0;
+    }
 
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
-        std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
-        ++invalidations;
+        // gow3: named flags only; padding bits set by a memset made AnyDirty() always true.
+        dirty_state.viewports = true;
+        dirty_state.scissors = true;
+        dirty_state.depth_test_enabled = true;
+        dirty_state.depth_write_enabled = true;
+        dirty_state.depth_compare_op = true;
+        dirty_state.depth_bounds_test_enabled = true;
+        dirty_state.depth_bounds = true;
+        dirty_state.depth_bias_enabled = true;
+        dirty_state.depth_bias = true;
+        dirty_state.stencil_test_enabled = true;
+        dirty_state.stencil_front_ops = true;
+        dirty_state.stencil_front_reference = true;
+        dirty_state.stencil_front_write_mask = true;
+        dirty_state.stencil_front_compare_mask = true;
+        dirty_state.stencil_back_ops = true;
+        dirty_state.stencil_back_reference = true;
+        dirty_state.stencil_back_write_mask = true;
+        dirty_state.stencil_back_compare_mask = true;
+        dirty_state.primitive_restart_enable = true;
+        dirty_state.rasterizer_discard_enable = true;
+        dirty_state.cull_mode = true;
+        dirty_state.front_face = true;
+        dirty_state.blend_constants = true;
+        dirty_state.color_write_masks = true;
+        dirty_state.line_width = true;
+        dirty_state.feedback_loop_enabled = true;
     }
-
-    /// sotc: how many times the state was invalidated (a new command buffer, or a pass that bound
-    /// its own pipeline): memos of per-command-buffer state (vertex input) drop with it.
-    u32 invalidations{};
 
     void SetViewports(const Viewports& viewports_) {
         if (!std::ranges::equal(viewports, viewports_)) {
@@ -365,27 +575,102 @@ struct DynamicState {
     }
 };
 
-using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
+
+/// gow3: a block of deferred Vulkan commands. Commands are closures placed in
+/// fixed storage (no allocation per command) and run in order on the recording thread.
+class RecordChunk {
+public:
+    static constexpr size_t Capacity = 128 * 1024;
+
+    /// Returns false (and leaves `func` untouched) when the chunk has no room.
+    template <typename Func>
+    bool Push(Func&& func) {
+        using Command = TypedCommand<std::decay_t<Func>>;
+        static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
+        const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
+        if (offset + sizeof(Command) > Capacity) {
+            return false;
+        }
+        auto* command = new (storage + offset) Command(std::forward<Func>(func));
+        if (last) {
+            last->next = command;
+        } else {
+            first = command;
+        }
+        last = command;
+        used = offset + sizeof(Command);
+        PrefetchAhead();
+        return true;
+    }
+
+    /// Raw storage in the chunk for a command's variable-length data; null when full.
+    void* Allocate(size_t bytes, size_t align) {
+        const size_t offset = (used + align - 1) & ~(align - 1);
+        if (offset + bytes > Capacity) {
+            return nullptr;
+        }
+        used = offset + bytes;
+        PrefetchAhead();
+        return storage + offset;
+    }
+
+    void Execute(vk::CommandBuffer cmdbuf) {
+        for (CommandBase* command = first; command;) {
+            CommandBase* const next = command->next;
+            command->Execute(cmdbuf);
+            command->~CommandBase();
+            command = next;
+        }
+        first = last = nullptr;
+        used = 0;
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return first == nullptr;
+    }
+
+    [[nodiscard]] size_t Size() const noexcept {
+        return used;
+    }
+
+private:
+    /// The recording thread last read these cache lines: the first write to each has to take
+    /// it back from that core. Requesting ownership a few lines ahead overlaps those
+    /// transfers instead of stalling on each (RecordPrefetch).
+    void PrefetchAhead() const {
+        if (!Gow3Toggle::Disabled(Gow3Toggle::RecordPrefetch)) {
+            __builtin_prefetch(storage + used + 384, 1, 3);
+            __builtin_prefetch(storage + used + 448, 1, 3);
+        }
+    }
+
+    struct CommandBase {
+        virtual ~CommandBase() = default;
+        virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
+        CommandBase* next{};
+    };
+    template <typename Func>
+    struct TypedCommand final : CommandBase {
+        explicit TypedCommand(Func&& func_) : func{std::move(func_)} {}
+        explicit TypedCommand(const Func& func_) : func{func_} {}
+        void Execute(vk::CommandBuffer cmdbuf) override {
+            func(cmdbuf);
+        }
+        Func func;
+    };
+
+    alignas(64) std::byte storage[Capacity];
+    size_t used = 0;
+    CommandBase* first{};
+    CommandBase* last{};
+};
 
 class Scheduler {
 public:
-    /// record_thread: Vulkan commands are recorded and submitted on a thread of their own
-    /// (cp_record_thread of Pink-shadPS4, vk_recorder.h).
-    explicit Scheduler(const Instance& instance, bool record_thread = false);
+    /// `threaded_recording`: Vulkan commands passed to Record() are recorded by a worker thread.
+    explicit Scheduler(const Instance& instance, bool threaded_recording = false);
     ~Scheduler();
-
-    /// Makes the calling thread the one recording (shutdown from another thread).
-    void ClaimRecorder();
-
-    /// sotc: SOTC_TICKWATCH -- samples this scheduler's timeline into SotcStats::tick_ring
-    /// (the presenter starts it on the draw scheduler; the FLIPGAP detector prints it).
-    void StartTickWatch();
-
-    /// Waits until the recording thread has put the submit of tick on the queue. Another
-    /// thread that queues work waiting for tick on the same queue must call this first: a wait
-    /// queued before its signal blocks the queue for good. kick: the recording thread only.
-    void WaitSubmitted(u64 tick, bool kick = true);
 
     /// Sends the current execution context to the GPU
     /// and increments the scheduler timeline semaphore.
@@ -396,49 +681,25 @@ public:
     void Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(std::source_location caller = std::source_location::current());
 
-    /// sotc: Finish for readbacks: returns once the host can read what was submitted, which with
-    /// SOTC_WAIT_MARKER=2 can be before the driver reports it (Semaphore::WaitHostRead).
-    void FinishHostRead();
+    /// gow3: waits for the work submitted so far but leaves the command buffer being
+    /// recorded open, so a CommandBuffer() the caller holds stays valid (Finish() submits it:
+    /// recording into a submitted buffer crashes AMD's driver).
+    void WaitSubmitted(std::source_location caller = std::source_location::current());
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
-
-    /// Begins a one-off command buffer that is submitted ahead of the one being recorded, for
-    /// work that only depends on already submitted commands (readbacks of their results).
-    vk::CommandBuffer BeginAhead();
-
-    /// Submits the command buffer from BeginAhead after all submitted work and waits for it.
-    void SubmitAheadAndWait();
+    void Wait(u64 tick, std::source_location caller = std::source_location::current(),
+              u64 submit_ns = 0);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
-    /// sotc: a non-zero token names a state a caller replays unchanged (BbToggle::DepthFastPath):
-    /// when the scope in progress was begun with that token the state is the same one, no
-    /// comparison needed.
-    void BeginRendering(const RenderState& new_state, u64 token = 0);
+    void BeginRendering(const RenderState& new_state);
 
     /// Ends current rendering scope.
     void EndRendering();
-
-    /// True inside a rendering scope.
-    bool IsRendering() const {
-        return is_rendering;
-    }
-
-    /// Starts a new session.
-    void BeginSession();
-
-    /// Returns the current command buffer used for uploads.
-    vk::CommandBuffer UploadCommandBuffer();
-
-    /// Sets a function to be called on every session finalization.
-    void SetSessionCallback(SessionFunc&& on_session) {
-        this->on_session = std::move(on_session);
-    }
 
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
@@ -455,55 +716,124 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
-        // sotc: SOTC_CULL_QUEUE (sotc_cull_queue.h): while a cull dispatch is recorded, its
-        // commands go to the cull queue's command buffer; the first graphics command after a
-        // batch of them sends that batch to the GPU.
-        if (cull_override) [[unlikely]] {
-            return cull_override;
+    /// Returns the current command buffer for recording on the calling thread. With threaded
+    /// recording this first waits until all commands passed to Record() are recorded, then
+    /// records directly (Record() included, so callers may mix both) until the next
+    /// KickRecording() or submission.
+    [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+        if (recording_threaded && !direct_mode) {
+            SyncRecording();
+            direct_mode = true;
+            direct_recordings.fetch_add(1, std::memory_order_relaxed);
+            TraceDirectRecording(__builtin_return_address(0));
         }
-        if (cull_batch_open) [[unlikely]] {
-            RunCullHook();
+        return current_cmdbuf;
+    }
+
+    /// GOW3_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
+    static void TraceDirectRecording(void* caller);
+
+    /// Records `func(vk::CommandBuffer)` in order with other commands. The closure must own
+    /// everything it uses (capture by value): it may run later on the recording thread.
+    template <typename Func>
+    void Record(Func&& func) {
+        if (!recording_threaded || direct_mode) {
+            func(current_cmdbuf);
+            return;
         }
-        return sessions.back().primary;
+        if (Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording)) {
+            SyncRecording();
+            direct_mode = true;
+            func(current_cmdbuf);
+            return;
+        }
+        if (!CurrentChunk().Push(std::forward<Func>(func))) {
+            RetireChunk();
+            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
+            ASSERT(pushed);
+        }
     }
 
-    /// sotc: SOTC_CULL_QUEUE: commands recorded through CommandBuffer() go to cmdbuf (a real
-    /// command buffer of the cull queue) until it is set back to null.
-    void SetCullOverride(vk::CommandBuffer cmdbuf) noexcept {
-        cull_override = cmdbuf;
+    /// True when Record() defers commands (and RecordData() copies into chunks).
+    [[nodiscard]] bool IsRecordingDeferred() const noexcept {
+        return recording_threaded && !direct_mode &&
+               !Gow3Toggle::Disabled(Gow3Toggle::ThreadedRecording);
     }
 
-    /// sotc: SOTC_CULL_QUEUE: hook run once by the next graphics CommandBuffer() call after
-    /// SetCullBatchOpen(true) (the cull queue submits its open batch there).
-    void SetCullHook(Common::UniqueFunction<void>&& hook) {
-        cull_hook = std::move(hook);
-    }
-    void SetCullBatchOpen(bool open) noexcept {
-        cull_batch_open = open;
-    }
-
-    /// sotc: newest tick whose submit the recording thread has put on the queue (every one
-    /// without the recording thread).
-    [[nodiscard]] u64 RecordedSubmitTick() const noexcept {
-        return recorder ? recorded_submit_tick.load(std::memory_order_acquire)
-                        : CurrentTick() - 1;
+    /// Makes room for `bytes` of RecordData() plus the command that uses them in the current
+    /// chunk: data and command must share a chunk, which is recycled once executed.
+    void ReserveRecordData(size_t bytes) {
+        if (!IsRecordingDeferred()) {
+            return;
+        }
+        ASSERT(bytes + 1024 <= RecordChunk::Capacity);
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
+            RetireChunk();
+        }
     }
 
-    /// sotc: runs func on the recording thread after everything queued there so far (right
-    /// away without it), and kicks it.
-    void RunAfterRecorded(Common::UniqueFunction<void>&& func);
-
-    /// sotc: calls func with the real current command buffer at this point of the command
-    /// stream: on the recording thread when there is one (func may wait there without holding
-    /// up the command processor), otherwise right away.
-    void RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func);
-
-    /// sotc: true when Vulkan commands are recorded on a thread of their own.
-    [[nodiscard]] bool HasRecordThread() const noexcept {
-        return recorder != nullptr;
+    /// Copies `data` into recording storage that lives until the command that uses it has
+    /// been recorded (the same chunk). With threaded recording off, returns `data` itself.
+    template <typename T>
+    std::span<const T> RecordData(std::span<const T> data) {
+        if (!IsRecordingDeferred() || data.empty()) {
+            return data;
+        }
+        // Room for the data and the command that follows it, so both stay in one chunk.
+        const size_t bytes = data.size_bytes();
+        ReserveRecordData(bytes + alignof(T));
+        auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
+        std::memcpy(dst, data.data(), bytes);
+        return {dst, data.size()};
     }
+
+    /// Hands recorded commands to the recording thread. Called at points where no caller holds
+    /// the raw command buffer (end of draws and dispatches); small batches are kept.
+    void KickRecording(bool force = false);
+
+    /// Waits until every recorded command is in the command buffer.
+    void SyncRecording();
+
+    /// gow3: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
+    /// copy threads (Gow3Copy::Async) must be done before the guest learns the GPU is past them
+    /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
+    /// submission that reads them. Waits for all.
+    void WaitHostCopies();
+
+    /// Runs `copy` on the recording thread in order with the commands (the thread spins for
+    /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
+    template <typename Func>
+    void RecordHostCopy(Func&& copy) {
+        Record([copy = std::forward<Func>(copy), this,
+                seq = ++host_copies_issued](vk::CommandBuffer) {
+            copy();
+            host_copies_done.store(seq, std::memory_order_release);
+        });
+    }
+
+    /// gow3: runs `signal` once the guest memory copies issued so far are done, without
+    /// waiting here: the recording thread reaches it after the copies queued before it and hands
+    /// it to the copy threads' completion (Gow3Copy::AfterCopies).
+    void SignalAfterHostCopies(std::function<void()> signal);
+
+    /// gow3: before a guest-visible write that is not deferred (WriteData, end-of-shader
+    /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
+    /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
+    /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
+    void WaitDeferredSignals();
+
+    /// Whether a render pass with exactly this state is open.
+    [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
+        return is_rendering && render_state == state;
+    }
+
+    /// Whether BeginRendering(state) would start a new render pass.
+    [[nodiscard]] bool WillBeginRendering(const RenderState& state) const {
+        return !(is_rendering && render_state == state);
+    }
+
+    /// CommandBuffer() calls that waited for a recording thread (GOW3_FRAME_STATS).
+    static inline std::atomic<u64> direct_recordings{0};
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -528,11 +858,8 @@ public:
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
         std::unique_lock lk(pending_ops_mutex);
-        const u64 tick = CurrentTick();
-        if (pending_ops.empty()) {
-            pending_front_tick.store(tick, std::memory_order_release);
-        }
-        pending_ops.emplace(std::move(func), tick);
+        pending_ops.emplace(std::move(func), CurrentTick());
+        num_pending_ops.fetch_add(1, std::memory_order_release);
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -548,35 +875,41 @@ public:
     static std::mutex submit_mutex;
 
 private:
-    void EndSession();
+    void AllocateWorkerCommandBuffers();
+
+    std::unique_ptr<RecordChunk> AcquireChunk();
+
+    /// Returns the writable chunk. The replacement is installed before a chunk is handed over,
+    /// so recording never observes the transient null window that caused issue #100 upstream.
+    RecordChunk& CurrentChunk() {
+        if (!record_chunk) [[unlikely]] {
+            record_chunk = AcquireChunk();
+        }
+        return *record_chunk;
+    }
+
+    /// Moves the current chunk aside while keeping a writable chunk installed at all times.
+    void RetireChunk() {
+        auto full = AcquireChunk();
+        record_chunk.swap(full);
+        if (full) {
+            full_chunks.push_back(std::move(full));
+        }
+    }
+
+    void RecorderThread(std::stop_token stoken);
 
     void SubmitExecution(SubmitInfo& info);
 
-    /// Recording thread: a real command buffer for the fake handle the producer uses.
-    void BeginRecorded(vk::CommandBuffer fake);
-
-
     void PriorityPendingOpsThread(std::stop_token stoken);
 
-    void RunCullHook() const;
-
 private:
-    // sotc: SOTC_CULL_QUEUE (see CommandBuffer)
-    vk::CommandBuffer cull_override{};
-    mutable bool cull_batch_open{};
-    mutable Common::UniqueFunction<void> cull_hook{};
-
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
-    SessionFunc on_session{};
     SubmitFunc on_submit{};
-    struct Session {
-        vk::CommandBuffer upload{};
-        vk::CommandBuffer primary{};
-    };
-    std::vector<Session> sessions;
+    vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -584,29 +917,38 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
-    // sotc: tick of the front pending op (UINT64_MAX when none), kept under pending_ops_mutex and
-    // read without it by PopPendingOperations' early-out (SOTC_POP_FAST=0 disables).
-    std::atomic<u64> pending_front_tick{UINT64_MAX};
+    u32 pending_polls = 0; // gow3
+    std::atomic<u32> num_pending_ops{0}; ///< gow3: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
-    u64 render_state_token{}; ///< sotc: see BeginRendering
     bool is_rendering = false;
-    vk::UniqueCommandPool ahead_pool;
-    vk::CommandBuffer ahead_cmdbuf;
-    vk::UniqueFence ahead_fence;
-    u64 ahead_sequence{};
-    bool ahead_unfinished{};
+    // gow3: threaded recording
+    std::unique_ptr<RecordChunk> record_chunk;
+    std::vector<std::unique_ptr<RecordChunk>> full_chunks;
+    // gow3: SignalAfterHostCopies 与等待路径都可能触发 KickRecording，保护 chunk 移交。
+    std::mutex kick_mutex;
+    std::mutex recorder_mutex;
+    std::condition_variable_any recorder_cv;
+    std::condition_variable_any recorder_idle_cv;
+    std::deque<std::unique_ptr<RecordChunk>> recorder_queue;
+    std::vector<std::unique_ptr<RecordChunk>> free_chunks;
+    bool recorder_busy = false;
+    std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
+    bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
+    bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
+    u64 host_copies_issued = 0;
+    std::atomic<u64> host_copies_done{0};
+    std::atomic<u64> deferred_signals_issued{0}; ///< by the thread recording (A or B)
+    std::shared_ptr<std::atomic<u64>> deferred_signals_done =
+        std::make_shared<std::atomic<u64>>(0);
+    // gow3: whether recorder_thread runs, read on every Record(). std::jthread::joinable()
+    // compares thread ids, which on Windows (libc++ over winpthreads) costs two system calls.
+    bool recording_threaded{false};
+    std::jthread recorder_thread;
     tracy::VkCtxScope* profiler_scope{};
-    /// Newest tick the recording thread has put on the queue.
-    std::atomic<u64> recorded_submit_tick{0};
-    /// sotc: SOTC_TICKWATCH (StartTickWatch); the thread uses work_semaphore, declared above.
-    bool tickwatch{};
-    std::jthread tickwatch_thread;
-    /// Last member: stops (after running everything queued) before the rest is destroyed.
-    std::unique_ptr<CommandRecorder> recorder;
 };
 
 } // namespace Vulkan

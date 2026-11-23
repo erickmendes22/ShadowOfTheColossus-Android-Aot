@@ -1,53 +1,58 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// sotc: AMD FSR upscaling through the official AMD FSR SDK 2.4 (amd_fidelityfx_loader_vk.dll and
-// amd_fidelityfx_upscaler_vk.dll next to bb-probe.exe, loaded at run time). The SDK picks the
-// newest version the GPU runs: FSR 4.1 (machine learning) on Radeon RX 6000/7000/9000 and recent
-// Ryzen APUs, FSR 3.1 on every other GPU. SOTC_UPSCALER=fsr4.
+// gow3: FSR 4 (source-v07 INT8/DOT4 model, FSR-Vulkan provider) as an alternative to the
+// FSR 3.1 context of TemporalUpscaler. It consumes the same inputs: HDR scene color, depth,
+// motion vectors in render pixels (previous - current) and the jitter offset.
 //
-// The inputs are DLSS super resolution's (vk_dlssg.cpp: the scene before the UI, the G-buffer
-// depth and motion vectors, the camera); Dlssg::Upscale calls Dispatch in place of DLSS.
+// The model is per preset (native, quality, balanced, performance, ultraperf) and per output
+// tier; its SPIR-V passes and weights come from tools/fetch_fsr4_assets.sh (GOW3_FSR4_DIR overrides
+// the fsr4_shaders directory). A preset change rebuilds the model graph.
 
 #pragma once
 
+#include <array>
+#include <memory>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
+
 class Instance;
-}
+class Scheduler;
 
-namespace Vulkan::Fsr4 {
+class Fsr4Upscaler {
+public:
+    Fsr4Upscaler(const Instance& instance, Scheduler& scheduler);
+    ~Fsr4Upscaler();
 
-/// After the device is created: loads the SDK and lists the versions this GPU runs.
-bool Init(const Instance& instance);
+    /// An image in layout General, written/read by compute shaders.
+    struct Image {
+        vk::Image image;
+        vk::ImageView view;
+        u32 width, height;
+    };
+    struct Frame {
+        vk::CommandBuffer cmdbuf;
+        Image color, depth, motion, output;
+        u32 render_width, render_height;
+        int preset; ///< Gow3Settings::Preset
+        std::array<float, 2> jitter;
+        float frame_ms, near_plane, far_plane, vertical_fov;
+        float sharpness;
+        bool sharpen, reset, auto_exposure;
+    };
 
-/// The SDK loaded and has an upscaler for this GPU.
-bool Available();
+    /// Records FSR 4 into `frame.cmdbuf`; the output stays in General. False when FSR 4
+    /// cannot run (Problem() says why; missing assets or device features are permanent).
+    bool Record(const Frame& frame);
 
-/// "FSR 4.1.2", "FSR 3.1.6"...: the version the SDK runs here.
-const char* Name();
+    /// Why the last Record failed, or null.
+    [[nodiscard]] const char* Problem() const noexcept;
+    /// Assets or device features are missing: FSR 4 will not run in this session.
+    [[nodiscard]] bool Fatal() const noexcept;
 
-struct Image {
-    vk::Image image;
-    vk::Format format{};
-    u32 width{}, height{};
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
-struct Params {
-    Image color;  ///< render size, layout ShaderReadOnlyOptimal, tonemapped (0..1)
-    Image depth;  ///< render size, layout ShaderReadOnlyOptimal
-    Image mvec;   ///< render size, layout ShaderReadOnlyOptimal
-    Image output; ///< output size, layout General (storage)
-    u32 render_width{}, render_height{}, out_width{}, out_height{};
-    float jitter_x{}, jitter_y{};   ///< pixels
-    float mvec_scale_x{}, mvec_scale_y{}; ///< motion vector -> pixels
-    float z_near{}, z_far{}, fov_y{}; ///< fov in radians
-    bool depth_inverted{};
-    bool reset{};
-};
-
-/// Recording thread, with the real command buffer: records the upscale. Creates (or recreates, for
-/// a new size or depth layout) the context first. False on failure.
-bool Dispatch(VkCommandBuffer cmdbuf, const Params& params);
-
-} // namespace Vulkan::Fsr4
+} // namespace Vulkan

@@ -3,7 +3,6 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
-#include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -73,7 +72,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
       profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
-    if (info.uses_dma) {
+    if (info.uses_dma || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {
         SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
@@ -131,11 +130,7 @@ void EmitContext::DefineArithmeticTypes() {
     F32[1] = Name(TypeFloat(32), "f32_id");
     S32[1] = Name(TypeSInt(32), "i32_id");
     U32[1] = Name(TypeUInt(32), "u32_id");
-    // sotc: no 64-bit integer type where the device lacks shaderInt64 and the shader does not
-    // need one (Info::uses_int64): declaring it requires the Int64 capability.
-    if (profile.support_int64 || info.uses_int64) {
-        U64 = Name(TypeUInt(64), "u64_id");
-    }
+    U64 = Name(TypeUInt(64), "u64_id");
 
     for (u32 i = 2; i <= 4; i++) {
         if (info.uses_fp16) {
@@ -158,10 +153,8 @@ void EmitContext::DefineArithmeticTypes() {
     u32_one_value = ConstU32(1U);
     u32_zero_value = ConstU32(0U);
     f32_zero_value = ConstF32(0.0f);
-    if (Sirit::ValidId(U64)) {
-        u64_one_value = Constant(U64, 1ULL);
-        u64_zero_value = Constant(U64, 0ULL);
-    }
+    u64_one_value = Constant(U64, 1ULL);
+    u64_zero_value = Constant(U64, 0ULL);
 
     pi_x2 = ConstF32(2.0f * float{std::numbers::pi});
 
@@ -319,9 +312,7 @@ void EmitContext::DefineInputs() {
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
-        if (sw_stage != SwStage::Vertex) {
-            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
-        }
+        Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
     }
     if (info.loads.GetAny(IR::Attribute::SubgroupLtMask)) {
         subgroup_lt_mask =
@@ -341,47 +332,26 @@ void EmitContext::DefineInputs() {
                 DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
         }
 
-        Shader::Gcn::FetchShaderData fetch_shader;
-        if (!Gcn::ParseFetchShader(info, fetch_shader)) {
+        const auto fetch_shader = Gcn::ParseFetchShader(info);
+        if (!fetch_shader) {
             break;
         }
-        ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
-        for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
-            const auto& attrib = fetch_shader.attributes[semantic];
+        for (const auto& attrib : fetch_shader->attributes) {
+            ASSERT(attrib.semantic < IR::NumParams);
             const auto sharp = attrib.GetSharp(info);
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
-            Id id{DefineInput(type, semantic)};
+            Id id{DefineInput(type, attrib.semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
-                Name(id, fmt::format("vs_instance_attr{}", semantic));
+                Name(id, fmt::format("vs_instance_attr{}", attrib.semantic));
             } else {
-                Name(id, fmt::format("vs_in_attr{}", semantic));
+                Name(id, fmt::format("vs_in_attr{}", attrib.semantic));
             }
-            input_params[semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
+            input_params[attrib.semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
         }
         break;
     }
     case SwStage::Fragment: {
-        // sotc: Profile::barycentric_via_gs: the barycentrics and per-vertex inputs come from the
-        // auxiliary geometry shader as plain inputs (EmitBarycentricGeometryShader).
-        const auto gs_layout = MakeBarycentricGsLayout(runtime_info.hw.fs, info);
-        std::array<Id, 2> gs_bary{};
-        const auto define_bary = [&](bool nopersp) -> Id {
-            if (!profile.barycentric_via_gs) {
-                return DefineVariable(F32[3],
-                                      nopersp ? spv::BuiltIn::BaryCoordNoPerspKHR
-                                              : spv::BuiltIn::BaryCoordKHR,
-                                      spv::StorageClass::Input);
-            }
-            Id& id = gs_bary[nopersp ? 1 : 0];
-            if (!ValidId(id)) {
-                id = DefineInput(F32[3], nopersp ? gs_layout.NoPerspective() : gs_layout.Smooth());
-                if (nopersp) {
-                    Decorate(id, spv::Decoration::NoPerspective);
-                }
-            }
-            return id;
-        };
-        if (info.loads.GetAny(IR::Attribute::FragCoord) ||
+        if (FragmentMotion() || info.loads.GetAny(IR::Attribute::FragCoord) ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
             frag_coord = DefineVariable(F32[4], spv::BuiltIn::FragCoord, spv::StorageClass::Input);
@@ -412,7 +382,7 @@ void EmitContext::DefineInputs() {
                                                    spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    define_bary(false);
+                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordPullModel)) {
@@ -421,7 +391,7 @@ void EmitContext::DefineInputs() {
                                                        spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    define_bary(false);
+                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothCentroid)) {
@@ -430,17 +400,16 @@ void EmitContext::DefineInputs() {
                     F32[2], spv::BuiltIn::BaryCoordSmoothCentroidAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    define_bary(false);
+                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric) {
-                if (!ValidId(bary_coord)) {
-                    bary_coord = define_bary(false);
-                }
+            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
+                bary_coord =
+                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
                 // we would need sample_index to interpolate the bary_coord later
                 if (!ValidId(sample_index)) {
                     sample_index =
@@ -454,7 +423,8 @@ void EmitContext::DefineInputs() {
                 bary_coord_nopersp = DefineVariable(F32[2], spv::BuiltIn::BaryCoordNoPerspAMD,
                                                     spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
-                bary_coord_nopersp = define_bary(true);
+                bary_coord_nopersp = DefineVariable(F32[3], spv::BuiltIn::BaryCoordNoPerspKHR,
+                                                    spv::StorageClass::Input);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPerspSample)) {
@@ -462,7 +432,8 @@ void EmitContext::DefineInputs() {
                 bary_coord_nopersp_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordNoPerspSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
-                bary_coord_nopersp_sample = define_bary(true);
+                bary_coord_nopersp_sample = DefineVariable(
+                    F32[3], spv::BuiltIn::BaryCoordNoPerspKHR, spv::StorageClass::Input);
                 // Decorate(bary_coord_nopersp_sample, spv::Decoration::Sample);
             }
         }
@@ -477,24 +448,19 @@ void EmitContext::DefineInputs() {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
+            const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
-            // sotc: the geometry shader writes the three vertex values as vec4s.
-            const bool gs_per_vertex = primary == Qualifier::PerVertex && profile.barycentric_via_gs;
-            const u32 num_components = gs_per_vertex ? 4 : info.loads.NumComponents(param);
             const Id type = F32[num_components];
             const Id attr_id = [&] {
                 const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
                 if (primary == Qualifier::PerVertex &&
                     profile.supports_fragment_shader_barycentric) {
-                    return Name(DefineInput(TypeArray(type, ConstU32(3U)),
-                                            gs_per_vertex ? gs_layout.Location(i) : bind_location),
+                    return Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
                                 fmt::format("fs_in_attr{}_p", i));
                 }
                 return Name(DefineInput(type, bind_location), fmt::format("fs_in_attr{}", i));
             }();
-            if (gs_per_vertex) {
-                Decorate(attr_id, spv::Decoration::Flat);
-            } else if (primary == Qualifier::PerVertex) {
+            if (primary == Qualifier::PerVertex) {
                 Decorate(attr_id, profile.supports_amd_shader_explicit_vertex_parameter
                                       ? spv::Decoration::ExplicitInterpAMD
                                       : spv::Decoration::PerVertexKHR);
@@ -619,15 +585,6 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
-    // sotc: barycentric emulation adds a geometry stage to some pipelines only (profile.h,
-    // barycentric_via_gs): the same vertex shader must give the same position with and without
-    // it, since the depth pre-pass and colour pass can pick different pipelines and still need
-    // an equal depth test. Without this, ground-level surfaces can show as untextured or black
-    // on GPUs that take this path (no VK_KHR_fragment_shader_barycentric /
-    // VK_AMD_shader_explicit_vertex_parameter).
-    if (profile.barycentric_via_gs) {
-        Decorate(output_position, spv::Decoration::Invariant);
-    }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;
@@ -687,6 +644,12 @@ void EmitContext::DefineOutputs() {
                 ++num_attrs;
             }
 
+            if (VertexMotion()) {
+                motion_out_cur = DefineOutput(F32[4], MotionVectors::CurrentLocation);
+                motion_out_prev = DefineOutput(F32[4], MotionVectors::PreviousLocation);
+                Name(motion_out_cur, "motion_cur");
+                Name(motion_out_prev, "motion_prev");
+            }
             if (needs_clip_distance_emulation) {
                 clip_distances = Id{DefineOutput(F32[MaxEmulatedClipDistances], 0)};
                 output_params[num_attrs] = GetAttributeInfo(
@@ -780,6 +743,12 @@ void EmitContext::DefineOutputs() {
             frag_outputs[i] = GetAttributeInfo(num_format, id, num_components, true);
             ++num_render_targets;
         }
+        if (FragmentMotion() && !Sirit::ValidId(frag_outputs[MotionVectors::Output].id)) {
+            motion_frag_out = DefineOutput(F32[4], MotionVectors::Output);
+            motion_in_cur = DefineInput(F32[4], MotionVectors::CurrentLocation);
+            motion_in_prev = DefineInput(F32[4], MotionVectors::PreviousLocation);
+            Name(motion_frag_out, "motion_vector");
+        }
         // Dual source blending allows at most 2 render targets, one for each source.
         // Fewer targets are allowed but the missing blending source values will be
         // undefined.
@@ -805,13 +774,18 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+    const Id struct_type{Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4],
+                                         U32[4], U32[4], U32[4], U32[2], U32[1], U32[1]),
+                              "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
     MemberName(struct_type, PushData::XScaleIndex, "xscale");
     MemberName(struct_type, PushData::YScaleIndex, "yscale");
+    MemberName(struct_type, PushData::UdRegsIndex + 0, "ud_regs0");
+    MemberName(struct_type, PushData::UdRegsIndex + 1, "ud_regs1");
+    MemberName(struct_type, PushData::UdRegsIndex + 2, "ud_regs2");
+    MemberName(struct_type, PushData::UdRegsIndex + 3, "ud_regs3");
     MemberName(struct_type, PushData::BufOffsetIndex + 0, "buf_offsets0");
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
@@ -819,9 +793,17 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
     MemberDecorate(struct_type, PushData::YScaleIndex, spv::Decoration::Offset, 12U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    MemberDecorate(struct_type, PushData::UdRegsIndex + 0, spv::Decoration::Offset, 16U);
+    MemberDecorate(struct_type, PushData::UdRegsIndex + 1, spv::Decoration::Offset, 32U);
+    MemberDecorate(struct_type, PushData::UdRegsIndex + 2, spv::Decoration::Offset, 48U);
+    MemberDecorate(struct_type, PushData::UdRegsIndex + 3, spv::Decoration::Offset, 64U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 80U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 96U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 112U);
+    MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
+    MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 120U);
+    MemberName(struct_type, PushData::SceneSizeIndex, "scene_size");
+    MemberDecorate(struct_type, PushData::SceneSizeIndex, spv::Decoration::Offset, 124U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -871,9 +853,6 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::FaultBuffer:
         Name(id, "fault_buffer");
         break;
-    case BufferType::LodFeedback:
-        Name(id, "lod_feedback");
-        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -900,8 +879,6 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
-        } else if (desc.buffer_type == BufferType::LodFeedback) {
-            lod_feedback_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1014,11 +991,12 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const u32 sampled = desc.is_written ? 2 : 1;
     switch (type) {
     case AmdGpu::ImageType::Color1D:
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, false, false, sampled, format);
+    case AmdGpu::ImageType::Color1DArray:
+        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, false, sampled, format);
-    case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
@@ -1043,8 +1021,7 @@ void EmitContext::DefineImagesAndSamplers() {
 
         const u32 num_bindings = image_desc.NumBindings(info);
         Id pointee_type = image_type;
-        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex ||
-            image_desc.array_size != 0) {
+        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
             pointee_type = TypeArray(pointee_type, ConstU32(num_bindings));
         }
 
@@ -1063,7 +1040,6 @@ void EmitContext::DefineImagesAndSamplers() {
             .is_integer = is_integer,
             .is_storage = is_storage,
             .mip_fallback_mode = mip_fallback_mode,
-            .array_size = image_desc.array_size,
         });
         interfaces.push_back(id);
     }
@@ -1319,90 +1295,6 @@ Id EmitContext::DefineReadConst(bool dynamic) {
     return func;
 }
 
-// sotc: the hardware LOD counters (sotc_lod_stats.h) from the sample's derivatives. lambda =
-// log2 of the longest texel footprint axis over the T#'s mip 0 size (isotropic: an anisotropic
-// sample may read a finer mip, which is the bias knob's job on the CPU side). The finest mip of
-// every enabled bank (T# dword 6: counter_bank_id 12-19, lod_hw_cnt_en 20) is kept with an atomic
-// min, skipped when the bank already holds this mip or a finer one (one load, few atomics).
-// Word 256 of the buffer says whether this frame measures at all (Rasterizer::
-// SotcLodFeedbackCycle measures one cycle in four): a draw-uniform branch, so the derivatives
-// below stay in uniform control flow; measuring every frame cost ~15% of the frame rate.
-Id EmitContext::DefineLodFeedback() {
-    const auto func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], F32[2])};
-    const auto func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
-    const auto dw2{OpFunctionParameter(U32[1])};
-    const auto dw3{OpFunctionParameter(U32[1])};
-    const auto dw6{OpFunctionParameter(U32[1])};
-    const auto uv{OpFunctionParameter(F32[2])};
-    Name(func, "lod_feedback");
-    AddLabel();
-
-    const auto measure_label{OpLabel()};
-    const auto write_label{OpLabel()};
-    const auto merge_label{OpLabel()};
-    const auto end_label{OpLabel()};
-
-    const auto& feedback{buffers[lod_feedback_index]};
-    const auto [feedback_id, feedback_pointer_type] = feedback.Alias(PointerType::U32);
-    const auto gate_ptr{
-        OpAccessChain(feedback_pointer_type, feedback_id, u32_zero_value, ConstU32(256U))};
-    const auto measuring{OpINotEqual(U1[1], OpLoad(U32[1], gate_ptr), u32_zero_value)};
-    OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
-    OpBranchConditional(measuring, measure_label, end_label);
-
-    AddLabel(measure_label);
-    const auto ddx{OpDPdx(F32[2], uv)};
-    const auto ddy{OpDPdy(F32[2], uv)};
-
-    const auto enabled{OpINotEqual(U1[1], OpBitwiseAnd(U32[1], dw6, ConstU32(1U << 20)),
-                                   u32_zero_value)};
-    const auto bank{OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw6, ConstU32(12U)),
-                                 ConstU32(0xffU))};
-    const auto width{OpConvertUToF(
-        F32[1], OpIAdd(U32[1], OpBitwiseAnd(U32[1], dw2, ConstU32(0x3fffU)), u32_one_value))};
-    const auto height{OpConvertUToF(
-        F32[1], OpIAdd(U32[1],
-                       OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw2, ConstU32(14U)),
-                                    ConstU32(0x3fffU)),
-                       u32_one_value))};
-    const auto size{OpCompositeConstruct(F32[2], width, height)};
-    const auto tx{OpFMul(F32[2], ddx, size)};
-    const auto ty{OpFMul(F32[2], ddy, size)};
-    const auto footprint{
-        OpFMax(F32[1], OpFMax(F32[1], OpDot(F32[1], tx, tx), OpDot(F32[1], ty, ty)),
-               ConstF32(1e-20f))};
-    const auto lambda{OpFMul(F32[1], OpLog2(F32[1], footprint), ConstF32(0.5f))};
-    // NaN derivatives (helper lanes at triangle edges) report nothing
-    const auto valid{OpLogicalAnd(U1[1], enabled, OpLogicalNot(U1[1], OpIsNan(U1[1], lambda)))};
-    // Never coarser than the texture's last mip (T# dword 3 bits 16-19): the game waits, while
-    // loading, until every bank's mip is resident, and a mip the texture lacks never is (loading
-    // screens of ~100 s instead of ~1 s, 22 Oct).
-    const auto last_level{OpConvertUToF(
-        F32[1], OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw3, ConstU32(16U)),
-                             ConstU32(0xfU)))};
-    const auto mip_f{OpFClamp(F32[1], OpFloor(F32[1], lambda), f32_zero_value, last_level)};
-    const auto mip{OpConvertFToU(U32[1], mip_f)};
-
-    const auto ptr{OpAccessChain(feedback_pointer_type, feedback_id, u32_zero_value, bank)};
-    const auto finer{OpULessThan(U1[1], mip, OpLoad(U32[1], ptr))};
-    const auto write{OpLogicalAnd(U1[1], valid, finer)}; // before the merge: last two in block
-    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    OpBranchConditional(write, write_label, merge_label);
-
-    AddLabel(write_label);
-    OpAtomicUMin(U32[1], ptr, ConstU32(static_cast<u32>(spv::Scope::Device)), u32_zero_value,
-                 mip);
-    OpBranch(merge_label);
-
-    AddLabel(merge_label);
-    OpBranch(end_label);
-
-    AddLabel(end_label);
-    OpReturn();
-    OpFunctionEnd();
-    return func;
-}
-
 void EmitContext::DefineFunctions() {
     if (info.uses_pack_10_11_11) {
         f32_to_uf11 = DefineFloat32ToUfloatM5(6, "f32_to_uf11");
@@ -1414,9 +1306,6 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
-    }
-    if (info.uses_lod_feedback) {
-        lod_feedback = DefineLodFeedback();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

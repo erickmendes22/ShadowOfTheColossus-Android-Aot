@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <cstdlib>
-#include <string>
 #include <span>
 #include <unordered_map>
 
@@ -15,6 +13,7 @@
 
 namespace Frontend {
 class WindowSDL;
+struct WindowSystemInfo;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -26,6 +25,8 @@ public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
+    /// Headless logical device for renderer regression tests (no window or game).
+    explicit Instance(s32 physical_device_index, bool enable_validation);
     ~Instance();
 
     /// Returns a formatted string for the driver version
@@ -41,6 +42,25 @@ public:
     }
 
     /// Returns the current physical device
+    /// gow3: device features the temporal upscaler reports as enabled.
+    bool IsStorageImageWriteWithoutFormatEnabled() const {
+        return features.shaderStorageImageWriteWithoutFormat;
+    }
+    bool IsMultisampleStorageImageSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+    bool IsShaderFloat16Enabled() const {
+        return vk12_features.shaderFloat16;
+    }
+    bool IsSubgroupSizeControlEnabled() const {
+        return vk13_features.subgroupSizeControl;
+    }
+
+    /// Largest VkBuffer the driver allows (2 GiB on AMD's Windows driver).
+    u64 GetMaxBufferSize() const {
+        return vk13_props.maxBufferSize;
+    }
+
     vk::PhysicalDevice GetPhysicalDevice() const {
         return physical_device;
     }
@@ -48,6 +68,10 @@ public:
     /// Returns the Vulkan device
     vk::Device GetDevice() const {
         return *device;
+    }
+
+    const vk::PipelineBinaryKeyKHR& GetPipelineBinaryGlobalKey() const {
+        return pipeline_binary_global_key;
     }
 
     /// Returns the VMA allocator handle
@@ -66,27 +90,19 @@ public:
     }
 
     u32 GetPresentQueueFamilyIndex() const {
-        return present_queue_family;
+        return queue_family_index;
     }
 
     vk::Queue GetGraphicsQueue() const {
         return graphics_queue;
     }
 
+    vk::Queue GetSparseQueue() const {
+        return sparse_queue;
+    }
+
     vk::Queue GetPresentQueue() const {
         return present_queue;
-    }
-
-    /// sotc: true when present_queue is its own vk::Queue (second queue in the graphics family),
-    /// so vkQueuePresentKHR does not need Scheduler::submit_mutex.
-    bool HasDedicatedPresentQueue() const {
-        return dedicated_present_queue;
-    }
-
-    /// sotc: SOTC_CULL_QUEUE: a queue of the graphics family of its own for the visibility
-    /// (cull) dispatches (sotc_cull_queue.h); null when off or the family has no queue left.
-    vk::Queue GetCullQueue() const {
-        return cull_queue;
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -101,6 +117,16 @@ public:
     /// Returns true if depth bounds testing is supported
     bool IsDepthBoundsSupported() const {
         return features.depthBounds;
+    }
+
+    /// gow3: true when query pools can be reset from the host (vkResetQueryPool).
+    bool IsHostQueryResetSupported() const {
+        return vk12_features.hostQueryReset;
+    }
+
+    /// gow3: true when VK_EXT_conditional_rendering is enabled (IT_SET_PREDICATION).
+    bool IsConditionalRenderingSupported() const {
+        return conditional_rendering;
     }
 
     /// Returns true if 16-bit floats are supported in shaders
@@ -131,11 +157,6 @@ public:
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
-    }
-
-    /// sotc: VK_EXT_external_memory_host, enabled with SOTC_PC_MEMORY=1 only
-    bool IsExternalMemoryHostEnabled() const {
-        return external_memory_host;
     }
 
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
@@ -228,25 +249,13 @@ public:
     /// VK_EXT_shader_atomic_float2 is supported.
     bool IsShaderAtomicFloatBuffer32MinMaxSupported() const {
         return shader_atomic_float2 &&
-               shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax &&
-               !ForceFloatAtomicFallback();
-    }
-
-    /// sotc: SOTC_FLOAT_ATOMIC_FALLBACK=1 uses the integer fallback for float atomic min/max
-    /// even where the device has them (to test the GCN path on another card).
-    static bool ForceFloatAtomicFallback() {
-        static const bool forced = [] {
-            const char* v = std::getenv("SOTC_FLOAT_ATOMIC_FALLBACK");
-            return v && v[0] == '1';
-        }();
-        return forced;
+               shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax;
     }
 
     /// Returns true when the shaderImageFloat32AtomicMinMax feature of
     /// VK_EXT_shader_atomic_float2 is supported.
     bool IsShaderAtomicFloatImage32MinMaxSupported() const {
-        return shader_atomic_float2 && shader_atomic_float2_features.shaderImageFloat32AtomicMinMax &&
-               !ForceFloatAtomicFallback();
+        return shader_atomic_float2 && shader_atomic_float2_features.shaderImageFloat32AtomicMinMax;
     }
 
     /// Returns true if 64-bit integer atomic operations can be used on buffers
@@ -259,72 +268,9 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
-    /// Returns true if the subgroup size can be set to match guest subgroup size in every stage.
-    /// sotc: AMD reports 64-wide subgroups but can require a size only for compute
-    /// (requiredSubgroupSizeStages = compute); requiring 64 in the graphics stages was invalid and
-    /// the compute shaders skipped the wave64 lowering, which gave AMD cards random green/pink
-    /// fog and characters (issue #7, raulbezerro-dev). Those cards use the 32-wide path instead.
+    /// Returns true if the subgroup size can be set to match guest subgroup size
     bool IsSubgroupSize64Supported() const {
-        constexpr auto stages = vk::ShaderStageFlagBits::eVertex |
-                                vk::ShaderStageFlagBits::eFragment |
-                                vk::ShaderStageFlagBits::eCompute;
-        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64 &&
-               (vk13_props.requiredSubgroupSizeStages & stages) == stages;
-    }
-
-    /// sotc: true when compute shaders must be pinned to 32-wide subgroups: the device could run
-    /// them wider, but the recompiler lowers wave64 code for 32 lanes (the NVIDIA path).
-    bool IsComputeSubgroupSize32Required() const {
-        if (IsAmdWave32Forced()) {
-            return true;
-        }
-        return !IsSubgroupSize64Supported() && vk13_features.subgroupSizeControl &&
-               vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize > 32 &&
-               (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
-    }
-
-    /// sotc: SOTC_AMD_WAVE32=1 does what the SotC-AMD-Fix layer does on GCN cards (#152): the
-    /// shaders are lowered for 32 lanes and compute pipelines require 32, although the driver
-    /// reports 64 as the only size. Testers said the layer fixes the white flicker.
-    bool IsAmdWave32Forced() const {
-        static const bool force = [] {
-            const char* v = std::getenv("SOTC_AMD_WAVE32");
-            return v && std::atoi(v) != 0;
-        }();
-        return force && GetVendorID() == 0x1002;
-    }
-
-    /// sotc: whether a required subgroup size may be given for this stage.
-    bool CanRequireSubgroupSize(vk::ShaderStageFlagBits stage) const {
-        return bool(vk13_props.requiredSubgroupSizeStages & stage);
-    }
-
-    /// sotc: the subgroup size a pipeline stage is created with, or 0 to leave it to the driver.
-    /// Intel runs 8, 16 or 32 lanes: left free, its compiler builds each shader for several SIMD
-    /// widths, and first-time compiles took from seconds to minutes (the screen froze meanwhile),
-    /// while the recompiler lowered wave64 code for SubgroupSize() lanes anyway. Intel stages are
-    /// pinned to that size; SOTC_INTEL_PIN_SUBGROUP=0 turns it off. From AjncSystem#81 (jownatan).
-    u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
-        if (IsAmdWave32Forced()) {
-            return stage == vk::ShaderStageFlagBits::eCompute ? 32u : 0u;
-        }
-        if (IsSubgroupSize64Supported()) {
-            return CanRequireSubgroupSize(stage) ? 64u : 0u;
-        }
-        if (stage == vk::ShaderStageFlagBits::eCompute && IsComputeSubgroupSize32Required()) {
-            return 32u;
-        }
-        static const bool pin_intel = [] {
-            const char* v = std::getenv("SOTC_INTEL_PIN_SUBGROUP");
-            return !v || std::atoi(v) != 0;
-        }();
-        const u32 size = SubgroupSize();
-        if (pin_intel && GetVendorID() == 0x8086 && vk13_features.subgroupSizeControl &&
-            CanRequireSubgroupSize(stage) && size >= vk13_props.minSubgroupSize &&
-            size <= vk13_props.maxSubgroupSize) {
-            return size;
-        }
-        return 0u;
+        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
@@ -355,6 +301,20 @@ public:
     }
 
     /// Returns true when the shaderSubgroupClock feature of
+    /// gow3: the FSR 4 v07 INT8/DOT4 shaders can run (Float16, Int8, Int16, packed int8 dot
+    /// products, linear compute derivatives, extended storage image formats).
+    bool IsFsr4Int8Supported() const {
+        return vk12_features.shaderFloat16 && vk12_features.shaderInt8 && features.shaderInt16 &&
+               vk13_features.shaderIntegerDotProduct && compute_shader_derivatives &&
+               compute_shader_derivatives_features.computeDerivativeGroupLinear &&
+               features.shaderStorageImageExtendedFormats;
+    }
+
+    /// gow3: FSR 4.1.1 (INT8 model passes and VK_VALVE_shader_mixed_float_dot_product).
+    bool IsFsr411Supported() const {
+        return IsFsr4Int8Supported() && mixed_float_dot_product;
+    }
+
     /// VK_KHR_shader_clock is supported.
     bool IsShaderSubgroupClockSupported() const {
         return shader_clock && shader_clock_features.shaderSubgroupClock;
@@ -363,25 +323,6 @@ public:
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
-    }
-
-    /// sotc: a one-dimensional dispatch of `groups` workgroups for a host shader that reads its
-    /// index as x + y * NumWorkGroups.x * WorkGroupSize.x. Above maxComputeWorkGroupCount[0]
-    /// (Intel: 65535; NVIDIA and AMD allow 2^31 and more) it is sent as x * y groups with
-    /// x * y == groups exactly (the counts are page or texel counts: powers of two times small
-    /// factors), as a larger dispatch is invalid and hung Intel GPUs: the texture detiler
-    /// dispatches one group per 64 texels, 81920 for a 2048x2560 32-bit texture (issue #59).
-    void Dispatch1D(vk::CommandBuffer cmdbuf, u32 groups) const {
-        const auto& max = properties.limits.maxComputeWorkGroupCount;
-        if (groups > max[0]) {
-            for (u32 y = (groups + max[0] - 1) / max[0]; y <= max[1] && y <= groups; ++y) {
-                if (groups % y == 0 && groups / y <= max[0]) {
-                    cmdbuf.dispatch(groups / y, y, 1);
-                    return;
-                }
-            }
-        }
-        cmdbuf.dispatch(groups, 1, 1);
     }
 
     /// Returns the device ID of the physical device
@@ -444,17 +385,8 @@ public:
         return properties.limits.nonCoherentAtomSize;
     }
 
-    /// Returns the subgroup size the recompiler targets (64 or 32 when it can be required).
+    /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
-        if (IsAmdWave32Forced()) {
-            return 32;
-        }
-        if (IsSubgroupSize64Supported()) {
-            return 64;
-        }
-        if (IsComputeSubgroupSize32Required()) {
-            return 32;
-        }
         return vk11_props.subgroupSize;
     }
 
@@ -562,11 +494,6 @@ public:
         return image_view_min_lod;
     }
 
-    /// Returns whether shaderStorageImageMultisample is supported.
-    bool IsMultisampleStorageImageSupported() const {
-        return features.shaderStorageImageMultisample;
-    }
-
     /// Returns whether the device can report memory usage.
     bool CanReportMemoryUsage() const {
         return supports_memory_budget;
@@ -574,6 +501,10 @@ public:
 
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
+
+    /// gow3: the driver's current budget of the heaps GetDeviceMemoryUsage counts
+    /// (VK_EXT_memory_budget: what this process can use now, other processes included).
+    [[nodiscard]] u64 GetDeviceMemoryBudgetNow() const;
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
@@ -583,10 +514,8 @@ public:
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
-    /// Logs whatever the driver reports about a device loss (VK_EXT_device_fault).
-    void ReportDeviceFault() const;
-
 private:
+    Instance(const Frontend::WindowSystemInfo&, s32, bool, bool);
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
 
@@ -622,16 +551,14 @@ private:
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR compute_shader_derivatives_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
-    bool dedicated_present_queue{};
-    u32 present_queue_family{0};
     vk::Queue graphics_queue;
-    vk::Queue cull_queue; ///< sotc: SOTC_CULL_QUEUE
-    u32 cull_queue_index{}; ///< sotc: its index in the graphics family (0: none)
+    vk::Queue sparse_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -657,15 +584,17 @@ private:
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
+    bool pipeline_binaries{};
+    vk::PipelineBinaryKeyKHR pipeline_binary_global_key{};
     bool maintenance_8{};
-    bool external_memory_host{}; // sotc
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool compute_shader_derivatives{};
+    bool mixed_float_dot_product{}; // gow3: VK_VALVE_shader_mixed_float_dot_product (FSR 4.1.1)
+    bool conditional_rendering{};   // gow3: VK_EXT_conditional_rendering (IT_SET_PREDICATION)
     bool supports_memory_budget{};
-    bool device_fault{};
-    bool device_fault_vendor_binary{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

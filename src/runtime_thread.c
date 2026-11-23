@@ -7,6 +7,7 @@
  * the same 9-byte instruction with another displacement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,6 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
-#include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
 #define ATTR_MAGIC UINT32_C(0x41545452)
@@ -40,6 +40,10 @@ typedef struct GuestThread {
     /* Guest-visible TCB is allocated separately; this is the ScePthread handle. */
     uint64_t *tcb;
     unsigned char *tls_block;
+    /* Separate guest stack when the guest CPU is not the host's (JIT): host calls into guest
+     * code that is not nested in guest code (thread entries, HLE callbacks) run on it. */
+    unsigned char *guest_stack;
+    size_t guest_stack_size;
     pthread_t host;
     GuestEntry entry;
     void *argument, *result;
@@ -47,8 +51,7 @@ typedef struct GuestThread {
     char name[32];
     int detached, finished, joined, host_owned;
 #ifdef _WIN32
-    void *os_handle; /* sotc: set by the thread itself under `lock` (runtime_thread_suspend_others) */
-    bb_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
+    gow3_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
     jmp_buf exit_jump;
 #endif
@@ -57,38 +60,23 @@ typedef struct GuestThread {
 
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
+static void *thread_object_alloc(size_t bytes) {
+#ifdef __ANDROID__
+    return runtime_low_map(bytes,PROT_READ|PROT_WRITE);
+#else
+    return calloc(1,bytes);
+#endif
+}
+static void thread_attr_free(void *p) {
+#ifdef __ANDROID__
+    munmap(p,16384); // runtime_low_map rounds these small objects to the guest page size.
+#else
+    free(p);
+#endif
+}
+
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
-#ifdef _WIN32
-/* sotc: stops every other guest thread (returns once each one is really stopped) while the memory
- * runtime unmaps and maps again live views of guest memory (runtime_memory.c carve_host): a guest
- * thread touching the view meanwhile, its own fiber stack included, would fault where Windows
- * cannot even push the exception frame, and the process died silently at startup. Called under
- * the memory runtime's write lock. `lock` stays held until runtime_thread_resume: a thread that is
- * starting blocks in host_start before running guest code. Only OS handles the threads opened
- * themselves are used (no winpthreads call while others are stopped: one may hold its lock). */
-size_t runtime_thread_suspend_others(void **out, size_t capacity) {
-    size_t n=0;
-    pthread_mutex_lock(&lock);
-    for (GuestThread *t=threads; t && n<capacity; t=t->next) {
-        if (t==current || t->finished || !t->os_handle) continue;
-        HANDLE h=t->os_handle;
-        if (SuspendThread(h)==(DWORD)-1) continue;
-        CONTEXT c;
-        c.ContextFlags=CONTEXT_CONTROL;
-        GetThreadContext(h,&c); /* returns once the thread is really stopped */
-        out[n++]=h;
-    }
-    return n;
-}
-/* Resumes what runtime_thread_suspend_others stopped and releases `lock` (always call it). */
-void runtime_thread_resume(void **handles, size_t n) {
-    for (size_t i=0;i<n;++i) ResumeThread(handles[i]);
-    pthread_mutex_unlock(&lock);
-}
-#endif
-/* sotc: true on threads that run guest code (created by the guest, or the main thread). */
-int runtime_thread_is_guest(void) { return current!=NULL; }
 static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
@@ -114,10 +102,15 @@ static void set_gs(void *base) {
 }
 #define tls_block_alloc(size) _aligned_malloc(size,64)
 #else
-static void set_gs(void *base) {
-    if (syscall(SYS_arch_prctl,ARCH_SET_GS,(unsigned long)base)) { perror("STOP: arch_prctl(ARCH_SET_GS)"); exit(21); }
-}
+/* The guest TCB base goes through the boundary: on x86-64 hosts it is arch_prctl(ARCH_SET_GS)
+ * (src/runtime_cpu.c); with the JIT the guest CPU owns how the guest sees GS. */
+static void set_gs(void *base) { guest_cpu_set_gs(base); }
+#ifdef __ANDROID__
+// Guest TCB/static TLS pointers must stay below 40 bits; Scudo addresses need not.
+#define tls_block_alloc(size) runtime_low_map(size,PROT_READ|PROT_WRITE)
+#else
 #define tls_block_alloc(size) aligned_alloc(64,size)
+#endif
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
@@ -137,7 +130,7 @@ static void attach(GuestThread *t) {
     current=t;
 }
 static GuestThread *new_thread(void) {
-    GuestThread *t=calloc(1,sizeof(*t));
+    GuestThread *t=thread_object_alloc(sizeof(*t));
     if (!t) return NULL;
     t->attr=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.stack=DEFAULT_STACK,.affinity=0x7f};
     return t;
@@ -158,16 +151,13 @@ GuestThread *runtime_thread_current(void) {
 }
 /* Host threads that call guest code (HLE decoders invoking guest callbacks) need
  * a TCB/TLS like guest threads; the record lives until process exit. */
-static void set_host_name(const char *name);
 void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
-    set_host_name(t->name);
 }
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
-    set_host_name(t->name);
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
@@ -191,7 +181,7 @@ int32_t *runtime_errno(void) { return &guest_errno; }
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
-    ThreadAttr *a=calloc(1,sizeof(*a));
+    ThreadAttr *a=thread_object_alloc(sizeof(*a));
     if (!a) return ERR(12);
     *a=(ThreadAttr){.magic=ATTR_MAGIC,.policy=1,.prio=DEFAULT_PRIO,.inherit=4,.stack=DEFAULT_STACK,.guard=4096,.affinity=0x7f};
     pthread_mutex_lock(&lock); a->next=attributes; attributes=a; pthread_mutex_unlock(&lock);
@@ -205,7 +195,7 @@ static ABI int32_t attr_destroy(ThreadAttr **slot) {
     while (*link!=a) link=&(*link)->next;
     *link=a->next; a->magic=0;
     pthread_mutex_unlock(&lock);
-    free(a); *slot=NULL; return 0;
+    thread_attr_free(a); *slot=NULL; return 0;
 }
 static ABI int32_t attr_get(void *thread,ThreadAttr **out) {
     ThreadAttr *a=find_attr(out);
@@ -221,11 +211,6 @@ static ABI int32_t attr_set_stack(ThreadAttr **slot,uint64_t size) {
     ThreadAttr *a=find_attr(slot);
     if (!a || size<16384) return ERR(22);
     a->stack=size; return 0;
-}
-/* Stacks are placed by the runtime, never by the guest. */
-static ABI int32_t attr_get_stackaddr(ThreadAttr **slot,void **address) {
-    if (!find_attr(slot) || !address) return ERR(22);
-    *address=NULL; return 0;
 }
 static ABI int32_t attr_get_stack(ThreadAttr **slot,uint64_t *size) {
     ThreadAttr *a=find_attr(slot);
@@ -283,74 +268,27 @@ static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
-#ifdef _WIN32
-    /* sotc: also publish the name as the Win32 thread description, so the sampling profiler
-     * (SOTC_PROFILE matches GetThreadDescription) can pick guest threads by name. */
-    typedef HRESULT (WINAPI *SetDescription)(HANDLE,PCWSTR);
-    static SetDescription set_description;
-    static int looked;
-    if (!looked) {
-        set_description=(SetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                                               "SetThreadDescription");
-        looked=1;
-    }
-    if (set_description) {
-        wchar_t wide[16];
-        for (int i=0;i<16;++i) wide[i]=(unsigned char)host[i];
-        set_description(GetCurrentThread(),wide);
-    }
-#endif
 }
 #ifdef _WIN32
-#define exit_setjmp(t) bb_setjmp((t)->exit_jump)
-#define exit_longjmp(t) bb_longjmp((t)->exit_jump,1)
+#define exit_setjmp(t) gow3_setjmp((t)->exit_jump)
+#define exit_longjmp(t) gow3_longjmp((t)->exit_jump,1)
 #else
 #define exit_setjmp(t) setjmp((t)->exit_jump)
 #define exit_longjmp(t) longjmp((t)->exit_jump,1)
 #endif
 static void *host_start(void *p) {
     GuestThread *t=p;
-#ifdef _WIN32
-    /* sotc: an OS handle for runtime_thread_suspend_others, published under `lock`; taking `lock`
-     * also waits out a live view split in progress before any guest code runs. */
-    pthread_mutex_lock(&lock);
-    t->os_handle=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,
-                            GetCurrentThreadId());
-    pthread_mutex_unlock(&lock);
-#endif
     attach(t);
     set_host_name(t->name);
-#ifdef _WIN32
-    /* sotc: host thread ids of guest threads, for traces that print GetCurrentThreadId. */
-    if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread '%s' is host thread %lu\n",t->name,GetCurrentThreadId());
-    /* sotc: on 4 CPU threads or fewer the game's job workers (busy-wait style) starve the update,
-     * render and GPU threads, and the sound and file threads that mostly sleep wait behind them
-     * (AjncSystem #267; the same fix as the God of War 3 port's, first made in the MMadmer fork).
-     * Workers go below normal, sound threads highest, file and loading threads above normal.
-     * Bigger CPUs are left alone. SOTC_JOB_PRIORITY=0 turns it off. */
-    {
-        DWORD_PTR process_mask=0, system_mask=0;
-        const char *off=getenv("SOTC_JOB_PRIORITY");
-        if (!(off && off[0]=='0') &&
-            GetProcessAffinityMask(GetCurrentProcess(),&process_mask,&system_mask) &&
-            __builtin_popcountll((unsigned long long)process_mask)<=4) {
-            if (t->attr.prio<400 || strstr(t->name,"Sound") || strstr(t->name,"sndx"))
-                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST);
-            else if (!strncmp(t->name,"BPE JobWorker",13))
-                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
-            else if (!strncmp(t->name,"SceFios",7) || !strcmp(t->name,"Resource Loading"))
-                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
-        }
-    }
-#endif
-    if (!exit_setjmp(t)) t->result=t->entry(t->argument);
+    /* The guest entry runs through the boundary: with the JIT the host calls guest code, which
+     * may not be nested in guest code, so it runs on this thread's guest stack. */
+    if (t->guest_stack) guest_cpu_thread_stack(t->guest_stack+t->guest_stack_size,t->guest_stack_size);
+    const uint64_t argument=(uint64_t)(uintptr_t)t->argument;
+    if (!exit_setjmp(t)) t->result=(void *)(uintptr_t)guest_cpu_call((uintptr_t)t->entry,1,&argument);
+    else guest_cpu_abandon();
     runtime_thread_keys_cleanup();
-    pthread_mutex_lock(&lock);
-    t->finished=1; ++exited;
-#ifdef _WIN32
-    if (t->os_handle) { CloseHandle(t->os_handle); t->os_handle=NULL; }
-#endif
-    pthread_mutex_unlock(&lock);
+    guest_cpu_thread_end();
+    pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
     return t->result;
 }
 static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name) {
@@ -375,6 +313,12 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     void *stack_memory=runtime_low_map(stack_bytes,PROT_READ|PROT_WRITE);
     if (stack_memory) pthread_attr_setstack(&host,stack_memory,stack_bytes);
     else pthread_attr_setstacksize(&host,stack_bytes);
+#endif
+#ifndef GUEST_CPU_NATIVE
+    /* With the JIT, guest frames run on their own stack (below 1 TiB), not the host pthread's. */
+    t->guest_stack=runtime_low_map((size_t)stack,PROT_READ|PROT_WRITE);
+    if (!t->guest_stack) { fputs("STOP: cannot allocate a guest thread stack\n",stderr); exit(21); }
+    t->guest_stack_size=(size_t)stack;
 #endif
     publish(t);
     /* Publish the handle before the thread can run and inspect itself. */
@@ -413,7 +357,6 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     GuestThread *t=runtime_thread_current();
     if (t->host_owned) { fputs("STOP: pthread_exit on host-owned/main thread\n",stderr); exit(21); }
     t->result=value;
-    runtime_fiber_thread_exit(); /* sotc: leaving a fiber: the thread's stack limits (#322) */
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }
@@ -441,9 +384,6 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     if (!name) return ERR(22);
     snprintf(t->name,sizeof(t->name),"%s",name);
     if (t==current) set_host_name(t->name);
-#ifdef _WIN32
-    if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread renamed to '%s'\n",t->name);
-#endif
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }
@@ -461,26 +401,25 @@ static ABI int32_t posix_join(GuestThread *t,void **r) { return posix(thread_joi
 
 uintptr_t runtime_thread_resolve(const char *name) {
     static const struct { const char *nid; void *fn; } table[]={
-        {"aI+OeCz8xrQ",thread_self}, {"EotR8a3ASf4",thread_self},
-        {"9BcDykPmo1I",guest_error},
-        {"nsYoNRywwNg",attr_init}, {"62KCwEMmzcM",attr_destroy},
-        {"x1X76arYMxU",attr_get}, {"8+s5BzZjxSg",attr_affinity},
-        {"UTXzJbWhhTE",attr_set_stack}, {"-Wreprtu0Qs",attr_set_detach},
-        {"4+h9EzwKF4I",attr_set_policy}, {"DzES9hQF4f4",attr_set_param},
-        {"3qxgM4ezETA",attr_set_affinity}, {"eXbUSpEaTsA",attr_set_inherit},
-        {"JaRMy+QcpeU",attr_get_detach}, {"-fA+7ZlGDQs",attr_get_stack},
-        {"Ru36fiTtJzA",attr_get_stackaddr}, {"7Xl257M4VNI",thread_equal},
-        {"FXPWHNk8Of0",attr_get_param}, {"El+cQ20DynU",attr_set_guard},
-        {"6UgtwV+0zb4",thread_create}, {"onNY9Byn-W8",thread_join},
-        {"4qGrR6eoP9Y",thread_detach}, {"3kg7rT0NQIs",thread_exit},
-        {"T72hz6ffq08",thread_yield}, {"1tKyG7RlMJo",thread_get_prio},
-        {"W0Hpm2X0uPE",thread_set_prio}, {"bt3CTBKmGyI",thread_set_affinity}, {"rcrVFJsQWRY",thread_get_affinity},
-        {"GBUY7ywdULE",thread_rename}, {"3PtV6p3QNX4",thread_equal},
-        {"wtkt-teR1so",posix_attr_init}, {"zHchY8ft5pk",posix_attr_destroy},
-        {"E+tyo3lp5Lw",posix_attr_set_detach}, {"2Q0z6rnBrTE",posix_attr_set_stack},
-        {"euKRgm0Vn2M",posix_attr_set_param}, {"OxhIB8LB-PQ",posix_create},
-        {"Jmi+9w9u0E4",posix_create_name}, {"h9CcP3J0oVM",posix_join},
-        {"FJrT5LuUBAU",thread_exit},
+        {"aI+OeCz8xrQ#libkernel",thread_self}, {"EotR8a3ASf4#libkernel",thread_self},
+        {"9BcDykPmo1I#libkernel",guest_error},
+        {"nsYoNRywwNg#libkernel",attr_init}, {"62KCwEMmzcM#libkernel",attr_destroy},
+        {"x1X76arYMxU#libkernel",attr_get}, {"8+s5BzZjxSg#libkernel",attr_affinity},
+        {"UTXzJbWhhTE#libkernel",attr_set_stack}, {"-Wreprtu0Qs#libkernel",attr_set_detach},
+        {"4+h9EzwKF4I#libkernel",attr_set_policy}, {"DzES9hQF4f4#libkernel",attr_set_param},
+        {"3qxgM4ezETA#libkernel",attr_set_affinity}, {"eXbUSpEaTsA#libkernel",attr_set_inherit},
+        {"JaRMy+QcpeU#libkernel",attr_get_detach}, {"-fA+7ZlGDQs#libkernel",attr_get_stack},
+        {"FXPWHNk8Of0#libkernel",attr_get_param}, {"El+cQ20DynU#libkernel",attr_set_guard},
+        {"6UgtwV+0zb4#libkernel",thread_create}, {"onNY9Byn-W8#libkernel",thread_join},
+        {"4qGrR6eoP9Y#libkernel",thread_detach}, {"3kg7rT0NQIs#libkernel",thread_exit},
+        {"T72hz6ffq08#libkernel",thread_yield}, {"1tKyG7RlMJo#libkernel",thread_get_prio},
+        {"W0Hpm2X0uPE#libkernel",thread_set_prio}, {"bt3CTBKmGyI#libkernel",thread_set_affinity}, {"rcrVFJsQWRY#libkernel",thread_get_affinity},
+        {"GBUY7ywdULE#libkernel",thread_rename}, {"3PtV6p3QNX4#libkernel",thread_equal},
+        {"wtkt-teR1so#libkernel",posix_attr_init}, {"zHchY8ft5pk#libkernel",posix_attr_destroy},
+        {"E+tyo3lp5Lw#libkernel",posix_attr_set_detach}, {"2Q0z6rnBrTE#libkernel",posix_attr_set_stack},
+        {"euKRgm0Vn2M#libkernel",posix_attr_set_param}, {"OxhIB8LB-PQ#libkernel",posix_create},
+        {"Jmi+9w9u0E4#libkernel",posix_create_name}, {"h9CcP3J0oVM#libkernel",posix_join},
+        {"FJrT5LuUBAU#libkernel",thread_exit},
     };
     for (size_t i=0;i<sizeof(table)/sizeof(*table);++i)
         if (!strcmp(name,table[i].nid)) return (uintptr_t)table[i].fn;

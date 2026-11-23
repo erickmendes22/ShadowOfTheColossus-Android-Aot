@@ -3,14 +3,14 @@
 
 #pragma once
 
+#include <deque>
+#include <functional>
+
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
-#include <atomic>
-#include <chrono>
 #include <condition_variable>
-#include <functional>
 #include <mutex>
 #include <queue>
 
@@ -36,7 +36,6 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
-    int submit_prev_index = -1; ///< sotc: prev_index as seen by SubmitFlipInternal
     bool is_open = false;
     bool is_hdr = false;
 
@@ -103,8 +102,6 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
-        // sotc: when the flip was submitted; the present thread paces flips from it.
-        std::chrono::steady_clock::time_point arrival;
 
         operator bool() const noexcept {
             return frame != nullptr;
@@ -116,22 +113,25 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
-    /// sotc: with DLSS Frame Generation, presenting waits for Streamline's pacing; the frames are
-    /// then presented on a thread of their own so that the vblank clock keeps its rate.
-    bool AsyncPresent();
-    void RunPresentJob(std::function<void()> job, bool droppable = false);
-    void PresentJobThread(std::stop_token token);
+    /// gow3: runs presenter work (acquire, blit, vkQueuePresent) off the vblank thread, in
+    /// order. Acquire and present block while the GPU is the bottleneck (much longer on NVIDIA);
+    /// on the vblank thread that delayed the guest's vblank events and its frame timing jumped.
+    /// The presenter's frame pool still bounds how far the GPU command thread runs ahead.
+    void SwapThread(std::stop_token token);
+    void RunPresenter(std::function<void()> work, bool if_idle = false);
+
+    std::mutex swap_mutex;
+    std::condition_variable_any swap_cv;
+    std::deque<std::function<void()>> swap_queue;
+    bool swap_busy = false;
+    bool separate_swap = true;
+    std::jthread swap_thread; ///< before present_thread: destroyed after it
 
     std::mutex mutex;
+    std::condition_variable request_cv; ///< gow3: a flip was queued (immediate flips)
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
-    std::condition_variable flip_taken_cv; ///< sotc: a request left `requests` (SubmitFlipInternal)
-    std::atomic<u64> present_since_ns{0};  ///< sotc: when the present in progress began, 0 if none
-    std::mutex present_job_mutex;
-    std::condition_variable_any present_job_cv;
-    std::queue<std::function<void()>> present_jobs;
-    std::jthread present_job_thread;
 };
 
 } // namespace Libraries::VideoOut

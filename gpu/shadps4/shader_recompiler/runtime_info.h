@@ -78,6 +78,21 @@ struct SwVertexRuntimeInfo {
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };
 
+/// gow3: object motion vectors for temporal upscaling. G-buffer vertex shaders store their
+/// clip-space positions per referenced vertex and read the previous frame's; the
+/// fragment shader writes the screen-space difference to an extra color attachment.
+struct MotionVectors {
+    static constexpr u32 CurrentLocation = 30;  ///< varying: current clip position
+    static constexpr u32 PreviousLocation = 31; ///< varying: previous clip position, z = valid
+    static constexpr u32 Output = 7;            ///< color attachment index
+    /// Per-draw parameters (u32x4: store base, load base, vertices per instance, flags) and
+    /// the position array (vec4 per vertex; element 0 is scratch), fixed for the session.
+    static inline u64 params_address = 0;
+    static inline u64 positions_address = 0;
+    static constexpr u32 FlagStore = 1;
+    static constexpr u32 FlagLoad = 2;
+};
+
 struct HwLocalRuntimeInfo {
     u32 ls_stride;
 
@@ -96,6 +111,8 @@ struct HwVertexRuntimeInfo {
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
     u32 user_clip_plane_mask{};
+    /// gow3: object motion vectors (G-buffer draws), see MotionVectors below.
+    bool motion_vectors{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
 };
@@ -152,9 +169,9 @@ struct HwGeometryRuntimeInfo {
     u64 vs_copy_hash;
 
     bool operator==(const HwGeometryRuntimeInfo& other) const {
-        return num_outputs == other.num_outputs && outputs == other.outputs &&
-               num_invocations == other.num_invocations &&
-               output_vertices == other.output_vertices && in_primitive == other.in_primitive &&
+        return num_outputs == other.num_outputs && outputs == other.outputs && num_invocations &&
+               other.num_invocations && output_vertices == other.output_vertices &&
+               in_primitive == other.in_primitive &&
                std::ranges::equal(out_primitive, other.out_primitive) &&
                vs_copy_hash == other.vs_copy_hash;
     }
@@ -176,7 +193,7 @@ struct PsColorBuffer {
     // GCN applies blend factors to min/max ops while Vulkan ignores them. For the self-scaled
     // pattern min/max(src*src, dst*dst) the shader squares its color output instead, keeping
     // the attachment in the squared domain end to end.
-    u32 blend_self_scale : 1;
+    u32 blend_self_scale : 1; ///< gow3: unused, kept so cached shader keys stay valid
     AmdGpu::CompMapping swizzle;
 
     bool operator==(const PsColorBuffer& other) const = default;
@@ -210,9 +227,8 @@ struct HwFragmentRuntimeInfo {
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};
-    /// The guest runs depth/stencil before the pixel shader (DB_SHADER_CONTROL.Z_ORDER early, no
-    /// Z export). Ported from Pink-shadPS4 (luizgustavs), early_fragment_tests_from_z_order.
-    bool early_fragment_tests{false};
+    /// gow3: writes the object motion vector to MotionVectors::Output.
+    bool motion_vectors{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -222,7 +238,7 @@ struct HwFragmentRuntimeInfo {
                front_face_all_bits == other.front_face_all_bits &&
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
-               early_fragment_tests == other.early_fragment_tests &&
+               motion_vectors == other.motion_vectors &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

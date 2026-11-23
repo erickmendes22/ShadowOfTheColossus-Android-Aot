@@ -1,164 +1,69 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <limits>
+#include <thread>
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+#include <functional>
+
+#include "gow3_copy.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "gow3_toggles.h"
+#include "video_core/renderer_vulkan/vk_wait_diagnostics.h"
+#include "common/arch.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
-#include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/sotc_stats.h"
-#include <chrono>
-#include <span>
-#include <boost/container/small_vector.hpp>
-#include <immintrin.h>
-#include "video_core/renderer_vulkan/sotc_gpu_times_note.h"
+#include "gow3_threads.h"
 
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance, bool record_thread)
+Scheduler::Scheduler(const Instance& instance, bool threaded_recording)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
-    if (record_thread) {
-        recorder = std::make_unique<CommandRecorder>();
-        LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
+    // gow3: GOW3_VK_RECORD_THREAD=0 records on the calling thread.
+    const char* env = std::getenv("GOW3_VK_RECORD_THREAD");
+    if (threaded_recording && !(env && env[0] == '0')) {
+        record_chunk = AcquireChunk();
+        recorder_thread = std::jthread(std::bind_front(&Scheduler::RecorderThread, this));
+        recording_threaded = true;
     }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
-    BeginSession();
+    AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
+    if (recorder_thread.joinable()) {
+        SyncRecording();
+        recorder_thread.request_stop();
+        recorder_cv.notify_all();
+        recorder_thread.join();
+    }
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
 }
 
-void Scheduler::ClaimRecorder() {
-    if (recorder) {
-        recorder->ClaimProducer();
-    }
-}
-
-void Scheduler::StartTickWatch() {
-    if (!SotcStats::kTickWatch || tickwatch) {
+void Scheduler::BeginRendering(const RenderState& new_state) {
+    if (is_rendering && render_state == new_state) {
         return;
-    }
-    tickwatch = true;
-    tickwatch_thread = std::jthread([this](std::stop_token stoken) {
-        Common::SetCurrentThreadName("shadPS4:SotcTickWatch");
-        u64 last_gpu = ~0ull;
-        u64 last_sub = ~0ull;
-        u64 last_ns = SotcStats::NowNs();
-        bool last_busy = false;
-        int last_who = 0; // GPU idle: 0 draw thread busy, 1 command processor busy, 2 game
-        while (!stoken.stop_requested()) {
-            work_semaphore.Refresh();
-            const u64 gpu = work_semaphore.KnownGpuTick();
-            const u64 sub = work_semaphore.CurrentTick();
-            // CurrentTick is the one being recorded: work is queued when the GPU is behind the
-            // last submitted one (sub - 1). The interval goes to the state seen at its start.
-            const u64 now_ns = SotcStats::NowNs();
-            (last_busy ? SotcStats::gpu_busy_ns : SotcStats::gpu_idle_ns)
-                .fetch_add(now_ns - last_ns, std::memory_order_relaxed);
-            if (!last_busy) {
-                (last_who == 0   ? SotcStats::gpu_idle_draw_ns
-                 : last_who == 1 ? SotcStats::gpu_idle_cp_ns
-                                 : SotcStats::gpu_idle_game_ns)
-                    .fetch_add(now_ns - last_ns, std::memory_order_relaxed);
-            }
-            last_ns = now_ns;
-            last_busy = gpu + 1 < sub;
-            last_who = !SotcStats::draw_idle_now.load(std::memory_order_relaxed)  ? 0
-                       : !SotcStats::cp_idle_now.load(std::memory_order_relaxed) ? 1
-                                                                                  : 2;
-            if (gpu != last_gpu || sub != last_sub) {
-                SotcStats::PushTick(0, gpu, sub);
-                last_gpu = gpu;
-                last_sub = sub;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(500));
-        }
-    });
-}
-
-void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func) {
-    const vk::CommandBuffer cmdbuf = CommandBuffer();
-    if (!recorder || !CommandRecorder::IsFake(cmdbuf)) {
-        func(vk::CommandBuffer{cmdbuf});
-        return;
-    }
-    recorder->CountCommand();
-    recorder->Run([this, cmdbuf, func = std::move(func)] {
-        func(vk::CommandBuffer{recorder->Real(cmdbuf)});
-    });
-}
-
-void Scheduler::RunCullHook() const {
-    // sotc: SOTC_CULL_QUEUE: once per open batch (the hook may record nothing graphical).
-    cull_batch_open = false;
-    if (cull_hook) {
-        cull_hook();
-    }
-}
-
-void Scheduler::RunAfterRecorded(Common::UniqueFunction<void>&& func) {
-    if (!recorder) {
-        func();
-        return;
-    }
-    recorder->Run([func = std::move(func)] { func(); });
-    recorder->Kick();
-}
-
-void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
-    const vk::CommandBuffer real = command_pool.Commit();
-    Check(real.begin(vk::CommandBufferBeginInfo{
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    }));
-    recorder->Bind(fake, real);
-}
-
-void Scheduler::WaitSubmitted(u64 tick, bool kick) {
-    if (!recorder || recorded_submit_tick.load(std::memory_order_acquire) >= tick) {
-        return;
-    }
-    if (kick) {
-        recorder->Kick();
-    }
-    const SotcStats::SplitTimer submit_split{SotcStats::SplitWaitSubmit};
-    u64 submitted = recorded_submit_tick.load(std::memory_order_acquire);
-    for (u32 spins = 0; spins < 4096 && submitted < tick; ++spins) {
-        _mm_pause();
-        submitted = recorded_submit_tick.load(std::memory_order_acquire);
-    }
-    while (submitted < tick) {
-        recorded_submit_tick.wait(submitted, std::memory_order_acquire);
-        submitted = recorded_submit_tick.load(std::memory_order_acquire);
-    }
-}
-
-void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
-    if (is_rendering) {
-        if (token != 0 && token == render_state_token) {
-            return;
-        }
-        if (render_state == new_state) {
-            render_state_token = token;
-            return;
-        }
     }
     EndRendering();
-    SotcGpuTimes::Note(SotcGpuTimes::CPass); // sotc: SOTC_GPU_TIMES
     is_rendering = true;
     render_state = new_state;
-    render_state_token = token;
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -204,38 +109,215 @@ void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
-    sessions.back().primary.beginRendering(rendering_info);
+    if (!recording_threaded) {
+        current_cmdbuf.beginRendering(rendering_info);
+        return;
+    }
+    // The attachment infos live on this stack frame: the recorded closure keeps copies.
+    Record([info = rendering_info, color_attachments, depth_attachment,
+            stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
+        info.pColorAttachments = color_attachments.data();
+        if (info.pDepthAttachment) {
+            info.pDepthAttachment = &depth_attachment;
+        }
+        if (info.pStencilAttachment) {
+            info.pStencilAttachment = &stencil_attachment;
+        }
+        cmdbuf.beginRendering(info);
+    });
 }
 
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
-    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
-        SotcStats::render_breaks.fetch_add(1, std::memory_order_relaxed);
-    }
     is_rendering = false;
-    // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
-    sessions.back().primary.endRendering();
+    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 
-vk::CommandBuffer Scheduler::UploadCommandBuffer() {
-    auto& upload_cmdbuf = sessions.back().upload;
-    if (upload_cmdbuf) {
-        return upload_cmdbuf;
+void Scheduler::TraceDirectRecording(void* caller) {
+    static const bool enabled = [] {
+        const char* env = std::getenv("GOW3_RECORDER_TRACE");
+        return env && env[0] == '1';
+    }();
+    if (!enabled) {
+        return;
     }
-    if (recorder) {
-        upload_cmdbuf = recorder->NewFakeHandle();
-        recorder->Run([this, fake = upload_cmdbuf] { BeginRecorded(fake); });
-        return upload_cmdbuf;
+    static std::mutex mutex;
+    static std::unordered_map<void*, u64> callers;
+    static u64 calls;
+    std::scoped_lock lk{mutex};
+    ++callers[caller];
+    if (++calls % 2000) {
+        return;
     }
-    const vk::CommandBufferBeginInfo begin_info = {
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    };
-    upload_cmdbuf = command_pool.Commit();
-    Check(upload_cmdbuf.begin(begin_info));
-    return upload_cmdbuf;
+    std::vector<std::pair<u64, void*>> top;
+    for (const auto& [address, count] : callers) {
+        top.emplace_back(count, address);
+    }
+    std::ranges::sort(top, std::greater{});
+    for (size_t i = 0; i < std::min<size_t>(top.size(), 8); ++i) {
+#ifdef _WIN32
+        struct { const char* dli_fname; void* dli_fbase; } info{nullptr, nullptr};
+#else
+        Dl_info info{};
+        dladdr(top[i].second, &info);
+#endif
+        std::printf("Recorder sync caller: %llu x %s+0x%lx\n",
+                    static_cast<unsigned long long>(top[i].first),
+                    info.dli_fname ? info.dli_fname : "?",
+                    static_cast<unsigned long>(reinterpret_cast<uintptr_t>(top[i].second) -
+                                               reinterpret_cast<uintptr_t>(info.dli_fbase)));
+    }
+    callers.clear();
+}
+
+std::unique_ptr<RecordChunk> Scheduler::AcquireChunk() {
+    std::scoped_lock lk{recorder_mutex};
+    if (free_chunks.empty()) {
+        return std::make_unique<RecordChunk>();
+    }
+    auto chunk = std::move(free_chunks.back());
+    free_chunks.pop_back();
+    return chunk;
+}
+
+void Scheduler::SignalAfterHostCopies(std::function<void()> signal) {
+    if (!IsRecordingDeferred()) {
+        WaitHostCopies();
+        signal();
+        return;
+    }
+    Gow3Copy::FlushBatch();
+    deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    Record([signal = std::move(signal), done = deferred_signals_done](vk::CommandBuffer) mutable {
+        Gow3Copy::AfterCopies([signal = std::move(signal), done = std::move(done)] {
+            signal();
+            done->fetch_add(1, std::memory_order_release);
+        });
+    });
+    KickRecording(true);
+}
+
+void Scheduler::WaitDeferredSignals() {
+    const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
+    if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
+        Gow3Toggle::Disabled(Gow3Toggle::OrderedGuestWrites)) {
+        return;
+    }
+    Gow3Stats::WaitTimer timer{Gow3Stats::host_copies_wait_ns};
+    KickRecording(true);
+    while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
+        // Helps the copy threads the signals wait for.
+        Gow3Copy::WaitAsync();
+        std::this_thread::yield();
+    }
+}
+
+void Scheduler::WaitHostCopies() {
+    if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+        Gow3Stats::WaitTimer timer{Gow3Stats::host_copies_wait_ns};
+        Gow3Stats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        KickRecording(true);
+        while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
+            std::this_thread::yield();
+        }
+    }
+    Gow3Stats::WaitTimer timer{Gow3Stats::copy_threads_wait_ns};
+    Gow3Copy::WaitAsync();
+}
+
+void Scheduler::KickRecording(bool force) {
+    if (!recording_threaded) {
+        return;
+    }
+    std::scoped_lock kick_lock{kick_mutex};
+    // Callers kick where nobody holds the raw command buffer: deferral resumes.
+    direct_mode = false;
+    // Batches of tens of KiB keep the queue handoff cheap relative to the work it carries.
+    if (!force && full_chunks.empty() && CurrentChunk().Size() < 32 * 1024) {
+        return;
+    }
+    if (full_chunks.empty() && CurrentChunk().Empty()) {
+        return;
+    }
+    // Acquire the replacement before handing over the current chunk. This mirrors Bloodborne's
+    // issue #100 fix: record_chunk remains valid throughout the handover, including if another
+    // recording path is entered while the queue lock is held.
+    std::unique_ptr<RecordChunk> next_record =
+        CurrentChunk().Empty() ? nullptr : AcquireChunk();
+    bool wake;
+    {
+        std::scoped_lock lk{recorder_mutex};
+        for (auto& chunk : full_chunks) {
+            recorder_queue.push_back(std::move(chunk));
+        }
+        if (next_record) {
+            record_chunk.swap(next_record);
+            recorder_queue.push_back(std::move(next_record));
+        }
+        wake = recorder_sleeping;
+        queued_chunks.store(recorder_queue.size(), std::memory_order_release);
+    }
+    full_chunks.clear();
+    // A busy recorder picks the new chunks up by itself: waking it is a syscall per draw.
+    if (wake) {
+        recorder_cv.notify_one();
+    }
+}
+
+void Scheduler::SyncRecording() {
+    if (!recording_threaded) {
+        return;
+    }
+    KickRecording(true);
+    Gow3Stats::WaitTimer timer{Gow3Stats::sync_recording_ns};
+    std::unique_lock lk{recorder_mutex};
+    recorder_idle_cv.wait(lk, [this] { return recorder_queue.empty() && !recorder_busy; });
+}
+
+void Scheduler::RecorderThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("gow3:VkRecorder");
+    while (true) {
+        // Spin briefly before sleeping: the next chunk usually follows within microseconds,
+        // and a sleeping recorder costs the GPU thread a wake-up syscall per kick. With few
+        // hardware threads (Steam Deck: 8) the spin would take time from guest threads.
+        static const auto spin_time = std::chrono::microseconds(
+            Gow3Threads::Available() >= 12 ? 200 : 20);
+        const auto spin_until = std::chrono::steady_clock::now() + spin_time;
+        for (u32 spins = 1; queued_chunks.load(std::memory_order_acquire) == 0; ++spins) {
+            COMMON_CPU_RELAX();
+            // The clock is read every 256 pauses, not per iteration.
+            if (!(spins & 255) &&
+                (stoken.stop_requested() || std::chrono::steady_clock::now() >= spin_until)) {
+                break;
+            }
+        }
+        std::unique_ptr<RecordChunk> chunk;
+        {
+            std::unique_lock lk{recorder_mutex};
+            recorder_sleeping = true;
+            recorder_cv.wait(lk, stoken, [this] { return !recorder_queue.empty(); });
+            recorder_sleeping = false;
+            if (recorder_queue.empty()) {
+                return; // stop requested
+            }
+            chunk = std::move(recorder_queue.front());
+            recorder_queue.pop_front();
+            queued_chunks.store(recorder_queue.size(), std::memory_order_release);
+            recorder_busy = true;
+        }
+        // current_cmdbuf only changes after SyncRecording(), which waits for this thread.
+        chunk->Execute(current_cmdbuf);
+        {
+            std::scoped_lock lk{recorder_mutex};
+            free_chunks.push_back(std::move(chunk));
+            recorder_busy = false;
+            if (recorder_queue.empty()) {
+                recorder_idle_cv.notify_all();
+            }
+        }
+    }
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -248,183 +330,75 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(std::source_location caller) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
+    const bool diagnose = WaitDiagnostics::Enabled();
+    const auto start = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    const u64 submit_ns = diagnose ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count() : 0;
+    Wait(presubmit_tick, caller, submit_ns);
 }
 
-void Scheduler::FinishHostRead() {
-    const u64 presubmit_tick = CurrentTick();
-    SubmitInfo info{};
-    SubmitExecution(info);
-    WaitSubmitted(presubmit_tick);
-    work_semaphore.WaitHostRead(presubmit_tick);
+void Scheduler::WaitSubmitted(std::source_location caller) {
+    const u64 tick = CurrentTick();
+    if (tick > 1) {
+        Wait(tick - 1, caller);
+    }
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, std::source_location caller, u64 submit_ns) {
+    const bool diagnose = WaitDiagnostics::Enabled();
+    auto start = diagnose ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
-    WaitSubmitted(tick);
+    Gow3Stats::WaitTimer timer{Gow3Stats::tick_wait_ns};
+    const auto submitted = diagnose ? std::chrono::steady_clock::now() : start;
     work_semaphore.Wait(tick);
-}
-
-vk::CommandBuffer Scheduler::BeginAhead() {
-    // Idea from the readback ahead of Pink-shadPS4 (luizgustavs), on the graphics queue only.
-    const vk::Device device = instance.GetDevice();
-    if (!ahead_pool) {
-        const vk::CommandPoolCreateInfo pool_info = {
-            .flags = vk::CommandPoolCreateFlagBits::eTransient |
-                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
-            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
-        };
-        auto [pool_result, pool] = device.createCommandPoolUnique(pool_info);
-        ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create the ahead pool: {}",
-                   vk::to_string(pool_result));
-        ahead_pool = std::move(pool);
-        const vk::CommandBufferAllocateInfo alloc_info = {
-            .commandPool = *ahead_pool,
-            .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = 1,
-        };
-        auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
-        ASSERT_MSG(alloc_result == vk::Result::eSuccess,
-                   "Failed to allocate the ahead command buffer: {}", vk::to_string(alloc_result));
-        ahead_cmdbuf = cmdbufs[0];
-        auto [fence_result, fence] = device.createFenceUnique({});
-        ASSERT_MSG(fence_result == vk::Result::eSuccess, "Failed to create the ahead fence: {}",
-                   vk::to_string(fence_result));
-        ahead_fence = std::move(fence);
-    } else {
-        // An ahead copy that returned on its marker may still be pending for the driver.
-        if (std::exchange(ahead_unfinished, false)) {
-            Check(device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max()));
-        }
-        Check(device.resetFences(*ahead_fence));
+    if (diagnose) {
+        const auto completed = std::chrono::steady_clock::now();
+        WaitDiagnostics::Get().Add(caller.file_name(), caller.line(),
+            submit_ns + std::chrono::duration_cast<std::chrono::nanoseconds>(submitted - start).count(),
+            std::chrono::duration_cast<std::chrono::nanoseconds>(completed - submitted).count());
     }
-    Check(ahead_cmdbuf.reset());
-    Check(ahead_cmdbuf.begin(vk::CommandBufferBeginInfo{
-        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-    }));
-    return ahead_cmdbuf;
-}
-
-void Scheduler::SubmitAheadAndWait() {
-    if (work_semaphore.HasMarker()) {
-        work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead,
-                                    static_cast<u32>(++ahead_sequence));
-    }
-    Check(ahead_cmdbuf.end());
-    // With the recorder, the earlier submits must have reached the queue first.
-    WaitSubmitted(CurrentTick() - 1);
-    // Queue submission order and the barriers recorded in the command buffer order it after
-    // all work submitted before; the command buffer being recorded is not involved.
-    const vk::SubmitInfo submit_info = {
-        .commandBufferCount = 1U,
-        .pCommandBuffers = &ahead_cmdbuf,
-    };
-    {
-        const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-        std::scoped_lock lk{submit_mutex};
-        const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-        const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
-        if (submit_result == vk::Result::eErrorDeviceLost) {
-            instance.ReportDeviceFault();
-            UNREACHABLE_MSG("Device lost during ahead submit");
-        }
-        ASSERT_MSG(submit_result == vk::Result::eSuccess, "Ahead submit failed: {}",
-                   vk::to_string(submit_result));
-        if (SotcStats::kTickWatch) {
-            const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
-            SotcStats::PushTick(3, 0,
-                                (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
-                                    static_cast<u64>((tw2 - tw1) / 1000));
-        }
-    }
-    if (work_semaphore.SpinMarker(Semaphore::MarkerSlot::Ahead, ahead_sequence) &&
-        work_semaphore.TrustMarker()) {
-        // The copy is readable; the fence is waited for before the command buffer is reused.
-        ahead_unfinished = true;
-        return;
-    }
-    if (const u32 spin_us = SotcWaitSpinUs(); spin_us != 0) {
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
-        while (instance.GetDevice().getFenceStatus(*ahead_fence) == vk::Result::eNotReady &&
-               std::chrono::steady_clock::now() < deadline) {
-            _mm_pause();
-        }
-    }
-    const auto wait_result =
-        instance.GetDevice().waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
-    if (wait_result == vk::Result::eErrorDeviceLost) {
-        instance.ReportDeviceFault();
-        UNREACHABLE_MSG("Device lost during ahead wait");
-    }
-    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Ahead wait failed: {}",
-               vk::to_string(wait_result));
-    // The ahead copy waited for all submitted work.
-    work_semaphore.Refresh();
 }
 
 void Scheduler::PopPendingOperations() {
-    // sotc: runs for many draws. Nothing can be done when the queue is empty or its front op was
-    // deferred into the command buffer still being recorded (that tick is not submitted yet), so
-    // skip the recursive lock and the semaphore query then. An op is moved out and popped before
-    // its callback runs, so a callback reaching here again does not run it twice.
-    static const bool fast = [] {
-        const char* v = std::getenv("SOTC_POP_FAST");
-        return !v || v[0] != '0';
-    }();
-    if (!fast) {
-        std::unique_lock lk(pending_ops_mutex);
-        work_semaphore.Refresh();
-        while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-            pending_ops.front().callback();
-            pending_ops.pop();
-        }
-        pending_front_tick.store(pending_ops.empty() ? UINT64_MAX : pending_ops.front().gpu_tick,
-                                 std::memory_order_release);
-        return;
-    }
-    if (pending_front_tick.load(std::memory_order_acquire) >= CurrentTick()) {
-        return;
+    if (num_pending_ops.load(std::memory_order_acquire) == 0) {
+        return; // every draw comes here
     }
     std::unique_lock lk(pending_ops_mutex);
+    // gow3: this runs on every draw and dispatch. Querying the timeline semaphore is an
+    // ioctl, so it is skipped when nothing waits and done once per 32 calls (~0.3 ms; reading
+    // the clock per draw instead was itself a hot spot).
     if (pending_ops.empty()) {
         return;
     }
     if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        if ((++pending_polls & 31) != 0 && !Gow3Toggle::Disabled(Gow3Toggle::PendingPollLimit)) {
+            return;
+        }
         work_semaphore.Refresh();
     }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        PendingOp op = std::move(pending_ops.front());
+        pending_ops.front().callback();
         pending_ops.pop();
-        pending_front_tick.store(pending_ops.empty() ? UINT64_MAX : pending_ops.front().gpu_tick,
-                                 std::memory_order_release);
-        op.callback();
+        num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
 }
 
-void Scheduler::BeginSession() {
-    EndSession();
+void Scheduler::AllocateWorkerCommandBuffers() {
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
 
-    auto& session = sessions.emplace_back();
-
-    if (recorder) {
-        session.primary = recorder->NewFakeHandle();
-        recorder->Run([this, fake = session.primary] { BeginRecorded(fake); });
-    } else {
-        const vk::CommandBufferBeginInfo begin_info = {
-            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
-        };
-        session.primary = command_pool.Commit();
-        Check(session.primary.begin(begin_info));
-    }
+    current_cmdbuf = command_pool.Commit();
+    Check(current_cmdbuf.begin(begin_info));
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -439,74 +413,27 @@ void Scheduler::BeginSession() {
 #endif
 }
 
-void Scheduler::EndSession() {
-    if (sessions.empty()) {
-        return;
-    }
-
-    if (on_session) {
-        on_session();
-    }
-
-    const auto& session = sessions.back();
-    if (session.upload) {
-        Check(session.upload.end());
-    }
-
-    EndRendering();
-    Check(session.primary.end());
-}
-
-// The queue submit of SubmitExecution, from the command processor or the recording thread.
-// Returns (submit_mutex wait us << 32) | vkQueueSubmit us when SOTC_TICKWATCH is on, else 0.
-static u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
-                       std::span<const vk::CommandBuffer> cmd_buffers) {
-    // One stage mask per wait semaphore; SubmitInfo can carry up to 4 waits (it used to provide
-    // only 2 masks, so a third/fourth wait read past the array). sotc: the masks now come with
-    // the SubmitInfo (same defaults; SOTC_CULL_QUEUE's waits block all commands).
-    const auto& wait_stage_masks = info.wait_stages;
-    static_assert(std::tuple_size_v<std::remove_cvref_t<decltype(info.wait_stages)>> >=
-                  std::tuple_size_v<decltype(info.wait_semas)>);
-
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = info.num_wait_semas,
-        .pWaitSemaphoreValues = info.wait_ticks.data(),
-        .signalSemaphoreValueCount = info.num_signal_semas,
-        .pSignalSemaphoreValues = info.signal_ticks.data(),
-    };
-
-    const vk::SubmitInfo submit_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = info.num_wait_semas,
-        .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
-        .pCommandBuffers = cmd_buffers.data(),
-        .signalSemaphoreCount = info.num_signal_semas,
-        .pSignalSemaphores = info.signal_semas.data(),
-    };
-
-    const s64 t0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-    std::scoped_lock lk{Scheduler::submit_mutex};
-    const s64 t1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    if (submit_result == vk::Result::eErrorDeviceLost) {
-        instance.ReportDeviceFault();
-        UNREACHABLE_MSG("Device lost during submit");
-    }
-    if (!SotcStats::kTickWatch) {
-        return 0;
-    }
-    const s64 t2 = static_cast<s64>(SotcStats::NowNs());
-    return (static_cast<u64>((t1 - t0) / 1000) << 32) | static_cast<u64>((t2 - t1) / 1000);
-}
-
 void Scheduler::SubmitExecution(SubmitInfo& info) {
-    // Only the queue operations take submit_mutex (the sparse binds of on_submit take it on
-    // their own): with the recorder, holding it while queueing commands could wait for the
-    // recording thread, which needs it for its submits.
+    std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
+
+    // BACHATA ARM64's bounded timeline policy: do not issue
+    // vkGetSemaphoreCounterValue on every submit (a costly Turnip ioctl).
+    // Instead, at most eight submissions remain in flight. We block on an
+    // exact, already submitted GPU tick only if the producer outruns the GPU.
+    // Readback demand paths retain their own mandatory waits; no guest memory
+    // becomes visible until its matching timeline tick is complete.
+    constexpr u64 MaxAndroidInFlightSubmissions = 8;
+    // Cache the policy once: this is the hot path for thousands of submissions.
+    // GOW3_VK_POLL_EACH_SUBMIT=1 re-enables the old path for device A/B testing.
+    static const bool bounded_submit = [] {
+        const char* opt_out = std::getenv("GOW3_VK_POLL_EACH_SUBMIT");
+        return std::getenv("GOW3_ANDROID_PORT") != nullptr &&
+               !(opt_out && opt_out[0] == '1');
+    }();
+    if (bounded_submit && signal_value > MaxAndroidInFlightSubmissions) {
+        work_semaphore.Wait(signal_value - MaxAndroidInFlightSubmissions);
+    }
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -520,57 +447,53 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
-    // sotc: the GPU writes this tick to host memory once everything before is visible there.
-    if (work_semaphore.HasMarker() && !sessions.empty()) {
-        EndRendering();
-        work_semaphore.RecordMarker(sessions.back().primary, Semaphore::MarkerSlot::Timeline,
-                                    static_cast<u32>(signal_value));
+    EndRendering();
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+        // Until the next submission's first timestamp: mostly the GPU waiting for it.
+        profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
     }
-
-    EndSession();
-
-    boost::container::small_vector<vk::CommandBuffer, 8> cmd_buffers;
-    for (const auto& session : sessions) {
-        if (session.upload) {
-            cmd_buffers.push_back(session.upload);
-        }
-        cmd_buffers.push_back(session.primary);
-    }
-    sessions.clear();
+    SyncRecording();
+    // Guest memory copies into staging read by this submission (copy threads).
+    WaitHostCopies();
+    Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    if (tickwatch) {
-        SotcStats::PushTick(1, signal_value,
-                            (static_cast<u64>(info.num_wait_semas) << 8) | cmd_buffers.size());
-    }
+    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+    };
 
-    if (recorder) {
-        // The submit runs on the recording thread after the commands of these command buffers.
-        recorder->Run([this, info, fakes = std::move(cmd_buffers), signal_value] {
-            boost::container::small_vector<vk::CommandBuffer, 8> real;
-            for (const vk::CommandBuffer fake : fakes) {
-                real.push_back(recorder->Real(fake));
-            }
-            const u64 queue_us = QueueSubmit(instance, info, real);
-            if (tickwatch) {
-                SotcStats::PushTick(2, signal_value, queue_us);
-            }
-            recorded_submit_tick.store(signal_value, std::memory_order_release);
-            recorded_submit_tick.notify_all();
-            recorder->Retire(static_cast<u32>(fakes.size()));
-        });
-        recorder->Kick();
-    } else {
-        const u64 queue_us = QueueSubmit(instance, info, cmd_buffers);
-        if (tickwatch) {
-            SotcStats::PushTick(2, signal_value, queue_us);
-        }
-    }
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .waitSemaphoreValueCount = info.num_wait_semas,
+        .pWaitSemaphoreValues = info.wait_ticks.data(),
+        .signalSemaphoreValueCount = info.num_signal_semas,
+        .pSignalSemaphoreValues = info.signal_ticks.data(),
+    };
 
-    work_semaphore.Refresh();
-    BeginSession();
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .waitSemaphoreCount = info.num_wait_semas,
+        .pWaitSemaphores = info.wait_semas.data(),
+        .pWaitDstStageMask = wait_stage_masks.data(),
+        .commandBufferCount = 1U,
+        .pCommandBuffers = &current_cmdbuf,
+        .signalSemaphoreCount = info.num_signal_semas,
+        .pSignalSemaphores = info.signal_semas.data(),
+    };
+
+    ImGui::Core::TextureManager::Submit();
+    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+
+    // On Android, completion is cached and advanced by the bounded wait
+    // above, explicit guest readback waits, or the deferred-ops poller (which
+    // already throttles Refresh calls). Never refresh unconditionally here.
+    if (!bounded_submit) {
+        work_semaphore.Refresh();
+    }
+    AllocateWorkerCommandBuffers();
 
     // Apply pending operations
     PopPendingOperations();
@@ -603,162 +526,13 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
 }
 
 void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf) {
-    if (dirty_state.viewports) {
-        dirty_state.viewports = false;
-        cmdbuf.setViewportWithCount(viewports);
-    }
-    if (dirty_state.scissors) {
-        dirty_state.scissors = false;
-        cmdbuf.setScissorWithCount(scissors);
-    }
-    if (dirty_state.depth_test_enabled) {
-        dirty_state.depth_test_enabled = false;
-        cmdbuf.setDepthTestEnable(depth_test_enabled);
-    }
-    if (dirty_state.depth_write_enabled) {
-        dirty_state.depth_write_enabled = false;
-        // Note that this must be set in a command buffer even if depth test is disabled.
-        cmdbuf.setDepthWriteEnable(depth_write_enabled);
-    }
-    if (depth_test_enabled && dirty_state.depth_compare_op) {
-        dirty_state.depth_compare_op = false;
-        cmdbuf.setDepthCompareOp(depth_compare_op);
-    }
-    if (dirty_state.depth_bounds_test_enabled) {
-        dirty_state.depth_bounds_test_enabled = false;
-        if (instance.IsDepthBoundsSupported()) {
-            cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
-        }
-    }
-    if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
-        dirty_state.depth_bounds = false;
-        if (instance.IsDepthBoundsSupported()) {
-            cmdbuf.setDepthBounds(depth_bounds_min, depth_bounds_max);
-        }
-    }
-    if (dirty_state.depth_bias_enabled) {
-        dirty_state.depth_bias_enabled = false;
-        cmdbuf.setDepthBiasEnable(depth_bias_enabled);
-    }
-    if (depth_bias_enabled && dirty_state.depth_bias) {
-        dirty_state.depth_bias = false;
-        cmdbuf.setDepthBias(depth_bias_constant, depth_bias_clamp, depth_bias_slope);
-    }
-    if (dirty_state.stencil_test_enabled) {
-        dirty_state.stencil_test_enabled = false;
-        cmdbuf.setStencilTestEnable(stencil_test_enabled);
-    }
-    if (stencil_test_enabled) {
-        if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
-            stencil_front_ops == stencil_back_ops) {
-            dirty_state.stencil_front_ops = false;
-            dirty_state.stencil_back_ops = false;
-            cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFrontAndBack, stencil_front_ops.fail_op,
-                                stencil_front_ops.pass_op, stencil_front_ops.depth_fail_op,
-                                stencil_front_ops.compare_op);
-        } else {
-            if (dirty_state.stencil_front_ops) {
-                dirty_state.stencil_front_ops = false;
-                cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eFront, stencil_front_ops.fail_op,
-                                    stencil_front_ops.pass_op, stencil_front_ops.depth_fail_op,
-                                    stencil_front_ops.compare_op);
-            }
-            if (dirty_state.stencil_back_ops) {
-                dirty_state.stencil_back_ops = false;
-                cmdbuf.setStencilOp(vk::StencilFaceFlagBits::eBack, stencil_back_ops.fail_op,
-                                    stencil_back_ops.pass_op, stencil_back_ops.depth_fail_op,
-                                    stencil_back_ops.compare_op);
-            }
-        }
-        if (dirty_state.stencil_front_reference && dirty_state.stencil_back_reference &&
-            stencil_front_reference == stencil_back_reference) {
-            dirty_state.stencil_front_reference = false;
-            dirty_state.stencil_back_reference = false;
-            cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack,
-                                       stencil_front_reference);
-        } else {
-            if (dirty_state.stencil_front_reference) {
-                dirty_state.stencil_front_reference = false;
-                cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eFront,
-                                           stencil_front_reference);
-            }
-            if (dirty_state.stencil_back_reference) {
-                dirty_state.stencil_back_reference = false;
-                cmdbuf.setStencilReference(vk::StencilFaceFlagBits::eBack, stencil_back_reference);
-            }
-        }
-        if (dirty_state.stencil_front_write_mask && dirty_state.stencil_back_write_mask &&
-            stencil_front_write_mask == stencil_back_write_mask) {
-            dirty_state.stencil_front_write_mask = false;
-            dirty_state.stencil_back_write_mask = false;
-            cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack,
-                                       stencil_front_write_mask);
-        } else {
-            if (dirty_state.stencil_front_write_mask) {
-                dirty_state.stencil_front_write_mask = false;
-                cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-                                           stencil_front_write_mask);
-            }
-            if (dirty_state.stencil_back_write_mask) {
-                dirty_state.stencil_back_write_mask = false;
-                cmdbuf.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, stencil_back_write_mask);
-            }
-        }
-        if (dirty_state.stencil_front_compare_mask && dirty_state.stencil_back_compare_mask &&
-            stencil_front_compare_mask == stencil_back_compare_mask) {
-            dirty_state.stencil_front_compare_mask = false;
-            dirty_state.stencil_back_compare_mask = false;
-            cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack,
-                                         stencil_front_compare_mask);
-        } else {
-            if (dirty_state.stencil_front_compare_mask) {
-                dirty_state.stencil_front_compare_mask = false;
-                cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-                                             stencil_front_compare_mask);
-            }
-            if (dirty_state.stencil_back_compare_mask) {
-                dirty_state.stencil_back_compare_mask = false;
-                cmdbuf.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-                                             stencil_back_compare_mask);
-            }
-        }
-    }
-    if (dirty_state.primitive_restart_enable) {
-        dirty_state.primitive_restart_enable = false;
-        cmdbuf.setPrimitiveRestartEnable(primitive_restart_enable);
-    }
-    if (dirty_state.rasterizer_discard_enable) {
-        dirty_state.rasterizer_discard_enable = false;
-        cmdbuf.setRasterizerDiscardEnable(rasterizer_discard_enable);
-    }
-    if (dirty_state.cull_mode) {
-        dirty_state.cull_mode = false;
-        cmdbuf.setCullMode(cull_mode);
-    }
-    if (dirty_state.front_face) {
-        dirty_state.front_face = false;
-        cmdbuf.setFrontFace(front_face);
-    }
-    if (dirty_state.blend_constants) {
-        dirty_state.blend_constants = false;
-        cmdbuf.setBlendConstants(blend_constants.data());
-    }
-    if (dirty_state.color_write_masks) {
-        dirty_state.color_write_masks = false;
-        if (instance.IsDynamicColorWriteMaskSupported()) {
-            cmdbuf.setColorWriteMaskEXT(0, color_write_masks);
-        }
-    }
-    if (dirty_state.line_width) {
-        dirty_state.line_width = false;
-        cmdbuf.setLineWidth(line_width);
-    }
-    if (dirty_state.feedback_loop_enabled && instance.IsAttachmentFeedbackLoopLayoutSupported()) {
-        dirty_state.feedback_loop_enabled = false;
-        cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
-                                                      ? vk::ImageAspectFlagBits::eColor
-                                                      : vk::ImageAspectFlagBits::eNone);
-    }
+    // A null command buffer only updates the dirty flags, exactly as recording would.
+    CommitWith(instance.IsDepthBoundsSupported(), instance.IsDynamicColorWriteMaskSupported(),
+               instance.IsAttachmentFeedbackLoopLayoutSupported(), [&](auto&& command) {
+                   if (cmdbuf) {
+                       command(cmdbuf);
+                   }
+               });
 }
 
 } // namespace Vulkan

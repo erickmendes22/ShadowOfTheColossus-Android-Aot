@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -43,6 +45,7 @@ struct GraphicsPipelineKey {
     u8 depth_samples;
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
+    u32 motion_vectors = 0;
     struct {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
@@ -78,10 +81,6 @@ public:
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
         std::vector<u32> fragment{};
-        /// sotc: Profile::barycentric_via_gs (EmitBarycentricGeometryShader). Stored only in the
-        /// caches of that profile (with_gs), so the other caches keep their format.
-        std::vector<u32> gs{};
-        static inline bool with_gs{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -92,17 +91,27 @@ public:
                      vk::PipelineCache pipeline_cache,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-                     const Shader::Gcn::FetchShaderData* fetch_shader,
+                     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading, bool async_build = false);
+                     bool preloading);
     ~GraphicsPipeline();
 
-    const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
+    // gow3: switch from compiler-owned snapshots to live stage data on publication.
+    void PublishStages(std::span<const Shader::Info*, MaxShaderStages> infos) {
+        std::ranges::copy(infos, stages.begin());
+    }
+
+    const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
         return fetch_shader;
     }
 
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
+    }
+
+    /// gow3: second draw squaring a self-scaled MIN/MAX blend, or null (vk_blend_rewrite.h).
+    vk::Pipeline SquarePassHandle() const noexcept {
+        return *square_pipeline;
     }
 
     /// Gets the attributes and bindings for vertex inputs.
@@ -117,7 +126,8 @@ private:
 
 private:
     GraphicsPipelineKey key;
-    Shader::Gcn::FetchShaderData fetch_shader{};
+    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    vk::UniquePipeline square_pipeline;
 };
 
 struct ClipDistanceShaderKey {

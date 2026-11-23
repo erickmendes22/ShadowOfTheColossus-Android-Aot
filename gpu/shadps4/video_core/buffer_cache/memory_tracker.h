@@ -5,250 +5,206 @@
 
 #include <algorithm>
 #include <deque>
+#include <mutex>
+#include <type_traits>
 #include <vector>
 
+#include "gow3_toggles.h"
+#include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_manager.h"
-#include "video_core/sotc_stats.h"
+#include "video_core/buffer_cache/copy_ranges.h"
 
 namespace VideoCore {
 
 class MemoryTracker {
 public:
-    static constexpr u64 MAX_CPU_PAGE_BITS = 40;
-    static constexpr u64 NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - HIGHER_PAGE_BITS);
-    static constexpr u64 MANAGER_POOL_SIZE = 32;
+    static constexpr size_t MAX_CPU_PAGE_BITS = 40;
+    static constexpr size_t NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - TRACKER_HIGHER_PAGE_BITS);
+    static constexpr size_t MANAGER_POOL_SIZE = 32;
 
 public:
-    explicit MemoryTracker(PageManager& tracker_)
-        : tracker{&tracker_}, readbacks_mode{EmulatorSettings.GetReadbacksMode()} {}
+    explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
     ~MemoryTracker() = default;
 
-    /// Returns true if a region has been modified from the GPU
-    bool IsRegionGpuModified(VAddr cpu_addr, u64 size) noexcept {
-        return IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
-            return manager->template IsRegionModified<Type::GPU>(offset, size);
-        });
-    }
-
     /// Returns true if a region has been modified from the CPU
-    bool IsRegionCpuModified(VAddr cpu_addr, u64 size) noexcept {
-        return IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
-            return manager->template IsRegionModified<Type::CPU>(offset, size);
-        });
+    bool IsRegionCpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        return IteratePages<true>(
+            query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
+                return manager->template IsRegionModified<Type::CPU>(offset, size);
+            });
     }
 
-    /// sotc: BB_READBACKS (GpuReadbacksMode)
-    u32 ReadbacksMode() const noexcept {
-        return readbacks_mode;
+    /// Returns true if a region has been modified from the GPU
+    bool IsRegionGpuModified(VAddr query_cpu_addr, u64 query_size) noexcept {
+        return IteratePages<false>(
+            query_cpu_addr, query_size, [](RegionManager* manager, u64 offset, size_t size) {
+                return manager->template IsRegionModified<Type::GPU>(offset, size);
+            });
     }
 
-    /// sotc: number of GPU-modified pages in a region (statistics only, SOTC_RB_NARROW)
-    u64 CountGpuModifiedPages(VAddr cpu_addr, u64 size) noexcept {
-        u64 pages = 0;
-        IteratePages(cpu_addr, size, [&pages](RegionManager* manager, u64 offset, u64 size) {
-            pages += manager->CountGpuModifiedPages(offset, size);
-        });
-        return pages;
+    /// Mark region as CPU modified, notifying the device_tracker about this change
+    void MarkRegionAsCpuModified(VAddr dirty_cpu_addr, u64 query_size) {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::CPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
+    /// gow3: see RegionManager::ExtendWriteFault.
+    void ExtendWriteFault(VAddr window_addr, u64 size) {
+        IteratePages<false>(window_addr, size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->ExtendWriteFault(manager->GetCpuAddr() + offset, size);
+                            });
     }
 
     /// Unmark region as modified from the host GPU
-    void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
-        IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {
-            if (is_write) {
-                manager->template ChangeRegionState<StateOp::Set, StateOp::Clear>(offset, size);
-            } else {
-                manager->template ChangeRegionState<StateOp::None, StateOp::Clear>(offset, size);
-            }
-        });
-    }
-
-    /// sotc: after a write fault, also marks the following pages (up to size bytes from
-    /// cpu_addr, page aligned) CPU-modified, which unprotects them, as long as they hold no GPU
-    /// data and are still tracked. SotC copies large blocks with memcpy every frame: one fault
-    /// per page otherwise. A page marked but not written only costs an upload.
-    void MarkAheadAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
-        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
-            const auto bounds = manager->GetBounds(offset, size);
-            manager->Lock(bounds);
-            u64 run = 0;
-            while (run < size &&
-                   !manager->template IsRegionModified<Type::GPU>(offset + run, BYTES_PER_PAGE) &&
-                   !manager->template IsRegionModified<Type::CPU>(offset + run, BYTES_PER_PAGE)) {
-                run += BYTES_PER_PAGE;
-            }
-            if (run != 0) {
-                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
-                                                                                        run);
-            }
-            manager->Unlock(bounds);
-            return run < size;
-        });
-    }
-
-    /// sotc: calls write(address, size) for the runs of [cpu_addr, cpu_addr + size) whose pages
-    /// are not CPU-modified, with their region's lock held. Those pages are write-protected, so
-    /// a guest write to them faults into InvalidateRegion and waits for this lock: the guest's
-    /// bytes land after the written ones, never under them (hot readbacks; checking first and
-    /// writing after the lock was released could overwrite a write made in between). Untracked
-    /// pages are written. Returns the bytes skipped.
-    template <typename Func>
-    u64 WriteUnlessCpuModified(VAddr cpu_addr, u64 size, Func&& write) {
-        u64 skipped = 0;
-        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
-        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
-        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
-            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
-            const VAddr base = page_index << HIGHER_PAGE_BITS;
-            remaining -= len;
-            RegionManager* manager = top_tier[page_index];
-            if (!manager) {
-                write(base + offset, len);
-                continue;
-            }
-            const auto bounds = manager->GetBounds(offset, len);
-            manager->Lock(bounds);
-            const u64 end = offset + len;
-            u64 run = offset;
-            for (u64 page = offset; page < end;) {
-                const u64 next = std::min((page & ~(BYTES_PER_PAGE - 1)) + BYTES_PER_PAGE, end);
-                if (manager->template IsRegionModified<Type::CPU>(page, next - page)) {
-                    if (page > run) {
-                        write(base + run, page - run);
-                    }
-                    run = next;
-                    skipped += next - page;
-                }
-                page = next;
-            }
-            if (end > run) {
-                write(base + run, end - run);
-            }
-            manager->Unlock(bounds);
-        }
-        return skipped;
-    }
-
-    /// Mark region as modified from the CPU
-    void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
-        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
-        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
-            manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
-        });
+    void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, false>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
-    /// sotc: guest_fault (a guest thread's write fault) feeds the repeat-fault grace.
-    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush,
-                          bool guest_fault = false) noexcept {
-        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
-        if (readbacks_mode == GpuReadbacksMode::Disabled) {
-            return MarkRegionAsCpuModified(cpu_addr, size);
-        }
-        bool should_flush = false;
-        IteratePages(cpu_addr, size, [&should_flush, guest_fault](RegionManager* manager,
-                                                                 u64 offset, u64 size) {
-            const auto bounds = manager->GetBounds(offset, size);
-            manager->Lock(bounds);
-            if (guest_fault) {
-                manager->NoteGuestWriteFaultLocked(offset);
-            }
-            const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
-            if (!modified) {
-                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
-                                                                                        size);
-            }
-            should_flush |= modified;
-            manager->Unlock(bounds);
-        });
-        if (should_flush) {
-            on_flush();
-        }
-    }
-
-    /// sotc: BbToggle::BufferBindMemo. The CPU-bit generation (RegionManager::CpuGenSum) of the
-    /// words a range covers, remembered by a bind that found no CPU-modified page in it.
-    static constexpr u64 MemoMaxWords = 16; // larger ranges are not remembered
-
-    /// Reads the key of [cpu_addr, cpu_addr + size): false when the range spans two regions,
-    /// covers more than MemoMaxWords words or lies in no region yet. Call it BEFORE looking for
-    /// CPU-modified pages, and store it only when that look found none.
-    bool SnapshotCpuGen(VAddr cpu_addr, u64 size, CpuGenKey& key) const noexcept {
-        const u64 first = cpu_addr >> HIGHER_PAGE_BITS;
-        if (size == 0 || ((cpu_addr + size - 1) >> HIGHER_PAGE_BITS) != first) {
-            return false;
-        }
-        RegionManager* region = top_tier[first];
-        if (!region) {
-            return false;
-        }
-        const u64 first_word = (cpu_addr & HIGHER_PAGE_MASK) / BYTES_PER_WORD;
-        const u64 last_word = ((cpu_addr + size - 1) & HIGHER_PAGE_MASK) / BYTES_PER_WORD;
-        const u64 count = last_word - first_word + 1;
-        if (count > MemoMaxWords) {
-            return false;
-        }
-        key = {region, static_cast<u32>(first_word), static_cast<u32>(count),
-               region->CpuGenSum(first_word, count)};
-        return true;
-    }
-
-    /// True while no CPU bit of the key's words has risen since SnapshotCpuGen.
-    static bool CpuGenUnchanged(const CpuGenKey& key) noexcept {
-        return key.region->CpuGenSum(key.first_word, key.words) == key.sum;
-    }
-
-    /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
-    void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
-        IteratePages<true>(
-            cpu_addr, size, [&func, is_written](RegionManager* manager, u64 offset, u64 size) {
-                if (is_written) {
-                    manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
-                        offset, size, func);
-                } else {
-                    manager
-                        ->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::None>(
-                            offset, size, func);
+    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
+        IteratePages<false>(
+            cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {
+                const bool should_flush = [&] {
+                    // Perform both the GPU modification check and CPU state change with the lock
+                    // in case we are racing with GPU thread trying to mark the page as GPU
+                    // modified. If we need to flush the flush function is going to perform CPU
+                    // state change.
+                    std::scoped_lock lk{manager->lock};
+                    if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
+                        manager->template IsRegionModified<Type::GPU>(offset, size)) {
+                        return true;
+                    }
+                    manager->template ChangeRegionState<Type::CPU, true>(
+                        manager->GetCpuAddr() + offset, size);
+                    return false;
+                }();
+                if (should_flush) {
+                    on_flush();
                 }
             });
     }
 
+    /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
+    void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, bool is_written, auto&& func,
+                            auto&& on_upload) {
+        IteratePages<true>(query_cpu_range, query_size,
+                           [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                               // gow3: read-only bindings skip the region lock when no page
+                               // in range is CPU-modified. A guest write sets its bit in the
+                               // fault handler before the store, and the draw that uses the
+                               // data reaches this thread through the submission queue lock.
+                               if (!is_written &&
+                                   !Gow3Toggle::Disabled(Gow3Toggle::LockFreeUploadCheck) &&
+                                   !manager->template IsRegionModified<Type::CPU>(offset, size)) {
+                                   return;
+                               }
+                               manager->lock.lock();
+                               manager->template ForEachModifiedRange<Type::CPU, true>(
+                                   manager->GetCpuAddr() + offset, size, func);
+                               if (!is_written) {
+                                   manager->lock.unlock();
+                               }
+                           });
+        on_upload();
+        if (!is_written) {
+            return;
+        }
+        IteratePages<false>(query_cpu_range, query_size,
+                            [&func, is_written](RegionManager* manager, u64 offset, size_t size) {
+                                manager->template ChangeRegionState<Type::GPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                                manager->lock.unlock();
+                            });
+    }
+
+    // Sorted, nonoverlapping byte intervals. Lock each region once even when several
+    // intervals share a page; upload before enabling GPU-write page protection.
+    void ForEachUploadRanges(VAddr base, std::span<const CopyRange> ranges, bool is_written,
+                             auto&& func, auto&& on_upload) {
+        std::vector<std::unique_lock<LockType>> locks;
+        RegionManager* previous = nullptr;
+        for (auto [offset, length] : ranges) {
+            IteratePages<true>(base + offset, length, [&](RegionManager* manager, u64 at, size_t size) {
+                if (manager != previous) {
+                    locks.emplace_back(manager->lock);
+                    previous = manager;
+                }
+                manager->template ForEachModifiedRange<Type::CPU, true>(
+                    manager->GetCpuAddr() + at, size, func);
+            });
+        }
+        on_upload();
+        if (is_written) {
+            for (auto [offset, length] : ranges) {
+                IteratePages<false>(base + offset, length, [&](RegionManager* manager, u64 at, size_t size) {
+                    manager->template ChangeRegionState<Type::GPU, true>(
+                        manager->GetCpuAddr() + at, size);
+                });
+            }
+        }
+    }
+
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
     template <bool clear>
-    void ForEachDownloadRange(VAddr cpu_addr, u64 size, auto&& func) {
-        constexpr auto gpu_op = clear ? StateOp::Clear : StateOp::None;
-        IteratePages(cpu_addr, size, [&func](RegionManager* manager, u64 offset, u64 size) {
-            manager->template ForEachModifiedRange<Type::GPU, StateOp::None, gpu_op>(offset, size,
-                                                                                     func);
-        });
+    void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, auto&& func) {
+        IteratePages<false>(query_cpu_range, query_size,
+                            [&func](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ForEachModifiedRange<Type::GPU, clear>(
+                                    manager->GetCpuAddr() + offset, size, func);
+                            });
     }
 
 private:
-    template <bool create_region_on_fail = false, typename Func>
-    bool IteratePages(VAddr cpu_address, u64 size, Func&& func) {
+    /**
+     * @brief IteratePages Iterates L2 word manager page table.
+     * @param cpu_address Start byte cpu address
+     * @param size Size in bytes of the region of iterate.
+     * @param func Callback for each word manager.
+     * @return
+     */
+    template <bool create_region_on_fail, typename Func>
+    bool IteratePages(VAddr cpu_address, size_t size, Func&& func) {
+        RENDERER_TRACE;
         using FuncReturn = typename std::invoke_result<Func, RegionManager*, u64, size_t>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
-        u64 remaining_size = size;
-        u64 page_index = cpu_address >> HIGHER_PAGE_BITS;
-        u64 page_offset = cpu_address & HIGHER_PAGE_MASK;
+        std::size_t remaining_size{size};
+        std::size_t page_index{cpu_address >> TRACKER_HIGHER_PAGE_BITS};
+        u64 page_offset{cpu_address & TRACKER_HIGHER_PAGE_MASK};
         while (remaining_size > 0) {
-            const u64 copy_amount = std::min(HIGHER_PAGE_SIZE - page_offset, remaining_size);
-            if (auto* region = top_tier[page_index]; region) {
+            const std::size_t copy_amount{
+                std::min<std::size_t>(TRACKER_HIGHER_PAGE_SIZE - page_offset, remaining_size)};
+            auto* manager{top_tier[page_index]};
+            if (manager) {
                 if constexpr (BOOL_BREAK) {
-                    if (func(region, page_offset, copy_amount)) {
+                    if (func(manager, page_offset, copy_amount)) {
                         return true;
                     }
                 } else {
-                    func(region, page_offset, copy_amount);
+                    func(manager, page_offset, copy_amount);
                 }
             } else if constexpr (create_region_on_fail) {
-                region = CreateRegion(page_index);
+                CreateRegion(page_index);
+                manager = top_tier[page_index];
                 if constexpr (BOOL_BREAK) {
-                    if (func(region, page_offset, copy_amount)) {
+                    if (func(manager, page_offset, copy_amount)) {
                         return true;
                     }
                 } else {
-                    func(region, page_offset, copy_amount);
+                    func(manager, page_offset, copy_amount);
                 }
             }
             page_index++;
@@ -258,8 +214,8 @@ private:
         return false;
     }
 
-    RegionManager* CreateRegion(u64 page_index) {
-        const VAddr base_cpu_addr = page_index << HIGHER_PAGE_BITS;
+    void CreateRegion(std::size_t page_index) {
+        const VAddr base_cpu_addr = page_index << TRACKER_HIGHER_PAGE_BITS;
         if (free_managers.empty()) {
             manager_pool.emplace_back();
             auto& last_pool = manager_pool.back();
@@ -268,36 +224,14 @@ private:
                 free_managers.push_back(&last_pool[i]);
             }
         }
+        // Each manager tracks a 4_MB virtual address space.
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
-        live_managers.push_back(new_manager);
-        return new_manager;
     }
-
-public:
-    /// sotc: calls f(address, size) for each run of 256 KiB words whose CPU bits rose since the
-    /// last call (RegionManager::TakeSweepWords). GPU command thread only (as CreateRegion).
-    template <typename F>
-    void ForEachSweepSpan(F&& f) {
-        for (size_t i = 0; i < live_managers.size(); ++i) {
-            RegionManager* manager = live_managers[i];
-            u64 words = manager->TakeSweepWords();
-            while (words) {
-                const int first = std::countr_zero(words);
-                const int count = std::countr_one(words >> first);
-                f(manager->CpuAddress() + u64(first) * BYTES_PER_WORD, u64(count) * BYTES_PER_WORD);
-                words = first + count >= 64 ? 0 : words & (~0ULL << (first + count));
-            }
-        }
-    }
-
-private:
-    std::vector<RegionManager*> live_managers;
 
     PageManager* tracker;
-    const u32 readbacks_mode;
     std::deque<std::array<RegionManager, MANAGER_POOL_SIZE>> manager_pool;
     std::vector<RegionManager*> free_managers;
     std::array<RegionManager*, NUM_HIGH_PAGES> top_tier{};

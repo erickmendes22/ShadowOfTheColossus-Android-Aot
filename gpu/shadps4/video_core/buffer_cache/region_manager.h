@@ -3,478 +3,62 @@
 
 #pragma once
 
-#include <algorithm>
 #include <array>
-#include <atomic>
-#include <bit>
 #include <chrono>
 #include <cstdlib>
-#include <utility>
 
-#include "common/adaptive_mutex.h"
-#include "common/types.h"
+#include "gow3_toggles.h"
+#include "common/div_ceil.h"
+#include "common/logging/log.h"
 #include "core/emulator_settings.h"
+
+#include "common/spin_lock.h"
+#ifdef __unix__
+#include "common/adaptive_mutex.h"
+#else
+#include "common/spin_lock.h"
+#endif
+#include "common/debug.h"
+#include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
-#include "video_core/sotc_stats.h"
 
 namespace VideoCore {
-
-/// sotc: repeat-fault grace. The GPU command thread clears a page's CPU bit and write-protects it
-/// again right after uploading it (every DMA draw syncs every resident range), so a guest writing
-/// that page could fault again and again before its instruction completed (thousands of times per
-/// boot, and the startup deaths came out of such storms). A page with a second guest write fault
-/// within 1-2 quanta is "hot" for 1-2 quanta: syncs still collect and upload it but leave its CPU
-/// bit set, so it is not protected again and the write goes through. Nothing CPU-written is ever
-/// hidden from the GPU. SOTC_FAULT_GRACE=0 turns it off.
-struct FaultGrace {
-    static u32 Pages() { // hot pages allowed per quantum, all regions together (0 = off)
-        static const u32 v = [] {
-            const char* e = std::getenv("SOTC_FAULT_GRACE");
-            if (e && e[0] == '0') {
-                return 0u;
-            }
-            const char* p = std::getenv("SOTC_FAULT_GRACE_PAGES");
-            return p ? static_cast<u32>(std::strtoul(p, nullptr, 10)) : 32u;
-        }();
-        return v;
-    }
-    static u32 Now() { // the current quantum (SOTC_FAULT_GRACE_US, default 1000)
-        static const u64 us = [] {
-            const char* e = std::getenv("SOTC_FAULT_GRACE_US");
-            return std::clamp<u64>(e ? std::strtoull(e, nullptr, 10) : 1000ULL, 100, 100000);
-        }();
-        return static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now().time_since_epoch())
-                                    .count() /
-                                us);
-    }
-    inline static std::atomic<u32> budget_epoch{0};
-    inline static std::atomic<u32> budget_used{0};
-    static bool TakeBudget(u32 now) { // approximate under races, which is fine for a cap
-        u32 epoch = budget_epoch.load(std::memory_order_relaxed);
-        if (epoch != now &&
-            budget_epoch.compare_exchange_strong(epoch, now, std::memory_order_relaxed)) {
-            budget_used.store(0, std::memory_order_relaxed);
-        }
-        return budget_used.fetch_add(1, std::memory_order_relaxed) < Pages();
-    }
-};
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
 #else
-using LockType = std::mutex;
+using LockType = Common::SpinLock;
 #endif
 
 /**
- * Allows tracking CPU and GPU modification of pages in a contigious virtual address region.
+ * Allows tracking CPU and GPU modification of pages in a contigious 16MB virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
  */
 class RegionManager {
 public:
     explicit RegionManager(PageManager* tracker_, VAddr cpu_addr_)
-        : tracker{tracker_}, cpu_addr{cpu_addr_},
-          readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
-        cpu.Fill(~0ULL);
-        gpu.Fill(0ULL);
-        ResetGrace();
+        : tracker{tracker_}, cpu_addr{cpu_addr_} {
+        cpu.Fill();
+        gpu.Clear();
+        writeable.Fill();
+        readable.Fill();
     }
     explicit RegionManager() = default;
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
-        sweep_words.store(~0ULL, std::memory_order_relaxed);
-        ResetGrace();
     }
 
-    /// sotc: the 256 KiB words where a CPU bit rose (or FaultGrace kept one) since the DMA sweep
-    /// last took them (BufferCache::SynchronizeDmaBuffers sweeps only those).
-    u64 TakeSweepWords() noexcept {
-        return sweep_words.load(std::memory_order_relaxed)
-                   ? sweep_words.exchange(0, std::memory_order_acq_rel)
-                   : 0;
-    }
-
-    VAddr CpuAddress() const noexcept {
+    VAddr GetCpuAddr() const {
         return cpu_addr;
     }
 
-    /// sotc: a guest write fault on the page at offset (region mutex held, from
-    /// MemoryTracker::InvalidateRegion). The second one within 1-2 quanta makes the page hot.
-    void NoteGuestWriteFaultLocked(u64 offset) {
-        if (FaultGrace::Pages() == 0) {
-            return;
-        }
-        const u64 page = offset / BYTES_PER_PAGE;
-        const u64 index = page / PAGES_PER_WORD;
-        const u64 bit = 1ULL << (page % PAGES_PER_WORD);
-        const u32 now = FaultGrace::Now();
-        if (grace_any) {
-            RotateGraceLocked(now);
-        }
-        if (!grace_any) {
-            grace_epoch = now;
-            grace_any = true;
-        }
-        const bool repeat = ((fault_cur[index] | fault_prev[index]) & bit) != 0;
-        fault_cur[index] |= bit;
-        if (!repeat || ((hot_cur[index] | hot_prev[index]) & bit) != 0) {
-            return;
-        }
-        if (FaultGrace::TakeBudget(now)) {
-            hot_cur[index] |= bit;
-            SotcStats::fault_grace_marks.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            SotcStats::fault_grace_cap_hits.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    static constexpr Bounds GetBounds(u64 offset, u64 size) {
-        const u64 end_address = offset + size - 1;
-        return Bounds{
-            .start_word = offset / BYTES_PER_WORD,
-            .start_page = (offset) / BYTES_PER_PAGE,
-            .end_word = end_address / BYTES_PER_WORD,
-            .end_page = (end_address) / BYTES_PER_PAGE,
-        };
-    }
-
-    static constexpr std::pair<u64, u64> GetMasks(u64 start_page, u64 end_page) {
-        const u64 start_mask = ~u64{0} << (start_page & (PAGES_PER_WORD - 1));
-        const u64 end_mask = ~u64{0} >> (63 - (end_page & (PAGES_PER_WORD - 1)));
-        return std::make_pair(start_mask, end_mask);
-    }
-
-    static constexpr void IterateWords(Bounds bounds, auto&& func) {
-        const auto [start_word, start_page, end_word, end_page] = bounds;
-        const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
-        if (start_word == end_word) [[likely]] {
-            func(start_word, start_mask & end_mask);
-        } else {
-            func(start_word, start_mask);
-            for (s64 i = start_word + 1; i < end_word; ++i) {
-                func(i, ~0ULL);
-            }
-            func(end_word, end_mask);
-        }
-    }
-
-    static constexpr void IteratePages(u64 word, auto&& func) {
-        u64 offset{};
-        while (word != 0) {
-            const u64 empty_bits = std::countr_zero(word);
-            offset += empty_bits;
-            word >>= empty_bits;
-            const u64 set_bits = std::countr_one(word);
-            func(offset, set_bits);
-            word = set_bits < PAGES_PER_WORD ? (word >> set_bits) : 0;
-            offset += set_bits;
-        }
-    }
-
-    template <StateOp cpu_op, StateOp gpu_op, bool locked = true>
-    void ChangeRegionState(u64 offset, u64 size) {
-        RegionBits write_prot;
-        RegionBits read_prot;
-        auto bounds = GetBounds(offset, size);
-        Bounds watcher_bounds;
-        if constexpr (locked) {
-            mutex.lock();
-        }
-        [[maybe_unused]] u64 raised = 0;
-        IterateWords(bounds, [&](u64 index, u64 mask) {
-            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
-            if constexpr (cpu_op == StateOp::Set) {
-                if (write_prot[index]) { // CPU bits that went 0 -> 1
-                    raised |= 1ULL << index;
-                }
-            }
-        });
-        if constexpr (cpu_op == StateOp::Set) {
-            if (raised) {
-                sweep_words.fetch_or(raised, std::memory_order_release);
-                BumpCpuGen(raised); // sotc: after the bits are set (see CpuGenSum)
-            }
-        }
-        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
-        const auto read_op = GetPageOp<Type::GPU>(gpu_op);
-        const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
-        if (update_watchers &&
-            GetWatcherBounds<cpu_op, gpu_op>(bounds, write_prot, read_prot, watcher_bounds)) {
-            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
-                                                 write_op, read_op);
-        }
-        if constexpr (locked) {
-            mutex.unlock();
-        }
-    }
-
-    /// sotc: BbToggle::BufferBindMemo. Generation of the CPU bits of the 256 KiB words
-    /// [first_word, first_word + count): the sum of per-word counters, each bumped (release) by
-    /// ChangeRegionState right after bits of that word went 0 -> 1. CPU bits rise nowhere else
-    /// (region creation sets them all, but a region cannot be remembered before it exists), so a
-    /// sum equal to one read before an unlocked "no CPU-modified page" look proves the look still
-    /// holds. The counters only grow, so equal sums mean equal counters.
-    u64 CpuGenSum(u64 first_word, u64 count) const noexcept {
-        u64 sum = 0;
-        for (u64 i = first_word; i < first_word + count; ++i) {
-            sum += cpu_word_gen[i].load(std::memory_order_acquire);
-        }
-        return sum;
-    }
-
-    template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
-    void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
-        // sotc: CPU bits rise only in ChangeRegionState (it marks sweep_words).
-        static_assert(!(type == Type::CPU && cpu_op == StateOp::Set));
-        auto& state = GetRegionBits<type>();
-        // sotc: every draw synchronizes its buffers here, and the region mutex is contended by
-        // the guest threads' write faults. Nothing CPU-modified and no GPU state to change is the
-        // common case: answered from an unlocked look at the bits (aligned 64-bit loads); a write
-        // fault landing right after it is the same as one landing right after the locked scan.
-        if constexpr (type == Type::CPU &&
-                      (cpu_op == StateOp::Clear || cpu_op == StateOp::None) &&
-                      (gpu_op == StateOp::None || gpu_op == StateOp::Set)) {
-            bool any_cpu = false;
-            bool all_gpu = true;
-            IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
-                any_cpu |= (__atomic_load_n(&cpu[index], __ATOMIC_ACQUIRE) & mask) != 0;
-                if constexpr (gpu_op == StateOp::Set) {
-                    all_gpu &= (__atomic_load_n(&gpu[index], __ATOMIC_ACQUIRE) & mask) == mask;
-                }
-            });
-            if (!any_cpu && (gpu_op == StateOp::None || all_gpu)) {
-                return;
-            }
-        }
-        RegionBits write_prot;
-        RegionBits read_prot;
-        u64 start_page{};
-        u64 end_page{};
-        auto bounds = GetBounds(offset, size);
-        Bounds watcher_bounds;
-        if constexpr (locked) {
-            mutex.lock();
-        }
-        // sotc: uploads (<CPU, Clear, None>) keep the CPU bit of hot pages (FaultGrace). Never for
-        // written bindings (<CPU, Clear, Set>): keeping the bit there would upload CPU data over
-        // GPU results later.
-        constexpr bool grace_op =
-            type == Type::CPU && cpu_op == StateOp::Clear && gpu_op == StateOp::None;
-        if constexpr (grace_op) {
-            if (grace_any) {
-                RotateGraceLocked(FaultGrace::Now());
-            }
-        }
-        [[maybe_unused]] u64 kept_words = 0;
-        IterateWords(bounds, [&](u64 index, u64 mask) {
-            const u64 base_page = index * PAGES_PER_WORD;
-            const u64 word = state[index] & mask; // collected before the change: hot pages too
-            u64 keep = 0;
-            if constexpr (grace_op) {
-                if (grace_any) {
-                    keep = (hot_cur[index] | hot_prev[index]) & word;
-                    if (keep) {
-                        kept_words |= 1ULL << index;
-                    }
-                    if (keep) {
-                        SotcStats::fault_grace_hot_upload_bytes.fetch_add(
-                            std::popcount(keep) * BYTES_PER_PAGE, std::memory_order_relaxed);
-                    }
-                }
-            }
-            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask, keep);
-            IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
-                if (end_page == base_page + pages_offset) {
-                    end_page += pages_size;
-                    return;
-                }
-                if (end_page) {
-                    func(cpu_addr + start_page * BYTES_PER_PAGE,
-                         (end_page - start_page) * BYTES_PER_PAGE);
-                }
-                start_page = base_page + pages_offset;
-                end_page = start_page + pages_size;
-            });
-        });
-        if (end_page) {
-            func(cpu_addr + start_page * BYTES_PER_PAGE, (end_page - start_page) * BYTES_PER_PAGE);
-        }
-        if constexpr (grace_op) {
-            // Hot pages keep their CPU bit without a new fault: the next sweep uploads them again.
-            if (kept_words) {
-                sweep_words.fetch_or(kept_words, std::memory_order_release);
-            }
-        }
-        const auto write_op = GetPageOp<Type::CPU>(cpu_op);
-        const auto read_op = GetPageOp<Type::GPU>(gpu_op);
-        const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
-        if (update_watchers &&
-            GetWatcherBounds<cpu_op, gpu_op>(bounds, write_prot, read_prot, watcher_bounds)) {
-            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
-                                                 write_op, read_op);
-        }
-        if constexpr (locked) {
-            mutex.unlock();
-        }
+    static constexpr size_t SanitizeAddress(size_t address) {
+        return static_cast<size_t>(std::max<s64>(static_cast<s64>(address), 0LL));
     }
 
     template <Type type>
-    bool IsRegionModified(u64 offset, u64 size) noexcept {
-        auto& state = GetRegionBits<type>();
-        const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
-        const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
-        if (start_word == end_word) [[likely]] {
-            return state[start_word] & (start_mask & end_mask);
-        } else {
-            if (state[start_word] & start_mask) {
-                return true;
-            }
-            for (s64 i = start_word + 1; i < end_word; ++i) {
-                if (state[i]) {
-                    return true;
-                }
-            }
-            return state[end_word] & end_mask;
-        }
-    }
-
-    /// sotc: GPU-modified pages in the range, from an unlocked look at the bits (statistics only,
-    /// SOTC_RB_NARROW).
-    u64 CountGpuModifiedPages(u64 offset, u64 size) noexcept {
-        u64 pages = 0;
-        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
-            pages += std::popcount(__atomic_load_n(&gpu[index], __ATOMIC_RELAXED) & mask);
-        });
-        return pages;
-    }
-
-    void Lock(const Bounds& bounds) noexcept {
-        mutex.lock();
-    }
-
-    void Unlock(const Bounds& bounds) noexcept {
-        mutex.unlock();
-    }
-
-private:
-    static_assert(NUM_REGION_WORDS == 64);
-    std::atomic<u64> sweep_words{~0ULL}; // sotc: see TakeSweepWords
-    std::array<std::atomic<u32>, NUM_REGION_WORDS> cpu_word_gen{}; // sotc: see CpuGenSum
-    void BumpCpuGen(u64 raised_words) noexcept {
-        for (; raised_words; raised_words &= raised_words - 1) {
-            cpu_word_gen[std::countr_zero(raised_words)].fetch_add(1, std::memory_order_release);
-        }
-    }
-    void ResetGrace() {
-        fault_cur.Fill(0);
-        fault_prev.Fill(0);
-        hot_cur.Fill(0);
-        hot_prev.Fill(0);
-        grace_epoch = 0;
-        grace_any = false;
-    }
-
-    /// Ages the grace bits to the quantum `now` (region mutex held). Invariant: !grace_any means
-    /// every grace bit is 0.
-    void RotateGraceLocked(u32 now) {
-        if (!grace_any || now == grace_epoch) {
-            return;
-        }
-        const bool adjacent = now - grace_epoch == 1;
-        if (adjacent) {
-            fault_prev = fault_cur;
-            hot_prev = hot_cur;
-        } else {
-            fault_prev.Fill(0);
-            hot_prev.Fill(0);
-        }
-        fault_cur.Fill(0);
-        hot_cur.Fill(0);
-        grace_any = adjacent;
-        grace_epoch = now;
-    }
-
-    template <StateOp cpu_op, StateOp gpu_op>
-    void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
-                                  u64 mask, u64 keep = 0) {
-        if constexpr (cpu_op != StateOp::None) {
-            const u64 prev = cpu[index];
-            if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~(mask & ~keep); // kept bits: no change, so no write Track
-            } else {
-                cpu[index] |= mask;
-            }
-            write_prot[index] = (cpu[index] ^ prev) & mask;
-        }
-        if constexpr (gpu_op != StateOp::None) {
-            const u64 prev = gpu[index];
-            if constexpr (gpu_op == StateOp::Clear) {
-                gpu[index] &= ~mask;
-            } else {
-                gpu[index] |= mask;
-            }
-            read_prot[index] = (gpu[index] ^ prev) & mask;
-        }
-    }
-
-    template <StateOp cpu_op, StateOp gpu_op>
-    static bool GetWatcherBounds(const Bounds& bounds, RegionBits& write_prot,
-                                 RegionBits& read_prot, Bounds& watcher_bounds) {
-        const auto prot = [&](u64 index) {
-            u64 word{};
-            if constexpr (cpu_op != StateOp::None) {
-                word |= write_prot[index];
-            }
-            if constexpr (gpu_op != StateOp::None) {
-                word |= read_prot[index];
-            }
-            return word;
-        };
-        u64 start_word = bounds.start_word;
-        while (prot(start_word) == 0) {
-            if (start_word == bounds.end_word) {
-                return false;
-            }
-            ++start_word;
-        }
-        u64 end_word = bounds.end_word;
-        while (prot(end_word) == 0) {
-            --end_word;
-        }
-        const u64 start_prot = prot(start_word);
-        const u64 end_prot = prot(end_word);
-        watcher_bounds = Bounds{
-            .start_word = start_word,
-            .start_page = static_cast<u64>(std::countr_zero(start_prot)),
-            .end_word = end_word,
-            .end_page = PAGES_PER_WORD - std::countl_zero(end_prot) - 1,
-        };
-        return true;
-    }
-
-    template <Type type>
-        requires(std::popcount(std::to_underlying(type)) == 1)
-    constexpr PageOp GetPageOp(StateOp state_op) {
-        if constexpr (type == Type::CPU) {
-            if (state_op == StateOp::Set) {
-                return PageOp::Untrack;
-            } else if (state_op == StateOp::Clear) {
-                return PageOp::Track;
-            }
-        } else if (type == Type::GPU && readbacks_mode == GpuReadbacksMode::Precise) {
-            if (state_op == StateOp::Set) {
-                return PageOp::Track;
-            } else if (state_op == StateOp::Clear) {
-                return PageOp::Untrack;
-            }
-        }
-        return PageOp::None;
-    }
-
-    template <Type type>
-        requires(std::popcount(std::to_underlying(type)) == 1)
     RegionBits& GetRegionBits() noexcept {
         if constexpr (type == Type::CPU) {
             return cpu;
@@ -483,19 +67,228 @@ private:
         }
     }
 
+    template <Type type>
+    const RegionBits& GetRegionBits() const noexcept {
+        if constexpr (type == Type::CPU) {
+            return cpu;
+        } else if constexpr (type == Type::GPU) {
+            return gpu;
+        }
+    }
+
+    /**
+     * Change the state of a range of pages
+     *
+     * @param dirty_addr    Base address to mark or unmark as modified
+     * @param size          Size in bytes to mark or unmark as modified
+     */
+    template <Type type, bool enable>
+    void ChangeRegionState(u64 dirty_addr, u64 size) noexcept(type == Type::GPU) {
+        RENDERER_TRACE;
+        const size_t offset = dirty_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+
+        RegionBits& bits = GetRegionBits<type>();
+        if constexpr (type == Type::CPU && enable) {
+            CountWriteFaults(start_page, end_page);
+        }
+        if constexpr (enable) {
+            bits.SetRange(start_page, end_page);
+        } else {
+            bits.UnsetRange(start_page, end_page);
+        }
+        if constexpr (type == Type::CPU) {
+            UpdateProtection<!enable, false>();
+        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+            UpdateProtection<enable, true>();
+        }
+    }
+
+    /// gow3: after a guest write fault, also unprotects the other pages of the window that
+    /// are protected for CPU writes and hold no GPU-modified data (see MarkFaultWindow).
+    void ExtendWriteFault(VAddr window_addr, u64 size) {
+        const size_t offset = window_addr - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+        RegionBits add(~(gpu | writeable), start_page, end_page);
+        if (add.None()) {
+            return;
+        }
+        cpu |= add;
+        UpdateProtection<false, false>();
+    }
+
+    /**
+     * Loop over each page in the given range, turn off those bits and notify the tracker if
+     * needed. Call the given function on each turned off range.
+     *
+     * @param query_cpu_range Base CPU address to loop over
+     * @param size            Size in bytes of the CPU range to loop over
+     * @param func            Function to call for each turned off region
+     */
+    template <Type type, bool clear>
+    void ForEachModifiedRange(VAddr query_cpu_range, s64 size, auto&& func) {
+        RENDERER_TRACE;
+        const size_t offset = query_cpu_range - cpu_addr;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return;
+        }
+
+        RegionBits& bits = GetRegionBits<type>();
+        // gow3: nothing modified in the range means nothing to clear or re-protect (CPU bits
+        // always match `writeable` after a change); this runs for every buffer binding, so
+        // it is checked before building the range mask.
+        if (type == Type::CPU && !bits.AnyInRange(start_page, end_page) &&
+            !Gow3Toggle::Disabled(Gow3Toggle::PageTrackingEarlyExit)) {
+            return;
+        }
+        RegionBits mask(bits, start_page, end_page);
+
+        if constexpr (clear) {
+            bits.UnsetRange(start_page, end_page);
+            if constexpr (type == Type::CPU) {
+                KeepHotPagesModified(start_page, end_page);
+                UpdateProtection<true, false>();
+            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                UpdateProtection<false, true>();
+            }
+        }
+
+        for (const auto& [start, end] : mask) {
+            func(cpu_addr + start * TRACKER_BYTES_PER_PAGE, (end - start) * TRACKER_BYTES_PER_PAGE);
+        }
+    }
+
+    /**
+     * Returns true when a region has been modified
+     *
+     * @param offset Offset in bytes from the start of the buffer
+     * @param size   Size in bytes of the region to query for modifications
+     */
+    template <Type type>
+    [[nodiscard]] bool IsRegionModified(u64 offset, u64 size) noexcept {
+        RENDERER_TRACE;
+        const size_t start_page = SanitizeAddress(offset) / TRACKER_BYTES_PER_PAGE;
+        const size_t end_page =
+            Common::DivCeil(SanitizeAddress(offset + size), TRACKER_BYTES_PER_PAGE);
+        if (start_page >= NUM_PAGES_PER_REGION || end_page <= start_page) {
+            return false;
+        }
+
+        const RegionBits& bits = GetRegionBits<type>();
+        return bits.AnyInRange(start_page, end_page);
+    }
+
+    LockType lock;
+
+private:
+    /**
+     * Notify tracker about changes in the CPU tracking state of a word in the buffer
+     *
+     * @param word_index   Index to the word to notify to the tracker
+     * @param current_bits Current state of the word
+     * @param new_bits     New state of the word
+     *
+     * @tparam track True when the tracker should start tracking the new pages
+     */
+    template <bool track, bool is_read>
+    void UpdateProtection() {
+        RENDERER_TRACE;
+        RegionBits mask = is_read ? (~gpu ^ readable) : (cpu ^ writeable);
+        if (mask.None()) {
+            return;
+        }
+        if constexpr (is_read) {
+            readable = ~gpu;
+        } else {
+            writeable = cpu;
+        }
+        tracker->UpdatePageWatchersForRegion<track, is_read>(cpu_addr, mask);
+    }
+
+    // gow3: pages the guest writes again and again (per-frame constants, skinning output)
+    // cost a protection fault in the writing thread plus an mprotect with TLB shootdowns on
+    // every upload. After HotFaults faults a page stays writable and counts as always CPU
+    // modified, so it is uploaded on every use instead. The set is rebuilt every HotPeriod.
+    // Opt-in (GOW3_HOT_PAGES=1): in the test scene the set grew to ~14k pages (56 MB), each
+    // re-uploaded on every binding, which cost far more than the faults (33 FPS) and preceded
+    // a GPU ring timeout.
+    static bool HotPagesEnabled() {
+        static const bool enabled = [] {
+            const char* env = std::getenv("GOW3_HOT_PAGES");
+            return env && env[0] == '1';
+        }();
+        return enabled && !Gow3Toggle::Disabled(Gow3Toggle::HotPages);
+    }
+    // A short period re-protects thousands of pages at once and each faults again before it is
+    // hot, a fault storm (a 2 s period gave ~20k faults/s and frame spikes).
+    static constexpr u8 HotFaults = 2;
+    static constexpr auto HotPeriod = std::chrono::seconds(20);
+
+    void CountWriteFaults(size_t start_page, size_t end_page) {
+        const bool hot_enabled = HotPagesEnabled();
+        for (size_t page = start_page; page < end_page; ++page) {
+            if (writeable.Get(page)) {
+                continue; // not protected: no fault
+            }
+            Gow3Stats::tracker_faults.fetch_add(1, std::memory_order_relaxed);
+            if (!hot_enabled) {
+                continue;
+            }
+            if (write_faults[page] < HotFaults) {
+                ++write_faults[page];
+                continue;
+            }
+            if (!hot.Get(page)) {
+                if (num_hot == 0) {
+                    hot_since = std::chrono::steady_clock::now();
+                }
+                hot.Set(page);
+                ++num_hot;
+                Gow3Stats::hot_pages.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    void KeepHotPagesModified(size_t start_page, size_t end_page) {
+        if (num_hot == 0) {
+            return;
+        }
+        if (!HotPagesEnabled() ||
+            std::chrono::steady_clock::now() - hot_since > HotPeriod) {
+            // Re-protect them (on this upload) and start counting again.
+            Gow3Stats::hot_pages.fetch_sub(num_hot, std::memory_order_relaxed);
+            hot.Clear();
+            write_faults.fill(0);
+            num_hot = 0;
+            return;
+        }
+        cpu |= RegionBits(hot, start_page, end_page);
+    }
+
+    std::array<u8, NUM_PAGES_PER_REGION> write_faults{};
+    RegionBits hot{};
+    u32 num_hot = 0;
+    std::chrono::steady_clock::time_point hot_since{};
+
     PageManager* tracker;
-    VAddr cpu_addr{};
-    u32 readbacks_mode;
+    VAddr cpu_addr = 0;
     RegionBits cpu;
     RegionBits gpu;
-    // sotc: FaultGrace state (two rotating quanta).
-    RegionBits fault_cur;
-    RegionBits fault_prev;
-    RegionBits hot_cur;
-    RegionBits hot_prev;
-    u32 grace_epoch{};
-    bool grace_any{false};
-    LockType mutex;
+    RegionBits writeable;
+    RegionBits readable;
 };
 
 } // namespace VideoCore

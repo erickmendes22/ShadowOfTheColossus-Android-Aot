@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
 #include <atomic>
 #include <thread>
 #include <magic_enum/magic_enum.hpp>
@@ -196,17 +195,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     if (micros == 0) {
         // Wait indefinitely for events
         std::unique_lock lock{m_mutex};
-        // sotc: an indefinite wait reports itself after 5 s (hang diagnosis).
-        if (!m_cond.wait_for(lock, std::chrono::seconds(5), predicate)) {
-            std::fprintf(stderr, "SOTC equeue '%s' waited 5s; registered events:", m_name.c_str());
-            for (const auto& event : m_events) {
-                std::fprintf(stderr, " [ident %#llx filter %d triggered %d]",
-                             static_cast<unsigned long long>(event.event.ident), event.event.filter,
-                             event.IsTriggered() ? 1 : 0);
-            }
-            std::fprintf(stderr, "\n");
-            m_cond.wait(lock, predicate);
-        }
+        m_cond.wait(lock, predicate);
     } else {
         // Wait up until the timeout value
         std::unique_lock lock{m_mutex};
@@ -325,14 +314,14 @@ bool EqueueInternal::EventExists(u64 id, s16 filter) {
     return it != m_events.cend();
 }
 
-static s32 NextEqueueHandle() { // bbport
+static s32 NextEqueueHandle() { // gow3
     static std::atomic<s32> next{0x40000};
     return next++;
 }
 
 s32 PS4_SYSV_ABI posix_kqueue() {
     // Reserve a file handle for the kqueue
-    // bbport: equeue handles come from their own range, not the file table.
+    // gow3: equeue handles come from their own range, not the file table.
     s32 kqueue_handle = NextEqueueHandle();
 
     // Plenty of equeue logic uses names to identify queues.
@@ -449,7 +438,7 @@ int PS4_SYSV_ABI sceKernelCreateEqueue(OrbisKernelEqueue* eq, const char* name) 
     LOG_INFO(Kernel_Event, "name = {}", name);
 
     // Reserve a file handle for the kqueue
-    // bbport: equeue handles come from their own range, not the file table.
+    // gow3: equeue handles come from their own range, not the file table.
     OrbisKernelEqueue kqueue_handle = NextEqueueHandle();
 
     // Create the equeue
@@ -627,16 +616,7 @@ int PS4_SYSV_ABI sceKernelTriggerUserEvent(OrbisKernelEqueue eq, int id, void* u
         return ORBIS_KERNEL_ERROR_EBADF;
     }
 
-    const bool found = kqueues[eq]->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata);
-    // sotc: SOTC_FLIP_TRACE=1 logs the frame handshake (user events, flips).
-    static const bool trace = std::getenv("SOTC_FLIP_TRACE") != nullptr;
-    if (trace) {
-        std::fprintf(stderr, "FLIPTRACE %lld user event '%s' id %d udata %p%s\n",
-                     static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch()).count()),
-                     std::string(kqueues[eq]->GetName()).c_str(), id, udata, found ? "" : " NOT FOUND");
-    }
-    if (!found) {
+    if (!kqueues[eq]->TriggerEvent(id, OrbisKernelEvent::Filter::User, udata)) {
         return ORBIS_KERNEL_ERROR_ENOENT;
     }
     return ORBIS_OK;

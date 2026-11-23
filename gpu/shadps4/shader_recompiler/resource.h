@@ -16,10 +16,6 @@ static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
 static constexpr u32 NUM_FMASKS = 8;
-/// Per-game dynamic_tsharp_array_size: largest array, and the descriptors all the arrays of a shader may take
-/// on top of NUM_IMAGES (room for two arrays of the largest size)
-static constexpr u32 MAX_TSHARP_ARRAY_SIZE = 64;
-static constexpr u32 NUM_IMAGE_ARRAY_DESCRIPTORS = 2 * (MAX_TSHARP_ARRAY_SIZE + 1);
 
 using SharpLocation = u16;
 
@@ -30,13 +26,6 @@ struct SharpFetch {
     static constexpr std::size_t N = sizeof(T) / sizeof(u32);
     static_assert(N <= 8);
 
-    enum class Summary : u8 {
-        SingleLoad,
-        MultiLoad,
-        Invalid,
-    };
-
-    Summary summary{Summary::MultiLoad};
     std::array<u32, N> immediates;
     std::array<SharpLocation, N> offsets;
     u8 load_mask;
@@ -45,41 +34,22 @@ struct SharpFetch {
 
     template <u32 num_dwords = N>
         requires(num_dwords <= N)
-    constexpr bool Fetch(const u32* flatbuf, T* out, u32 element_off_dw = 0) const {
-        if (summary == Summary::SingleLoad) [[likely]] {
-            std::memcpy(out, flatbuf + offsets[0] + element_off_dw, num_dwords * sizeof(u32));
-            return true;
-        } else if (summary == Summary::Invalid) [[unlikely]] {
-            return false;
-        }
+    constexpr bool Fetch(const u32* flatbuf, T* out) const {
         u8 mask = load_mask;
+        for (u32 i = 0; i < num_dwords; i++) {
+            if (offsets[i] == UNKNOWN_LOCATION) {
+                return false;
+            }
+        }
         std::array<u32, num_dwords> out_dw;
         for (u32 i = 0; i < num_dwords; i++) {
-            out_dw[i] = (mask & 1) ? flatbuf[offsets[i] + element_off_dw] : immediates[i];
+            out_dw[i] = (mask & 1) ? flatbuf[offsets[i]] : immediates[i];
             mask >>= 1;
         }
         std::memcpy(out, out_dw.data(), sizeof(out_dw));
         return true;
     }
 };
-
-/// Per-game dynamic_tsharp_array_size: a table of sharps in guest memory that the shader indexes at runtime,
-/// ReadConst(ptr, element * stride_dw + offset_dw + k). Every flat buffer refresh copies num_elements *
-/// stride_dw dwords from ptr + offset_dw * 4 to flatbuf_off, where element i starts at flatbuf_off + i *
-/// stride_dw
-struct SharpTable {
-    SharpLocation ptr_lo;
-    SharpLocation ptr_hi;
-    SharpLocation flatbuf_off;
-    u16 num_elements;
-    u32 offset_dw;
-    u32 stride_dw;
-
-    u32 NumDwords() const noexcept {
-        return num_elements * stride_dw;
-    }
-};
-using SharpTableList = boost::container::static_vector<SharpTable, 4>;
 
 enum class SharpFetchPostOp : u8 {
     None,
@@ -103,7 +73,6 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
-    LodFeedback, ///< sotc: finest mip each texture counter bank was sampled at (sotc_lod_stats.h)
 };
 
 struct BufferResource {
@@ -121,13 +90,13 @@ struct BufferResource {
 
     constexpr AmdGpu::Buffer GetSharp(const auto& info) const noexcept {
         AmdGpu::Buffer buffer;
-        if (!sharp_fetch.Fetch(info.FlatBuf().data(), &buffer)) {
+        if (!sharp_fetch.Fetch(info.FlatUserData().data(), &buffer)) {
             return AmdGpu::Buffer::Null();
         }
         if (post_op == SharpFetchPostOp::BitwiseOrDw1WithImm) {
             reinterpret_cast<u32*>(&buffer)[1] |= post_op_dw1_mask;
         } else if (post_op == SharpFetchPostOp::OffsetByProgramBase) {
-            buffer.base_address += info.PgmBase();
+            buffer.base_address += info.ProgramBase();
         }
         if (!buffer.Valid()) {
             return AmdGpu::Buffer::Null();
@@ -150,32 +119,16 @@ struct ImageResource {
     bool is_array{};
     bool is_written{};
     bool is_r128{};
+    /// gow3: read other than by normalized sampling without offsets (texel loads, size
+    /// queries, offsets): needs the native-size image, not a reduced scene proxy.
+    bool needs_native{};
     u8 constant_mip_index{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
-    /// Descriptor array over a SharpTable (0 = single image): sharp_fetch locates element 0 and element i is
-    /// array_stride_dw dwords further. The shader indexes array_size + 1 bindings; the last one stays null
-    /// and catches out-of-range indices (dynamic_tsharp_array_size, from Pink-shadPS4)
-    u16 array_size{};
-    u16 array_stride_dw{};
 
-    /// For descriptor arrays, the first valid element: it types the whole array
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
-        if (array_size == 0) {
-            return GetElementSharp(info, 0);
-        }
-        for (u32 i = 0; i < array_size; ++i) {
-            const AmdGpu::Image image = GetElementSharp(info, i);
-            if (image) {
-                return image;
-            }
-        }
-        return AmdGpu::Image::Null(is_depth);
-    }
-
-    constexpr AmdGpu::Image GetElementSharp(const auto& info, u32 element) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.FlatBuf().data(), &image, element * array_stride_dw)) {
+        if (!Fetch(info.FlatUserData().data(), &image)) {
             return AmdGpu::Image::Null(is_depth);
         }
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -194,13 +147,13 @@ struct ImageResource {
         return image;
     }
 
-    constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out, u32 element_off_dw = 0) const {
+    constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {
         if (!is_r128) {
             // Fetch full 8 byte T#
-            return sharp_fetch.Fetch(flatbuf, out, element_off_dw);
+            return sharp_fetch.Fetch(flatbuf, out);
         }
         // Fetch r128 T# and fix pitch
-        if (!sharp_fetch.Fetch<4>(flatbuf, out, element_off_dw)) {
+        if (!sharp_fetch.Fetch<4>(flatbuf, out)) {
             return false;
         }
         out->pitch = out->width;
@@ -208,16 +161,9 @@ struct ImageResource {
     }
 
     u32 NumBindings(const auto& info) const {
-        if (array_size != 0) {
-            return array_size + 1u;
-        }
-        if (mip_fallback_mode != MipStorageFallbackMode::DynamicIndex) {
-            return 1;
-        }
         const AmdGpu::Image tsharp = GetSharp(info);
-        // A garbage T# can have last_level < base_level; the difference would wrap around
-        return tsharp.last_level >= tsharp.base_level
-                   ? u32(tsharp.last_level) - u32(tsharp.base_level) + 1
+        return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
+                   ? (tsharp.last_level - tsharp.base_level + 1)
                    : 1;
     }
 };
@@ -231,9 +177,9 @@ struct SamplerResource {
 
     constexpr AmdGpu::Sampler GetSharp(const auto& info) const noexcept {
         AmdGpu::Sampler sampler{};
-        sharp_fetch.Fetch(info.FlatBuf().data(), &sampler);
+        sharp_fetch.Fetch(info.FlatUserData().data(), &sampler);
         if (post_op == SharpFetchPostOp::DisableAnisoIfSingleLod) {
-            const u32 tsharp_dw3 = info.FlatBuf()[post_op_tsharp_dw3_off];
+            const u32 tsharp_dw3 = info.FlatUserData()[post_op_tsharp_dw3_off];
             if (((tsharp_dw3 >> 12) & 0xff) == 0) {
                 sampler.max_aniso.Assign(AmdGpu::AnisoRatio::One);
             }
@@ -268,13 +214,19 @@ struct PushData {
     static constexpr u32 YOffsetIndex = 1;
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
-    static constexpr u32 BufOffsetIndex = 4;
+    static constexpr u32 UdRegsIndex = 4;
+    static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 MotionParamIndex = BufOffsetIndex + NUM_BUFFERS / 16 + 1;
+    static constexpr u32 SceneSizeIndex = MotionParamIndex + 1;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
+    std::array<u32, NUM_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    u32 motion_param; ///< gow3: object motion parameter index (0: off)
+    u32 scene_size; ///< reduced width | height << 16; zero means native pixel coordinates
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

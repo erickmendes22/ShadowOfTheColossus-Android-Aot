@@ -8,7 +8,7 @@ function (host contracts first) and otherwise binds the native export.
 Exports are matched by (NID, library identity, module identity). Imports of
 libSceLibcInternal are served by libc.prx's same-NID exports: the internal
 library is not shipped with the game and exposes the same functions.
-Output: out/boot-linked.bin (format BBPROBE5) and out/link.json.
+Output: out/boot-linked.bin (format G3PROBE5) and out/link.json.
 """
 import collections
 import hashlib
@@ -19,17 +19,17 @@ from prepare import parse_self, span, unpack
 from link_libc import encode_id
 
 DEFAULT_MODULES = ('libc.prx', 'libSceFios2.prx')
-# sotc: audio. Never shipped: the user copies them from their own console.
-SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
+
+
+def canonical(identity, fallback=None):
+    """NID#library for an import identity (NID, (library, version), module)."""
+    return f'{identity[0]}#{identity[1][0]}' if identity else fallback
 
 
 def module(path):
     source = path.read_bytes()
-    try:
-        elf, header, ph, _, missing = parse_self(source)
-    except ValueError as error:
-        raise ValueError(f'{path}: {error}') from None
+    elf, header, ph, _, missing = parse_self(source)
     dp = next(p for p in ph if p['type'] == 2)
     dynamic = []
     for pos in range(dp['offset'], dp['offset'] + dp['filesz'], 16):
@@ -98,8 +98,8 @@ def link(game, out, module_names=DEFAULT_MODULES):
     main = module(game / 'eboot.bin')
     raw = (out / 'boot.bin').read_bytes()
     magic, size, entry, ns, nr, ni, flags = unpack('<8s6Q', raw, 0)
-    if magic != b'BBPROBE2':
-        raise ValueError('linker expects freshly prepared BBPROBE2')
+    if magic != b'G3PROBE2':
+        raise ValueError('linker expects freshly prepared G3PROBE2')
     pos = 56
     segments = [unpack('<3Q', raw, pos + i * 24) for i in range(ns)]
     pos += ns * 24
@@ -112,19 +112,14 @@ def link(game, out, module_names=DEFAULT_MODULES):
         raise ValueError('unexpected boot trailer')
 
     identities = {main['identity'](name): i for i, name in enumerate(names)}
-    main_libraries = {identity: key for key, identity in main['libraries'].items()}
-    main_modules = {identity: key for key, identity in main['modules'].items()}
+    # Host tables key imports as NID#library: the eboot's own letters (#c#C) differ per game.
+    names = [canonical(main['identity'](name), name) for name in names]
 
     def imported(symbol):
         key = symbol['identity']
         if key not in identities:
-            n, lib, mod = key
-            # Main-program spelling when the identity matches (existing host
-            # tables use it); otherwise NID#library for new libraries.
-            name = (f'{n}#{main_libraries[lib]}#{main_modules[mod]}'
-                    if lib in main_libraries and mod in main_modules else f'{n}#{lib[0]}')
             identities[key] = len(names)
-            names.append(name)
+            names.append(canonical(key))
         return identities[key]
 
     exports, by_nid = {}, collections.defaultdict(list)
@@ -133,10 +128,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
     fs_patched = patch_fs_loads(image, main['ph'], 0)
     tls_module = 2
     for filename in module_names:
-        # The game's bundled modules by name; the user's own firmware modules by path.
-        source = Path(filename) if Path(filename).is_absolute() else game / 'sce_module' / filename
-        m = module(source)
-        filename = source.name
+        m = module(game / 'sce_module' / filename)
         loads = [p for p in m['ph'] if p['type'] in (1, 0x61000010)]
         modsize = max(p['vaddr'] + p['memsz'] for p in loads)
         if base + modsize > 512 * 1024 * 1024:
@@ -198,14 +190,10 @@ def link(game, out, module_names=DEFAULT_MODULES):
                 by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)
-        # sotc: the module's function table, for the CPU patches of its code (sotc_cpu.py).
-        eh = next((p for p in m['ph'] if p['type'] == 0x6474e550), None)
-        eh_frame_hdr = [base + eh['vaddr'], eh['memsz']] if eh and mapped(eh['vaddr'], eh['memsz']) else [0, 0]
         table.append(dict(file=filename, base=base, size=modsize, init=base + m['tags'].get(12, 0),
                           tls_address=base + tls['vaddr'] if tls else 0, tls_memsz=tls['memsz'] if tls else 0,
                           tls_filesz=tls['filesz'] if tls else 0, tls_module=module_id,
-                          tls_relocations=tls_relocations, exports=count, sha256=m['sha256'],
-                          eh_frame_hdr=eh_frame_hdr))
+                          tls_relocations=tls_relocations, exports=count, sha256=m['sha256']))
         base = (base + modsize + 65535) & ~65535
 
     bindings, unresolved = [], []
@@ -226,7 +214,7 @@ def link(game, out, module_names=DEFAULT_MODULES):
         raise ValueError('unsupported eboot TLS layout')
     procparam = next(p for p in main['ph'] if p['type'] == 0x61000001)
     with (out / 'boot-linked.bin').open('wb') as f:
-        f.write(struct.pack('<8s6Q', b'BBPROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
+        f.write(struct.pack('<8s6Q', b'G3PROBE5', len(image), entry, len(segments), len(relocs), len(names), flags))
         f.write(struct.pack('<Q', procparam['vaddr']))
         f.write(struct.pack('<4Q', *main_tls_values))
         f.write(struct.pack('<Q', len(table)))
@@ -261,14 +249,5 @@ if __name__ == '__main__':
     p.add_argument('game', type=Path)
     p.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'out')
     p.add_argument('--modules', nargs='*', default=list(DEFAULT_MODULES))
-    p.add_argument('--sys-modules', type=Path,
-                   help="the user's decrypted firmware modules (sys_modules): links libSceUlt and libSceNgs2 (audio)")
     a = p.parse_args()
-    modules = list(a.modules)
-    if a.sys_modules:
-        modules += [str((a.sys_modules / name).resolve()) for name in SYS_MODULES]
-    try:
-        link(a.game, a.out, modules)
-    except (ValueError, OSError) as error:
-        # sotc: a message for the launcher's log instead of a traceback (issue #52)
-        p.exit(1, f'link failed: {error}\n')
+    link(a.game, a.out, a.modules)

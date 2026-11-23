@@ -3,15 +3,20 @@
 
 #pragma once
 
-#include <chrono>
-#include <cstdlib>
-#include <unordered_map>
-
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bind_helper.h"
+#include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_constant_ring.h"
+#include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include "video_core/renderer_vulkan/vk_object_motion.h"
+#include "video_core/renderer_vulkan/vk_draw_pipe.h"
+#include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_predication.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -28,29 +33,18 @@ namespace Vulkan {
 class GraphicsPipeline;
 class Runtime;
 
-/// sotc: SOTC_DRAW_PHASES=1: TSC timers per phase of a graphics draw on the draw thread (and of
-/// its capture on the command processor), by class (depth-only, G-buffer, other), printed every
-/// 32768 draws as "SOTC DRAWPHASE". Off: one predictable branch per phase.
-namespace DrawPhase {
-inline const bool kOn = std::getenv("SOTC_DRAW_PHASES") != nullptr;
-inline u64 Now() {
-    return __builtin_ia32_rdtsc();
-}
-/// Draw thread: ExecuteBackOp's register chunk copy and per-stage user data copy, per op.
-void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords);
-/// Command processor: 0 = pipeline lookup, 1 = BackAlloc (dirty chunk copy), 2 = CaptureBackOp.
-void AddCp(u32 what, u64 ticks);
-} // namespace DrawPhase
+/// gow3: predicate state captured on the packet thread and handed to the recording thread (see
+/// vk_predication.h). The predicate value itself lives on the recording thread (the draw pipe
+/// is its only producer), so only the packet's predicate bit travels with the draw.
+struct DrawPredication {
+    bool predicated{};
+};
 
 class Rasterizer {
 public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
-
-    [[nodiscard]] Scheduler& GetScheduler() noexcept {
-        return scheduler;
-    }
 
     [[nodiscard]] Runtime& GetRuntime() noexcept {
         return runtime;
@@ -60,46 +54,25 @@ public:
         return buffer_cache;
     }
 
+    [[nodiscard]] TemporalUpscaler& GetUpscaler() noexcept {
+        return *upscaler;
+    }
+
     [[nodiscard]] VideoCore::TextureCache& GetTextureCache() noexcept {
         return texture_cache;
     }
 
-    /// resolved/use_resolved: the pipeline the command processor looked up for this draw
-    /// (Liverpool::IsBackThreaded), instead of looking it up here.
-    void Draw(bool is_indexed, u32 index_offset = 0, const Pipeline* resolved = nullptr,
-              bool use_resolved = false);
-    void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
-                      const Pipeline* resolved = nullptr, bool use_resolved = false);
+    void Draw(bool is_indexed, u32 index_offset = 0, const PreparedDraw* prepared = nullptr);
 
-    void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
-    void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,
-                          bool use_resolved = false);
-
-    /// sotc: the pipeline lookups of the draws and dispatches alone (command processor thread).
-    const Pipeline* LookupGraphicsPipeline(u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
-    /// sotc: the register-only test of FilterDraw: true when it will not record the draw. With
-    /// the draw thread the command processor then skips the pipeline lookup (a pipeline for
-    /// PrimitiveType::None would not even build).
-    bool IsDrawFilteredOut() const;
-    const Pipeline* LookupComputePipeline();
-    /// sotc: SOTC_COMPUTE_PREFETCH: a dispatch further on in a submission (command processor).
-    void PrefetchComputeShader(const AmdGpu::ComputeProgram& cs);
-    /// sotc: SOTC_GPU_TIMES (sotc_gpu_times.h): timestamps around a draw or dispatch.
-    void GpuTimesBefore(vk::CommandBuffer cmdbuf, u8 kind, const Pipeline* pipeline);
-    void GpuTimesAfter(vk::CommandBuffer cmdbuf);
-    /// sotc: SOTC_IDLE_FLUSH: the draw thread ran out of work; submits what it recorded.
-    void FlushIdle();
-    /// sotc: SOTC_GPU_TIMES: GPU writes and the cull programs' dependencies of a dispatch.
-    void GpuTimesDeps(const Shader::Info& cs);
-    bool IsGpuSideThread() const;
-    void PrepareGpuSideFault();
-    bool RunsGpuWorkElsewhere() const;
-    template <typename F>
-    void RunOnDrawThread(F&& func) {
-        RunOnDrawThreadImpl(Common::UniqueFunction<void>{std::forward<F>(func)});
+    /// gow3: draw preparation workers (vk_draw_prep.h), fed and consumed by Liverpool.
+    DrawPreparation& GetDrawPreparation() {
+        return *draw_prep;
     }
-    void RunOnDrawThreadImpl(Common::UniqueFunction<void>&& func);
+    void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
+                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+
+    void DispatchDirect();
+    void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
@@ -121,21 +94,57 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
-    bool InvalidateMemoryOnGuestFault(VAddr addr, u64 size);
-    /// sotc: after a guest write fault at addr (BufferCache::MarkWriteAhead).
-    void MarkWriteAhead(VAddr addr) {
-        buffer_cache.MarkWriteAhead(addr);
+    /// GPU thread, before a write the guest can observe (see Scheduler::WaitHostCopies).
+    void WaitHostCopies() {
+        DrainDrawPipe();
+        scheduler.WaitHostCopies();
     }
+
+    /// gow3: GPU command thread: waits until the draw recording thread has recorded every
+    /// draw handed to it (vk_draw_pipe.h); no-op on other threads.
+    /// `line`/`function`: the caller, for the statistics of where stage A waits.
+    void DrainDrawPipe(u32 reason = DrawPipe::ReasonRasterizer, u32 line = __builtin_LINE(),
+                       const char* function = __builtin_FUNCTION());
+    /// Runs `task(rasterizer, copy of data)` in order with the draws: on the draw recording
+    /// thread while the draw pipeline is in use (PipelinedTasks), else here after a drain.
+    using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
+    /// Returns true when the task was handed to the recording thread (not run yet).
+    bool RunInOrder(OrderedTask task, const void* data, u32 size,
+                    u64 toggle = Gow3Toggle::PipelinedTasks);
+    /// Stage A: the draw pipe position after the last handed-over packet, and whether the
+    /// recording thread has run everything before a position.
+    [[nodiscard]] u64 DrawPipeHead() const {
+        return draw_pipe ? draw_pipe->Head() : 0;
+    }
+    [[nodiscard]] bool DrawPipeReached(u64 position) const {
+        return !draw_pipe || draw_pipe->Reached(position);
+    }
+    /// Stage A: no draws waiting for the recording thread.
+    [[nodiscard]] bool DrawPipeIdle() const {
+        return !draw_pipe || draw_pipe->Idle();
+    }
+    /// Stage A, end of a submission: its prepared draws stay alive until the recording thread
+    /// has recorded them (instead of a drain).
+    void RetireSubmission();
+    /// Stage A: guest memory the recording thread will write for work handed to it (storage
+    /// buffers, DMA, WriteData, fences); constants overlapping it are bound there, not copied here.
+    void NotePendingGpuWrite(VAddr address, u64 size);
+    /// Before a guest-visible write: fences deferred earlier are written first.
+    void WaitDeferredSignals() {
+        scheduler.WaitDeferredSignals();
+    }
+    /// Runs `signal` after the guest memory copies issued so far, without waiting here.
+    void SignalAfterHostCopies(std::function<void()> signal) {
+        scheduler.SignalAfterHostCopies(std::move(signal));
+    }
+    /// The GPU command thread or the draw recording thread (fault handling runs inline there).
+    bool IsGpuSideThread() const;
+    bool IsGpuSideThreadId(u32 tid) const;
+    /// A guest write hit a protected page.
+    bool OnWriteFault(VAddr addr, bool assume_locks);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
-    /// Command processor thread only, see BufferCache::IsRangeGpuWritten.
-    bool IsRangeGpuWritten(VAddr addr, u64 size) const {
-        return buffer_cache.IsRangeGpuWritten(addr, size);
-    }
-    /// Command processor thread only, see BufferCache::ReadClean.
-    bool ReadCleanMemory(VAddr addr, void* out, u32 size) {
-        return buffer_cache.ReadClean(addr, out, size);
-    }
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -143,12 +152,13 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
-    /// sotc: copies the LOD feedback buffer to the host and clears it (sotc_lod_stats.h)
-    void SotcLodFeedbackCycle();
-    void OnFence();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
+    }
+
+    PredicationManager& GetPredication() {
+        return predication;
     }
 
     template <typename Func>
@@ -161,134 +171,158 @@ public:
     }
 
     std::thread::id GetGpuCommandProcessorThread();
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     u32 GetGpuCommandProcessorThreadId();
-    bool IsGpuSideThreadId(u32 tid) const;
 #endif
-
-    /// sotc: frame generation without the HUD. The game composes its UI layer (an R8G8B8A8 sRGB
-    /// render target) over the fp16 scene in one draw into the video out image; while frame
-    /// generation (FSR 3 or DLSS-G) runs, that draw is repeated into an image of its own with a transparent UI
-    /// texture (SOTC_FG_HUDLESS=0 turns it off). Thread of PrepareFrame: that image for the video
-    /// out image at `address`, viewed as `format` (layout ShaderReadOnlyOptimal), when it was
-    /// drawn since the last call; else a null view.
-    vk::ImageView TakeHudless(VAddr address, vk::Format format);
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
-    /// sotc: BbToggle::DepthFastPath (docs/sotc/DEPTH-FASTPATH.md). BeginRendering for a depth-only
-    /// draw replays the RenderState of the last full one when everything it was derived from is
-    /// provably the same (registers by Liverpool::DrawRelSerial, registry and metadata epochs,
-    /// image flags and layout state); `storage` takes the state of a full call, `token` is what
-    /// Scheduler::BeginRendering uses to skip comparing a replayed state.
-    const RenderState& BeginRenderingFast(const GraphicsPipeline* pipeline, RenderState& storage,
-                                          u64& token);
-    bool DepthFastActive() const;
-    void DepthFastEnsureRelevance();
-    u32 DepthFastBeginCheck(const GraphicsPipeline* pipeline);
-    void DepthFastBeginApply();
-    void DepthFastRecord(const RenderState& state);
-    /// sotc: BbToggle::GBufferFastPath (docs/sotc/GBUFFER-FASTPATH.md): the same for a draw with
-    /// colour targets. GBufferFastCheck is 0 when the RenderState BeginRendering would derive is
-    /// gb_memo.state and its effects are the few GBufferFastApply repeats; else why not.
-    const RenderState& GBufferFast(const GraphicsPipeline* pipeline, RenderState& storage,
-                                   u64& token);
-    u32 GBufferFastCheck(const GraphicsPipeline* pipeline);
-    void GBufferFastApply();
-    void GBufferFastRecord(const RenderState& state, const GraphicsPipeline* pipeline);
-    void RefreshImageLayouts();
+    RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
+    /// gow3: a draw continuing the open render pass with the same inputs gets the same render
+    /// state (RenderStateMemo); nothing can have broken the pass in between (barriers, copies and
+    /// dispatches end it).
+    struct BeginSignature {
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        std::array<VideoCore::ImageViewInfo, AmdGpu::NUM_COLOR_BUFFERS + 1> views{};
+        u32 mrt_mask = 0;
+        u32 num_samples = 0;
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        bool motion = false;
+        bool scene_started = false;
+        bool raster_scaling = false;
+        u64 upscaler_state = 0;
+        u64 generation = 0;
+        u32 depth_control = 0;
+        bool depth_valid = false;
+        bool stencil_valid = false;
+        bool operator==(const BeginSignature&) const = default;
+    };
+    BeginSignature MakeBeginSignature(const GraphicsPipeline* pipeline) const;
+    struct BeginMemo {
+        bool valid = false;
+        BeginSignature signature;
+        RenderState state;
+        u32 scene_size = 0;
+        std::array<float, 2> target_scale{};
+    } begin_memo;
+    u64 begin_memo_hits = 0, begin_memo_misses = 0;
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
     void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
-    /// sotc: BbToggle::DrawFixedCostOpt. UpdateDynamicState, skipped when none of the registers it
-    /// reads changed in value since the last time it ran (and the pipeline's write masks and the
-    /// feedback loop flag are the same): the dynamic state object still holds what it derived.
-    void CommitDynamicState(const GraphicsPipeline* pipeline, bool is_indexed);
-    void CommitDynamicStateOld(const GraphicsPipeline* pipeline, bool is_indexed);
-    void UpdateDynamicStateValues(const GraphicsPipeline* pipeline, bool is_indexed) const;
-    struct DynMemo {
-        bool valid{};
-        bool feedback_loop{};
-        u32 serial{};
-        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
-    };
-    DynMemo dyn_memo;
-    /// sotc: BbToggle::DepthFastPath. The inputs of the last derivation of the dynamic state values
-    /// (by any draw): no relevant register changed since (Liverpool::DrawRelSerial), the pipeline's
-    /// write masks, the feedback loop flag and indexed-ness are those; valid only while every
-    /// derivation went through this memo (the old path clears it).
-    struct DynFast {
-        bool valid{};
-        bool feedback_loop{};
-        bool is_indexed{};
-        u32 rel_serial{}; ///< Liverpool::RelDynamic
-        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
-    };
-    DynFast df_dyn;
-    std::vector<std::pair<u32, u32>> dyn_fields; ///< byte offset in the registers and size of each input
-    std::vector<u8> dyn_snap;                    ///< the inputs as of the last derivation
-    /// sotc: the vertex input last recorded with setVertexInputEXT (BindVertexBuffers), and the
-    /// DynamicState::invalidations count it was recorded at.
-    struct ViMemo {
-        bool valid{};
-        u32 invalidations{};
-        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
-        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
-    };
-    ViMemo vi_memo;
-    std::vector<u16> dyn_chunks; ///< register chunks UpdateDynamicState reads (built on first use)
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
+    /// gow3: the squaring pipeline of a scaled MIN/MAX blend when this draw can use it.
+    vk::Pipeline SquarePass(const GraphicsPipeline& pipeline) const;
     void UpdatePrimitiveState(bool is_indexed) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
+    bool FilterDrawPasses() const;
+    /// Everything of a direct draw after the pipeline selection (GPU thread or stage B).
+    void DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw* used_prepared,
+                    bool is_indexed, u32 index_offset, const DrawPredication& pred);
+    static bool DrawPipeWanted();
+    bool UseDrawPipe() const;
+    bool OnStageA() const;
+    /// Arguments of an indirect draw: `args` holds `max_count` commands `stride` apart.
+    struct IndirectDraw {
+        VAddr args;
+        VAddr count; ///< the draw count, or 0 for max_count draws
+        u32 stride;
+        u32 max_count;
+    };
+    /// Everything of an indirect draw after the pipeline selection (GPU thread or stage B).
+    void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
+                            const IndirectDraw& indirect, const DrawPredication& pred);
+    /// Everything of an indirect dispatch after the pipeline selection.
+    void DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr args, u32 size,
+                                const DrawPredication& pred);
+    /// Hands a draw (or, with `cs`, a dispatch) to the recording thread.
+    void PostDraw(const Pipeline* pipeline, const PreparedDraw* used_prepared, bool is_indexed,
+                  u32 index_offset, const DrawPredication& pred,
+                  const AmdGpu::ComputeProgram* cs = nullptr,
+                  const IndirectDraw* indirect = nullptr);
+    /// Everything of a direct dispatch after the pipeline selection (GPU thread or stage B).
+    void DispatchRecord(const ComputePipeline* pipeline, const DrawPredication& pred);
+    /// The compute registers of the dispatch being recorded.
+    const AmdGpu::ComputeProgram& CsRegs() const;
+    static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
+    struct RingBinding;
+    void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
+                             boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
+    void PrintPipeStats();
+    /// The registers of the draw being recorded: stage B's copy there, else Liverpool's.
+    const AmdGpu::Regs& Regs() const;
+    AmdGpu::CbDbExtent CbExtent(u32 index) const;
+    AmdGpu::CbDbExtent DbExtent() const;
 
-    /// sotc: SOTC_SHADOW_REUSE: true when this draw's far sun shadow cascade is reused (moved
-    /// by whole texels) instead of drawn this frame (vk_shadow_scroll.h).
-    bool ReuseShadowCascade();
-    std::unique_ptr<class ShadowScroll> shadow_scroll;
-
-    void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
-    static bool DrawBindMemoOn();
-    struct TexBindMemo;
-    struct TexBindMemoBinding;
-    void BindResolvedImage(VideoCore::ImageId image_id, VideoCore::TextureCache::BindingType type,
-                           const VideoCore::ImageViewInfo& view_info);
-    bool TexBindMemoFresh(const TexBindMemo& memo) const;
-    /// sotc: BbToggle::TexBindFastPath. 0 when BindResolvedImage for this memoized binding would
-    /// only add the descriptor the memo remembers (no upload, no barrier, same view); else why not.
-    u32 TexBindFastCheck(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
-    void TexBindFastApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
-    bool ReplayTexBindMemo(const Shader::Info& stage, TexBindMemo& memo,
-                           const AmdGpu::Image* sharps,
-                           boost::container::small_vector<u32, 8>& array_sizes,
-                           std::array<VideoCore::ImageId, Shader::NUM_IMAGES>& bind_ids,
-                           std::array<bool, Shader::NUM_IMAGES>& bind_storage, u32& num_binds);
+    void BindBuffers(const Shader::Info& stage, const PreparedStage* prepared,
+                     Shader::Backend::Bindings& binding,
+                     Shader::PushData& push_data, u32& write_index);
+    /// `on_helper`: run by the texture binding helper; out-of-date images are not refreshed.
+    void BindTextures(const Shader::Info& stage, const PreparedStage* prepared,
+                      Shader::Backend::Bindings& binding, u32& write_index, bool& barrier,
+                      bool on_helper = false);
     bool BindResources(const Pipeline* pipeline);
-    bool FastBindEligible(const Pipeline* pipeline) const;
-    u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
-    void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma);
+    void BindSamplers(const Shader::Info& stage, const PreparedStage* prepared,
+                      Shader::Backend::Bindings& binding, u32& write_index);
+    /// gow3: a stage's resolved textures remembered by its prepared T# hashes
+    /// (TextureSetMemo): a hit only redoes the per-draw effects (binding flags, transitions).
+    struct TextureSetEntry {
+        VideoCore::ImageId id{}; ///< after the depth redirect; null descriptor when invalid
+        vk::ImageView view;
+        const void* backing = nullptr;
+        VideoCore::SubresourceRange range;
+        bool proxy = false; ///< sampled from the scene proxy (view: SampleProxy on each use)
+    };
+    struct TextureSet {
+        u64 key = 0;
+        const Shader::Info* stage = nullptr;
+        u64 generation = ~0ull;
+        u64 scene_generation = 0; ///< SceneTargets::Generation of the proxy views
+        u32 count = 0;
+        static constexpr u32 MaxImages = 16; ///< larger sets are not memoized
+        std::array<u64, MaxImages> hashes{};
+        std::array<TextureSetEntry, MaxImages> entries{};
+    };
+    std::array<TextureSet, 32768> texture_sets{};
+    u64 texture_set_hits = 0, texture_set_misses = 0;
+    std::array<u64, 4> texture_set_why{}; ///< misses: other key, generation, image check, new
+    /// Returns true when the stage's images were bound from the memo.
+    bool BindTexturesFromSet(const Shader::Info& stage, const PreparedStage* prepared,
+                             u32 first_image_idx, bool& barrier, TextureSet*& slot);
+    /// The prepared sharps of `stage` in the current prepared draw, if they fit it.
+    const PreparedStage* FindPreparedStage(const Shader::Info& stage) const;
+    /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
+    /// no storage writes that invalidate cached images).
+    bool HelperEligible(const Pipeline* pipeline) const;
+    /// Whether every texture of `stage` takes the memoized path without refreshing, creating or
+    /// redirecting anything that records commands or touches the buffer cache.
+    bool TexturesBindableOnHelper(const Shader::Info& stage, const PreparedStage* prepared);
+    static void RunTextureTask(void* rasterizer);
+    static void JoinBindHelper(void* rasterizer);
 
-    void BindVertexBuffers(const GraphicsPipeline* pipeline);
+    /// Display pass: counts the frame (Gow3Stats::gpu_frames) and, with GOW3_BUFFER_STATS, the lag.
+    void NoteFrameStart();
+    /// Without an upscaler: the display buffer of the last NoteFrameStart (HUD draws go there too).
+    VAddr last_display_buffer = 0;
+    /// GOW3_GPU_PROFILE: a timestamp where a render pass starts (vk_gpu_profiler.h).
+    void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
+    void BindVertexBuffers(const GraphicsPipeline* pipeline,
+                           const PreparedDraw* prepared = nullptr);
     void BindIndexBuffer(u32 index_offset = 0);
+    /// gow3: BindVertexBuffers/BindIndexBuffer in two halves: obtaining the buffers
+    /// (vertex_binds, index_bind) and recording the binds.
+    void ResolveVertexBuffers(const GraphicsPipeline* pipeline, const PreparedDraw* prepared);
+    void EmitVertexBuffers();
+    void ResolveIndexBuffer(u32 index_offset);
+    void EmitIndexBuffer();
 
     void ResetBindings(bool is_compute);
-    void CaptureTextures();
-    static bool TaaOff(); ///< sotc: DLSS on or SOTC_TAA_OFF=1, vk_rasterizer.cpp
-    u32 CompositeUiIndex(); ///< sotc: which of the composite's two images is the UI layer
-    void MaybeDumpImages(u64 pgm_hash);
-    void FlushPeriodic();
-    u64 commands_tick{};
-    u64 commands_since_submit{};
-    u64 evict_poll{}; ///< sotc: FlushPeriodic commands without periodic submits
-    std::chrono::steady_clock::time_point commands_since{};
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -303,21 +337,23 @@ private:
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
-    // sotc: the finest mip per texture counter bank written by fragment shaders (device local),
-    // and the host copies read when the GPU reaches them (one per area in flight).
-    static constexpr u32 SotcLodFeedbackBytes = 256 * sizeof(u32); ///< + the gate word
-    static constexpr u32 SotcLodFeedbackAreas = 4;
-    u32 sotc_lod_cycles{};
-    std::unique_ptr<VideoCore::Buffer> sotc_lod_feedback;
-    std::unique_ptr<VideoCore::Buffer> sotc_lod_download;
-    std::array<std::atomic<bool>, SotcLodFeedbackAreas> sotc_lod_pending{};
-    u32 sotc_lod_area{};
-    std::chrono::steady_clock::time_point sotc_lod_last{};
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    PredicationManager predication;
+    std::unique_ptr<DrawPreparation> draw_prep;
+    std::unique_ptr<CameraMotion> camera_motion; // gow3: motion vectors (docs/upscaler.md)
+    std::unique_ptr<SceneTargets> scene_targets;
+    bool scene_started = false;
+    std::unique_ptr<ObjectMotion> object_motion;
+    bool motion_draw = false;
+    u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
+    bool gbuffer_draw = false;
+    std::unique_ptr<TemporalUpscaler> upscaler; // gow3: FSR (docs/upscaler.md)
+    std::array<float, 2> draw_jitter{};         ///< viewport offset of the current draw, pixels
+    std::array<float, 2> target_scale{1.0f, 1.0f}; ///< pass drawn into the upscaler's output-size images
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
 
@@ -325,9 +361,6 @@ private:
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
-    /// sotc: the image of each image_infos entry (null for samplers and empty slots). Ids, not
-    /// pointers: FindImage may grow the image slot vector and move every image.
-    std::array<VideoCore::ImageId, Shader::NUM_IMAGES> image_info_images{};
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     struct BoundBuffer {
@@ -337,245 +370,172 @@ private:
         bool is_written;
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
-    /// sotc: SOTC_VIS_DIRECT: bitmaps the dispatch being bound writes in the game's memory.
-    struct VisCopy {
-        VAddr address;
-        u64 size;
-        vk::Buffer buffer;
-        u64 offset;
-    };
-    std::vector<VisCopy> vis_copies;
-    /// sotc: SOTC_VIS_DIRECT v2: ranges of the game's memory a dispatch wrote directly (an unmap
-    /// of one waits for the GPU first: a late write would land in memory given back).
-    boost::icl::interval_set<VAddr> vis_ranges;
-    std::mutex vis_ranges_mutex;
-
-public:
-    /// sotc: SOTC_VIS_DIRECT v2: true while a dispatch that writes the game's memory directly has not
-    /// finished on the GPU (labels must wait for the GPU then).
-    /// sotc: SOTC_RB_PUSH: after a cull dispatch, the copies of what it wrote (buffer_cache.h).
-    void PushCullReadbacks(u64 pgm_hash);
-    bool VisWritesInFlight() {
-        const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
-        return tick && !scheduler.IsFree(tick);
-    }
-
-private:
-    bool BindVisDirect(VAddr address, u64 size, u64 alignment, Shader::Backend::Bindings& binding,
-                       Shader::PushData& push_data);
-    void AfterVisDirect();
-    /// sotc: SOTC_CULL_QUEUE (sotc_cull_queue.h): the second queue for the cull dispatches, and
-    /// its SOTC_CULL_QUEUE_VERIFY run on the graphics queue (CullVerifyCapture before the
-    /// dispatch is recorded on the cull queue, CullVerifyRun after its session ended).
-    std::unique_ptr<class CullQueue> cull_queue;
-    struct CullVerify {
-        void* slot{}; ///< CullQueue::VerifySlot
-        bool armed{};
-        vk::Buffer arena{};
-        u64 offset{};
-        u64 range{};
-        std::vector<vk::DescriptorBufferInfo> infos;
-        std::vector<vk::WriteDescriptorSet> writes;
-        Shader::PushData push{};
-    } cull_verify;
-    void CullVerifyCapture(vk::CommandBuffer cull_cmdbuf);
-    void CullVerifyRun(const class ComputePipeline* pipeline, u32 x, u32 y, u32 z);
-    /// Vertex/index buffers read by fixed-function stages of the current draw. They are recorded
-    /// as reads after the draw so later writes to the same ranges wait for it.
-    std::vector<BoundBuffer> fixed_function_reads;
-
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
 
-    using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
+    // gow3: bindings point at their description instead of copying it (a hot spot): into
+    // image_desc_cache for memoized lookups (pinned for the current BindTextures call), else
+    // into image_desc_storage.
+    using ImageBindingInfo = std::pair<VideoCore::ImageId, const VideoCore::TextureCache::ImageDesc*>;
+    // gow3: texture descriptions depend only on the T# and three resource flags; building
+    // them (mip layout sizes) for every binding of every draw was a hot spot.
+    struct ImageDescCacheEntry {
+        std::array<u64, 4> sharp{};
+        u32 flags = ~0u;
+        VideoCore::TextureCache::ImageDesc desc;
+        // Memoized FindImage for bindings without mip overrides (TextureBindingMemo).
+        u64 found_generation = ~0ULL;
+        VideoCore::ImageId found_id{};
+        VideoCore::TextureCache::ImageDesc found_desc;
+        u64 pinned = 0; ///< bind_epoch of the BindTextures call referencing found_desc
+        u64 last_use = 0;
+        // Memoized FindView for found_id (after the depth redirect): valid while the entry's
+        // FindImage memo holds and the image keeps this backing (TextureViewMemo).
+        VideoCore::TextureCache::ViewMemo view_memo;
+    };
+    std::array<ImageDescCacheEntry, 4096> image_desc_cache{};
+    u64 desc_use_counter = 0;
+    /// Entries replacing pinned cache slots during one BindTextures call.
+    boost::container::static_vector<ImageDescCacheEntry, Shader::NUM_IMAGES> image_desc_overflow;
+    boost::container::static_vector<VideoCore::TextureCache::ImageDesc, Shader::NUM_IMAGES * 2>
+        image_desc_storage;
+    u64 bind_epoch = 0;
+    // gow3: render/depth target lookups memoized by their raw register bytes while image
+    // registrations are unchanged (the descriptions depend only on those registers).
+    struct TargetMemo {
+        std::array<u8, 256> key{};
+        u32 key_size = 0;
+        u64 generation = ~0ULL;
+        VideoCore::ImageId image_id{};
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    std::array<TargetMemo, 64> target_memo{};
+    // gow3: consecutive draws mostly keep their targets; the slot's description (cb_descs,
+    // db_desc) is then still the right one and is neither looked up nor copied.
+    struct LastTarget {
+        std::array<u8, 256> key{};
+        u32 key_size = 0;
+        u64 generation = ~0ULL;
+        VideoCore::ImageId image_id{};
+    };
+    std::array<LastTarget, AmdGpu::NUM_COLOR_BUFFERS + 1> last_targets{}; ///< CBs, then DB
+    template <typename... Parts>
+    VideoCore::ImageId FindTargetMemoized(VideoCore::TextureCache::ImageDesc& desc,
+                                          LastTarget& last, auto&& make_desc,
+                                          const Parts&... parts);
+    /// The prepared draw whose pipeline the current Draw uses (its sharps are valid), or null.
+    const PreparedDraw* bind_prepared = nullptr;
+    /// `hash` is ImageDescHash(sharp, res), computed by a draw-preparation worker or here.
+    ImageDescCacheEntry& CachedImageDescEntry(const AmdGpu::Image& sharp,
+                                              const Shader::ImageResource& res, u64 hash);
+    ImageDescCacheEntry& CachedImageDescEntry(const AmdGpu::Image& sharp,
+                                              const Shader::ImageResource& res) {
+        return CachedImageDescEntry(sharp, res, ImageDescHash(sharp, res));
+    }
+    const VideoCore::TextureCache::ImageDesc& CachedImageDesc(const AmdGpu::Image& sharp,
+                                                              const Shader::ImageResource& res) {
+        return CachedImageDescEntry(sharp, res).desc;
+    }
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
-
-    /// sotc: BbToggle::DrawBindMemo. The texture bindings of a stage, resolved: for an exact set
-    /// of T#s (what ImageDesc is built from) the image each one found and the view it asked for.
-    /// A binding stays valid while the images registered at its guest address do not change (the
-    /// per-address generation FindImage's own memo uses; for a mip-tail candidate also those at
-    /// the address of the other form of the chain) and the GPU-modified epoch stays; the
-    /// per-draw effects (found tick, binding flags, image update, layout transition, usage)
-    /// are redone on every replay (BindTextures). Direct mapped on the stage and the T#s.
-    struct TexBindMemoBinding {
-        VideoCore::ImageId image_id{}; ///< as FindImage returned it (before the depth redirect)
-        VideoCore::ImageViewInfo view_info;
-        VideoCore::TextureCache::BindingType type{};
-        VAddr addr{};        ///< guest address FindImage matched the image at (0: no image)
-        u64 addr_gen{};      ///< TextureCache::FindGeneration(addr) when it did
-        VAddr other_addr{};  ///< mip-tail candidates: the address of the other form of the chain
-        u64 other_gen{};
-        // sotc: BbToggle::TexBindFastPath: what BindResolvedImage produced when this binding was
-        // stored (the image after the stencil redirect, its backing, the view and the layout the
-        // descriptor got); `fast` only for a plain texture binding that was no render target.
-        VideoCore::ImageId bound_id{};
-        const void* backing{};
-        vk::ImageView view{};
-        bool fast{};
-    };
-    static constexpr u32 MemoMaxImages = 16;
-    struct TexBindMemo {
-        const Shader::Info* stage{};
-        u64 gpu_epoch{};
-        u32 count{};
-        std::array<AmdGpu::Image, MemoMaxImages> sharps;
-        std::array<TexBindMemoBinding, MemoMaxImages> bindings;
-    };
-    /// sotc: BbToggle::DrawBindMemo. What PrepareRenderState read for the last draw (the render
-    /// target registers and extents, the pipeline's attachment mask) and the registry state it
-    /// resolved them in. While they stay the same, cb_descs/db_desc already hold what it would
-    /// compute again (the images, found by FindImage), so a draw only redoes its per-draw
-    /// effects (found tick, bound list, target flag).
-    struct RtMemo {
-        bool valid{};
-        u32 mrt_mask{};
-        u32 active_mask{}; ///< attachments with a non-empty write mask
-        bool cb_disabled{};
-        bool depth_enable{};
-        bool stencil_enable{};
-        bool depth_write{}; ///< sotc: db_desc.view_info.is_storage follows depth_write_enable
-        u32 htile{};
-        u64 image_generation{};
-        u64 gpu_epoch{};
-        u32 rel_depth{}, rel_color{}; ///< sotc: Liverpool::DrawRelSerial when stored (DepthFastPath)
-        AmdGpu::DepthBuffer depth_buffer{};
-        AmdGpu::DepthView depth_view{};
-        AmdGpu::CbDbExtent db_extent{};
-        std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> cb_extent{};
-        std::array<AmdGpu::ColorBuffer, AmdGpu::NUM_COLOR_BUFFERS> color_buffers{};
-    };
-    RtMemo rt_memo;
-    /// sotc: BbToggle::DepthFastPath. What the last full BeginRendering of a depth-only draw
-    /// derived its RenderState from, and the state itself (see BeginRenderingFast).
-    struct DepthFastMemo {
-        bool valid{};
-        u32 rel_serial{};
-        u64 image_generation{}, gpu_epoch{}, meta_epoch{};
-        VideoCore::ImageId db_id{};
-        VideoCore::ImageId stencil_id{};
-        const void* backing{};
-        vk::ImageLayout layout{};
-        vk::AccessFlags2 access{};
-        vk::PipelineStageFlags2 stage{};
-        std::optional<VideoCore::SubresourceRange> range;
-        u64 token{};
-        RenderState state{};
-    };
-    DepthFastMemo df_memo;
-    /// sotc: BbToggle::GBufferFastPath. What the last full BeginRendering of a draw with colour
-    /// targets derived its RenderState from, and the state itself (see GBufferFast).
-    struct GBufferFastMemo {
-        bool valid{};
-        u32 rel_render{}, rel_color{}, mrt_mask{}, num_cb{};
-        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> samples{};
-        u64 image_generation{}, gpu_epoch{}, meta_epoch{};
-        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS> color_id{};
-        std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS> color_backing{};
-        VideoCore::ImageId db_id{};
-        VideoCore::ImageId stencil_id{};
-        const void* db_backing{};
-        vk::ImageLayout db_layout{};
-        vk::AccessFlags2 db_access{};
-        vk::PipelineStageFlags2 db_stage{};
-        std::optional<VideoCore::SubresourceRange> db_range;
-        u64 token{};
-        RenderState state{};
-    };
-    GBufferFastMemo gb_memo;
-    /// SOTC_DEPTHFAST_WHY=1: the depth side registers as of the last record, to tell which one
-    /// moved when the register serial says the memo is out.
-    struct DepthRegsSnap {
-        AmdGpu::DepthControl depth_control{};
-        AmdGpu::DepthBuffer depth_buffer{};
-        AmdGpu::DepthRenderControl depth_render_control{};
-        AmdGpu::ColorControl color_control{};
-        AmdGpu::DepthView depth_view{};
-        u32 htile{};
-        u32 depth_clear{};
-        u32 stencil_clear{};
-        u64 db_extent{};
-    };
-    DepthRegsSnap df_snap;
-    /// The Transit BeginRendering made on the depth image (captured there, used by the memo).
-    vk::ImageLayout df_transit_layout{};
-    vk::AccessFlags2 df_transit_access{};
-    vk::PipelineStageFlags2 df_transit_stage{};
-    std::optional<VideoCore::SubresourceRange> df_transit_range;
-    u64 df_next_token{1};
-    bool df_rel_built{};
-    static constexpr u32 NumTexBindMemos = 4096;
-    struct FreeDeleter {
-        void operator()(void* p) const noexcept {
-            std::free(p);
-        }
-    };
-    std::unique_ptr<TexBindMemo[], FreeDeleter> tex_bind_memos; ///< zeroed pages, committed on use
+    struct VertexBinds {
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::Buffer> host_buffers;
+        VertexInputs<vk::DeviceSize> host_offsets;
+        VertexInputs<vk::DeviceSize> host_sizes;
+        VertexInputs<vk::DeviceSize> host_strides;
+        u32 num_buffers = 0;
+    } vertex_binds;
+    struct IndexBind {
+        vk::Buffer handle;
+        u64 offset;
+        vk::IndexType type;
+    } index_bind{};
+    /// The direct draw whose vertex/index buffers BindResources may resolve early.
+    struct DrawInputs {
+        const GraphicsPipeline* pipeline;
+        const PreparedDraw* prepared;
+        u32 index_offset;
+        bool is_indexed;
+        bool pending;
+        bool resolved;
+    } draw_inputs{};
+    // gow3: textures of a draw bound on the helper thread while this thread binds buffers.
+    static bool BindHelperWanted();
+    BindHelper bind_helper{BindHelperWanted()};
+    struct TextureTask {
+        struct Stage {
+            const Shader::Info* info;
+            const PreparedStage* prepared;
+            Shader::Backend::Bindings binding;
+            u32 write_index;
+        };
+        std::array<Stage, Shader::MaxStageTypes> stages;
+        u32 count = 0;
+        u32 completed = 0; ///< stages the helper bound; the rest are bound after the join
+        bool barrier = false;
+    } texture_task;
+    /// Draws whose textures the helper bound completely, partly or not at all (GOW3_FRAME_STATS).
+    u64 helper_full = 0, helper_partial = 0, helper_serial = 0;
+    /// The memoized cache entry of each image binding (FindImage memo taken), else null.
+    boost::container::static_vector<ImageDescCacheEntry*, Shader::NUM_IMAGES> image_binding_entries;
+    bool fault_process_pending{};
     bool attachment_feedback_loop{};
     bool needs_barrier{};
-    /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
-    /// stencil is written: one layout serves both.
-    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
-                                  const VideoCore::TextureCache::ImageDesc& desc,
-                                  bool compute) const;
-    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
-                                  const VideoCore::ImageViewInfo& view_info) const;
-    bool bind_stage_compute{}; ///< the stage BindTextures is binding is a compute shader
-
-    /// sotc: TakeHudless. BeginHudless starts the redraw of this draw (the final composite) into
-    /// its HUD-less image; false when this draw is not the composite.
-    bool BeginHudless(const GraphicsPipeline* pipeline, const RenderState& state);
-    struct HudlessImage {
-        vk::Image image;
-        vk::ImageView rt_view;   ///< in the composite's attachment format
-        vk::ImageView read_view; ///< in the format TakeHudless asked
-        vk::Format rt_format{}, read_format{};
-        struct VmaAllocation_T* allocation{};
-        u32 width{}, height{};
-        bool fresh{};
+    // gow3: two-stage draw pipeline (stage B state; the thread is the last member so it
+    // stops first).
+    static inline thread_local const AmdGpu::Regs* stage_regs = nullptr;
+    static inline thread_local const AmdGpu::ComputeProgram* stage_cs = nullptr;
+    AmdGpu::Regs pipe_regs{};
+    bool pipe_synced = false;
+    std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
+    AmdGpu::CbDbExtent pipe_db_extent{};
+    /// Stage A: small read-only guest buffers copied into the constant ring for a packet.
+    struct RingBinding {
+        u32 index;  ///< buffer resource of the stage
+        u32 size;
+        u64 offset; ///< in the ring
+        VAddr address;
     };
-    void DestroyHudless(HudlessImage& image);
-    std::unordered_map<VAddr, HudlessImage> hudless_images; ///< by video out address
-    HudlessImage hudless_clear;  ///< 1x1, all zero: the UI layer of the redraw
-    s32 hudless_ui_info{-1};     ///< this draw: image_infos index of the UI texture, -1 none
-    VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
-    vk::Format hudless_vo_format{};
-    u32 hudless_vo_width{}, hudless_vo_height{};
-    /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
-    /// the same command buffer, pipeline, push data and resource generations are current.
-    struct FastBindState {
-        const Pipeline* pipeline{};
-        u64 hash{};
-        u64 buffer_generation{};
-        u64 texture_generation{};
-        u64 stream_generation{};
-        u64 mem_epoch{}; ///< SotcStats::mem_epoch: guest memory unchanged since
-        u64 tick{};
-        bool uses_dma{};
-        bool valid{};
-        boost::container::small_vector<u32, 8> lod_marks{}; ///< SotcLod banks the bind marked
+    struct PendingWrite {
+        VAddr begin;
+        VAddr end;
+        u64 position;
     };
-    boost::container::small_vector<u32, 8> lod_marks; ///< banks marked by the bind in progress
-    FastBindState fast_bind{};
-    bool fast_bind_hit{};
-
-    /// sotc: DLSS super resolution draws the game's UI layer at the output size: each draw into
-    /// it (Dlssg::UiTarget) is drawn again into ui_shadow with its viewport and scissor scaled,
-    /// and the composite hands that to the presenter (Dlssg::NoteUiShadow). BeginUiShadow
-    /// starts the redraw of this draw, EndUiShadow restores the dynamic state.
-    bool BeginUiShadow(const GraphicsPipeline* pipeline, const RenderState& state);
-    void EndUiShadow();
-    void NoteUiShadow(); ///< at the composite: hands the shadow over, starts the next frame's
-    HudlessImage ui_shadow; ///< R8G8B8A8: rt_view sRGB, read_view UNORM
-    u32 ui_shadow_draws{};  ///< since the last composite
-    bool ui_shadow_broken{}; ///< a draw into the UI layer was not redrawn since then
-    bool ui_shadow_hit{};    ///< this draw renders into the UI layer
-    vk::Format ui_shadow_format{};
-    u32 ui_shadow_src_width{}, ui_shadow_src_height{}; ///< this draw: the UI layer size
-    u32 ui_shadow_width{}, ui_shadow_height{};         ///< this draw: the output size
-    Viewports ui_shadow_viewports;
-    Scissors ui_shadow_scissors;
+    std::vector<PendingWrite> pending_writes;
+    VAddr pending_min = ~VAddr{0}, pending_max = 0; ///< bounds of pending_writes
+    u32 pending_checks = 0;
+    u64 proxy_samples = 0; ///< texture bindings that read a scene proxy (statistics)
+    float sampler_lod_bias = 0.0f; ///< gow3: extra bias of this draw's samplers
+    bool scene_debug_frame = false; ///< GOW3_SCENE_DEBUG: this frame's passes are printed
+    bool PendingWriteOverlaps(VAddr address, u64 size);
+    /// Stage B: the ring bindings of the stages of the packet being recorded.
+    struct RingStage {
+        const Shader::Info* info;
+        const RingBinding* bindings;
+        u32 count;
+    };
+    std::array<RingStage, Shader::MaxStageTypes> ring_stages{};
+    u32 num_ring_stages = 0;
+    const RingBinding* FindRingBinding(const Shader::Info& stage, u32 index) const {
+        for (u32 i = 0; i < num_ring_stages; ++i) {
+            if (ring_stages[i].info == &stage) {
+                for (u32 j = 0; j < ring_stages[i].count; ++j) {
+                    if (ring_stages[i].bindings[j].index == index) {
+                        return &ring_stages[i].bindings[j];
+                    }
+                }
+                return nullptr;
+            }
+        }
+        return nullptr;
+    }
+    std::unique_ptr<ConstantRing> constant_ring;
+    /// Submissions (prepared draws) kept alive until stage B reaches the position.
+    std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
+    std::unique_ptr<DrawPipe> draw_pipe;
 };
 
 } // namespace Vulkan

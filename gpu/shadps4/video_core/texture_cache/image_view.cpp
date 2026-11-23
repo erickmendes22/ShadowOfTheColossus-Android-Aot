@@ -1,10 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <array>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -19,12 +15,13 @@ namespace VideoCore {
 vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
+        return vk::ImageViewType::e1D;
+    case AmdGpu::ImageType::Color1DArray:
+        return vk::ImageViewType::e1DArray;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
         return vk::ImageViewType::e2D;
-    case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
         return vk::ImageViewType::e2DArray;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageViewType::e3D;
@@ -37,13 +34,12 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     switch (view_type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
+        return image_type == AmdGpu::ImageType::Color1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DArray:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DMsaaArray:
-    case AmdGpu::ImageType::Cube:
-        return image_type == AmdGpu::ImageType::Color1D ||
-               image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
+        return image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
     case AmdGpu::ImageType::Color3D:
         return image_type == AmdGpu::ImageType::Color3D;
     default:
@@ -53,40 +49,6 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
 
 ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
     : is_storage{desc.is_written} {
-    // sotc: like the ImageInfo T# cache (image_info.cpp), every texture bind describes its view
-    // again from the same few hundred T#s. The result only depends on the 32-byte T# and on
-    // is_written/is_depth/is_array: answered from a small per-thread cache
-    // (SOTC_TEX_BIND_P1=0: always compute).
-    static const bool memo_enabled = [] {
-        const char* v = std::getenv("SOTC_TEX_BIND_P1");
-        return !v || v[0] != '0';
-    }();
-    struct Entry {
-        std::array<u64, 4> sharp;
-        u8 key;
-        bool valid;
-        ImageViewInfo view;
-    };
-    static constexpr size_t NumEntries = 512;
-    using Cache = std::array<Entry, NumEntries>;
-    static thread_local std::unique_ptr<Cache> cache =
-        memo_enabled ? std::make_unique<Cache>() : std::unique_ptr<Cache>{};
-    const u8 key = static_cast<u8>(u8{desc.is_written} | (u8{desc.is_depth} << 1) |
-                                   (u8{desc.is_array} << 2));
-    std::array<u64, 4> sharp;
-    Entry* entry = nullptr;
-    if (memo_enabled) {
-        static_assert(sizeof(sharp) == sizeof(AmdGpu::Image));
-        std::memcpy(sharp.data(), &image, sizeof(sharp));
-        const u64 hash = (sharp[0] * 0x9E3779B97F4A7C15ULL) ^ (sharp[1] * 0xC2B2AE3D27D4EB4FULL) ^
-                         (sharp[2] * 0x165667B19E3779F9ULL) ^ (sharp[3] * 0x27D4EB2F165667C5ULL) ^
-                         u64{key};
-        entry = &(*cache)[(hash ^ (hash >> 29)) % NumEntries];
-        if (entry->valid && entry->key == key && entry->sharp == sharp) {
-            *this = entry->view;
-            return;
-        }
-    }
     const auto dfmt = image.GetDataFmt();
     auto nfmt = image.GetNumberFmt();
     if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
@@ -106,13 +68,6 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
 
     if (!is_storage) {
         mapping = Vulkan::LiverpoolToVK::ComponentMapping(image.DstSelect());
-    }
-    // sotc: remember the result for the next bind of this T# (SOTC_TEX_BIND_P1).
-    if (entry) {
-        entry->sharp = sharp;
-        entry->key = key;
-        entry->view = *this;
-        entry->valid = true;
     }
 }
 
@@ -162,7 +117,32 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
-    vk::ImageViewCreateInfo image_view_ci = {
+    // gow3: storage writes never convert to sRGB and sRGB formats cannot be storage images
+    // (AMD's driver loses the device on such a view; NVIDIA tolerates it): write through the
+    // UNORM format, which stores the same bytes.
+    if (info.is_storage) {
+        switch (format) {
+        case vk::Format::eR8G8B8A8Srgb:
+            format = vk::Format::eR8G8B8A8Unorm;
+            break;
+        case vk::Format::eB8G8R8A8Srgb:
+            format = vk::Format::eB8G8R8A8Unorm;
+            break;
+        case vk::Format::eA8B8G8R8SrgbPack32:
+            format = vk::Format::eA8B8G8R8UnormPack32;
+            break;
+        case vk::Format::eR8Srgb:
+            format = vk::Format::eR8Unorm;
+            break;
+        case vk::Format::eR8G8Srgb:
+            format = vk::Format::eR8G8Unorm;
+            break;
+        default:
+            break;
+        }
+    }
+
+    const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
         .viewType = ConvertImageViewType(info.type),

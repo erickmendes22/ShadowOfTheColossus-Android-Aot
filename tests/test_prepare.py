@@ -3,7 +3,7 @@ import struct
 import unittest
 import tempfile
 from pathlib import Path
-from prepare import parse_self, inspect_libc, nid
+from prepare import parse_self, inspect_libc, nid, write_report
 
 
 def fixture():
@@ -47,6 +47,13 @@ class SelfTests(unittest.TestCase):
             self.assertFalse(inspect_libc(path)['init_env_is_ret'])
         self.assertEqual(nid('_init_env'),'bzQExy189ZI')
 
+    def test_report_with_non_latin_title_is_written_as_utf8(self):
+        title = 'ゴッド・オブ・ウォーIII リマスタード'
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'analysis.json'
+            write_report(path, dict(sfo=dict(TITLE=title)))
+            self.assertIn(title, path.read_bytes().decode('utf-8'))
+
     def test_file_offset_is_not_virtual_address(self):
         elf, header, ph, segments, missing = parse_self(fixture())
         self.assertEqual(elf[0x1000:0x1010], bytes(range(16)))
@@ -61,7 +68,7 @@ class SelfTests(unittest.TestCase):
         for flag in (2, 8):
             data = fixture()
             struct.pack_into('<Q', data, 32, 0x800 | flag)
-            with self.assertRaisesRegex(ValueError, 'still encrypted'):
+            with self.assertRaisesRegex(ValueError, 'encrypted/compressed'):
                 parse_self(data)
 
     def test_missing_required_segment_rejected(self):

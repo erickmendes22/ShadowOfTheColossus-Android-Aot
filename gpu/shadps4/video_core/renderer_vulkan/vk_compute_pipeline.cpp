@@ -1,28 +1,35 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/sotc_stats.h"
 
 namespace Vulkan {
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
-                                 const Shader::Info& info_, vk::ShaderModule module_,
-                                 SerializationSupport& sdata, bool preloading /*=false*/,
-                                 bool deferred /*=false*/)
+                                 const Shader::Info& info_, vk::ShaderModule module,
+                                 SerializationSupport& sdata, bool preloading /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
-      compute_key{compute_key_}, cache{pipeline_cache}, module{module_}, from_cache{preloading} {
+      compute_key{compute_key_} {
     auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
+
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+        .requiredSubgroupSize = 64,
+    };
+    const vk::PipelineShaderStageCreateInfo shader_ci = {
+        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .stage = vk::ShaderStageFlagBits::eCompute,
+        .module = module,
+        .pName = "main",
+    };
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
@@ -95,87 +102,18 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
-    if (deferred) {
-        ready.store(false, std::memory_order_relaxed);
-        return;
-    }
-    CreatePipeline();
-}
-
-ComputePipeline::~ComputePipeline() = default;
-
-void ComputePipeline::CreatePipeline() {
-    // sotc: 64 where every stage can be pinned to it, otherwise 32 when the device could pick a
-    // wider size (AMD): the shaders were lowered for 32 lanes (vk_instance.h). On Intel the
-    // recompiler's lane count (Instance::RequiredSubgroupSize).
-    const u32 required_size = instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eCompute);
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = required_size,
-    };
-    const bool require_size = required_size != 0;
-    const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = require_size ? &subgroup_size_ci : nullptr,
-        .stage = vk::ShaderStageFlagBits::eCompute,
-        .module = module,
-        .pName = "main",
-    };
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };
     auto [pipeline_result, pipe] =
-        instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);
-    if (pipeline_result != vk::Result::eSuccess && from_cache) {
-        // sotc: as for graphics pipelines, a cached one the driver refuses is dropped.
-        LOG_WARNING(Render_Vulkan, "Cached compute pipeline {} failed to build: {}", GetDebugString(),
-                    vk::to_string(pipeline_result));
-        return;
-    }
+        instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
-    SetObjectName(instance.GetDevice(), *pipeline, "Compute Pipeline {}", GetDebugString());
+    SetObjectName(device, *pipeline, "Compute Pipeline {}", debug_str);
 }
 
-void ComputePipeline::Build() {
-    if (claimed.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-    CreatePipeline();
-    ready.store(true, std::memory_order_release);
-    ready.notify_all();
-}
-
-void ComputePipeline::WaitBuilt() {
-    if (!claimed.load(std::memory_order_acquire)) {
-        Build();
-    }
-    ready.wait(false, std::memory_order_acquire);
-}
-
-void ComputePipeline::BindWhenReady() const {
-    if (ready.load(std::memory_order_acquire)) {
-        scheduler.CommandBuffer().bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
-        return;
-    }
-    scheduler.RecordDeferred([this](vk::CommandBuffer cmdbuf) {
-        if (!ready.load(std::memory_order_acquire)) {
-            const auto start = std::chrono::steady_clock::now();
-            if (!claimed.load(std::memory_order_acquire)) {
-                const_cast<ComputePipeline*>(this)->Build();
-                SotcStats::async_compute_self_built.fetch_add(1, std::memory_order_relaxed);
-            }
-            ready.wait(false, std::memory_order_acquire);
-            LogSlowBuild("compute wait (recorder)", start);
-            SotcStats::async_compute_wait_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start)
-                    .count(),
-                std::memory_order_relaxed);
-            SotcStats::async_compute_waits.fetch_add(1, std::memory_order_relaxed);
-        }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
-    });
-}
+ComputePipeline::~ComputePipeline() = default;
 
 } // namespace Vulkan

@@ -1,7 +1,11 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
-#include "gpu/bbgpu.h"
+#ifdef __ANDROID__
+#include "ports/sotc/android/gpu_bridge.h"
+#endif
+#include "guest_cpu.h"
+#include "gpu/gow3gpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,12 +31,17 @@ static _Thread_local unsigned char *tls_blocks[TLS_MODULES];
 static void *process_param;
 void runtime_set_procparam(void *param) { process_param=param; }
 static ABI void *guest_procparam(void) { return process_param; }
-/* sotc: libSceNgs2/libSceUlt (linked from sys_modules) ask for the eboot's SDK version. */
-static ABI int32_t compiled_sdk_version(int32_t *version) {
+void *sotc_runtime_procparam(void) { return process_param; }
+
+/* Use the original SotC HLE contract: return the SDK of the linked executable. */
+int32_t sotc_compiled_sdk_version(int32_t *version) {
     if (!version) return (int32_t)0x80020016;
-    *version=process_param ? *(const int32_t *)((const char *)process_param+16) : 0;
+    extern void *sotc_runtime_procparam(void);
+    const unsigned char *proc=(const unsigned char *)sotc_runtime_procparam();
+    *version=proc ? *(const int32_t *)(proc+16) : 0;
     return 0;
 }
+
 static void **application_heap_api;
 static ABI void guest_set_heap_api(void **api) {
     application_heap_api=api;
@@ -78,7 +87,6 @@ void runtime_report(void) {
            calls_init, calls_atexit, calls_cxa, handler_count);
     printf("Runtime: static guards acquired=%zu, released=%zu\n", (size_t)guards_acquired, (size_t)guards_released);
     runtime_thread_report();
-    runtime_fiber_report();
     runtime_mutex_report();
     runtime_rwlock_report();
     runtime_sema_report();
@@ -129,8 +137,11 @@ void runtime_finalize(void *dso) {
         if (!i) { pthread_mutex_unlock(&handler_lock); return; }
         ExitHandler handler = handlers[i-1]; handlers[i-1].active = 0;
         pthread_mutex_unlock(&handler_lock);
-        if (handler.with_arg) handler.callback.with_arg(handler.argument);
-        else handler.callback.plain();
+        /* Destructors are guest functions: they run through the boundary (a plain call on
+         * x86-64 hosts, the JIT elsewhere). */
+        if (handler.with_arg) guest_cpu_call((uintptr_t)handler.callback.with_arg,1,
+                                             (const uint64_t[]){ (uint64_t)(uintptr_t)handler.argument });
+        else guest_cpu_call((uintptr_t)handler.callback.plain,0,NULL);
     }
 }
 static ABI void guest_finalize(void *dso) { runtime_finalize(dso); }
@@ -186,88 +197,171 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
     runtime_report();
     exit(status);
 }
-uintptr_t runtime_resolve(const char *scoped, int is_data) {
+/* Imports are spelled NID#library by link_modules.py, the same for every game. libScePosix
+ * exports libkernel's symbols with the same contracts, so both share the libkernel key. */
+/* SotC imports have numeric module scopes; only legacy HLE functions need
+ * their original NID#library keys. SotC-only/GPU exports keep bare NIDs. */
+static const char *canonical_name(const char *name, char out[128]) {
+    const char *posix=strstr(name,"#libScePosix");
+    if (!posix || posix[12] || posix-name>100) return name;
+    snprintf(out,128,"%.*s#libkernel",(int)(posix-name),name);
+    return out;
+}
+uintptr_t runtime_resolve(const char *name, int is_data) {
     if (!(capabilities & 1)) return 0;
-    /* sotc: imports are matched by NID alone. The #library#module suffix letters are
-     * assigned per executable, so the Bloodborne spellings do not apply to other games. */
-    char name[16];
-    size_t length=strcspn(scoped,"#");
-    if (length>=sizeof(name)) return 0;
-    memcpy(name,scoped,length); name[length]=0;
+    char canonical[128];
+    char sotc_nid[16];
+    const int is_sotc = getenv("SOTC_PORT") != NULL;
+    if (is_sotc) {
+        /* The SotC eboot and its linked PRXs use different scoped module
+         * suffixes than GoW3. Resolve HLE by the stable 11-character NID,
+         * not by a GoW3-specific #library suffix. */
+        size_t length=strcspn(name,"#");
+        if (!length || length>=sizeof(sotc_nid)) return 0;
+        memcpy(sotc_nid,name,length);
+        sotc_nid[length]=0;
+        name=sotc_nid;
+    } else {
+        name=canonical_name(name,canonical);
+    }
     if (is_data) {
         static int32_t need_libc_internal = 1; /* SDK marker variable referenced by Fios2 */
-        if (!strcmp(name, "f7uOxY9mM1U")) return (uintptr_t)&stack_canary;
-        if (!strcmp(name, "ZT4ODD2Ts9o")) return (uintptr_t)&need_libc_internal;
+        if (is_sotc && !strcmp(name,"f7uOxY9mM1U")) return (uintptr_t)&stack_canary;
+        if (is_sotc && !strcmp(name,"ZT4ODD2Ts9o")) return (uintptr_t)&need_libc_internal;
+        if (!strcmp(name, "f7uOxY9mM1U#libkernel")) return (uintptr_t)&stack_canary;
+        if (!strcmp(name, "ZT4ODD2Ts9o#libSceLibcInternal")) return (uintptr_t)&need_libc_internal;
+        static const char *progname = "eboot.bin";
+        if (!strcmp(name, "djxxOmW6-aw#libkernel")) return (uintptr_t)&progname;
         return 0;
     }
-    /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
-    if (!strcmp(name, "bzQExy189ZI")) return (uintptr_t)init_env;
-    if (!strcmp(name, "8G2LB+A3rzg")) return (uintptr_t)guest_atexit;
-    if (!strcmp(name, "tsvEmnenz48")) return (uintptr_t)guest_cxa_atexit;
-    if (!strcmp(name, "uMei1W9uyNo")) return (uintptr_t)guest_libc_exit;
+    /* Exact imports; the suffix is the exporting library. */
+    if (is_sotc) {
+        if (!strcmp(name,"bzQExy189ZI")) return (uintptr_t)init_env;
+        if (!strcmp(name,"8G2LB+A3rzg")) return (uintptr_t)guest_atexit;
+        if (!strcmp(name,"tsvEmnenz48")) return (uintptr_t)guest_cxa_atexit;
+        if (!strcmp(name,"uMei1W9uyNo")) return (uintptr_t)guest_libc_exit;
+        if (!strcmp(name,"H2e8t5ScQGc")) return (uintptr_t)guest_finalize;
+        if (!strcmp(name,"3GPpjQdAMTw")) return (uintptr_t)guard_acquire;
+        if (!strcmp(name,"9rAeANT2tyE")) return (uintptr_t)guard_release;
+        if (!strcmp(name,"2emaaluWzUw")) return (uintptr_t)guard_abort;
+        if (!strcmp(name,"Ou3iL1abvng")) return (uintptr_t)stack_fail;
+        if (!strcmp(name,"8zTFvBIAIN8")) return (uintptr_t)guest_memset;
+        if (!strcmp(name,"Q3VBxCXhUHs")) return (uintptr_t)guest_memcpy;
+        if (!strcmp(name,"+P6FRGH4LfA")) return (uintptr_t)guest_memmove;
+        if (!strcmp(name,"DfivPArhucg")) return (uintptr_t)guest_memcmp;
+        if (!strcmp(name,"j4ViWNHEgww")) return (uintptr_t)guest_strlen;
+        if (!strcmp(name,"vNe1w4diLCs")) return (uintptr_t)guest_tls_get_addr;
+        if (!strcmp(name,"959qrazPIrg")) return (uintptr_t)guest_procparam;
+        if (!strcmp(name,"p5EcQeEeJAE")) return (uintptr_t)guest_set_heap_api;
+        if (!strcmp(name,"WB66evu8bsU")) {
+            /* PS4 SDK version query for the user's NGS2/Ult PRXs. */
+            extern int32_t sotc_compiled_sdk_version(int32_t *);
+            return (uintptr_t)sotc_compiled_sdk_version;
+        }
+    }
+
+    if (!strcmp(name, "bzQExy189ZI#libc")) return (uintptr_t)init_env;
+    if (!strcmp(name, "8G2LB+A3rzg#libc")) return (uintptr_t)guest_atexit;
+    if (!strcmp(name, "tsvEmnenz48#libc")) return (uintptr_t)guest_cxa_atexit;
+    if (!strcmp(name, "uMei1W9uyNo#libc")) return (uintptr_t)guest_libc_exit;
     /* Not imported by the current eboot, exposed for ABI tests/future use. */
-    if (!strcmp(name, "H2e8t5ScQGc")) return (uintptr_t)guest_finalize;
-    if (!strcmp(name, "3GPpjQdAMTw")) return (uintptr_t)guard_acquire;
-    if (!strcmp(name, "9rAeANT2tyE")) return (uintptr_t)guard_release;
-    if (!strcmp(name, "2emaaluWzUw")) return (uintptr_t)guard_abort;
-    if (!strcmp(name, "Ou3iL1abvng")) return (uintptr_t)stack_fail;
-    if (!strcmp(name, "8zTFvBIAIN8")) return (uintptr_t)guest_memset;
-    if (!strcmp(name, "Q3VBxCXhUHs")) return (uintptr_t)guest_memcpy;
-    if (!strcmp(name, "+P6FRGH4LfA")) return (uintptr_t)guest_memmove;
-    if (!strcmp(name, "DfivPArhucg")) return (uintptr_t)guest_memcmp;
-    if (!strcmp(name, "j4ViWNHEgww")) return (uintptr_t)guest_strlen;
-    if (!strcmp(name, "vNe1w4diLCs")) return (uintptr_t)guest_tls_get_addr;
-    if (!strcmp(name, "959qrazPIrg")) return (uintptr_t)guest_procparam;
-    if (!strcmp(name, "WB66evu8bsU")) return (uintptr_t)compiled_sdk_version;
-    if (!strcmp(name, "p5EcQeEeJAE")) return (uintptr_t)guest_set_heap_api;
-    uintptr_t mutex = runtime_mutex_resolve(name);
+    if (!strcmp(name, "H2e8t5ScQGc#libc")) return (uintptr_t)guest_finalize;
+    if (!strcmp(name, "3GPpjQdAMTw#libc")) return (uintptr_t)guard_acquire;
+    if (!strcmp(name, "9rAeANT2tyE#libc")) return (uintptr_t)guard_release;
+    if (!strcmp(name, "2emaaluWzUw#libc")) return (uintptr_t)guard_abort;
+    if (!strcmp(name, "Ou3iL1abvng#libkernel")) return (uintptr_t)stack_fail;
+    if (!strcmp(name, "8zTFvBIAIN8#libc")) return (uintptr_t)guest_memset;
+    if (!strcmp(name, "Q3VBxCXhUHs#libc")) return (uintptr_t)guest_memcpy;
+    if (!strcmp(name, "+P6FRGH4LfA#libc")) return (uintptr_t)guest_memmove;
+    if (!strcmp(name, "DfivPArhucg#libc")) return (uintptr_t)guest_memcmp;
+    if (!strcmp(name, "j4ViWNHEgww#libc")) return (uintptr_t)guest_strlen;
+    if (!strcmp(name, "vNe1w4diLCs#libkernel")) return (uintptr_t)guest_tls_get_addr;
+    if (!strcmp(name, "959qrazPIrg#libkernel")) return (uintptr_t)guest_procparam;
+    if (!strcmp(name, "p5EcQeEeJAE#libkernel")) return (uintptr_t)guest_set_heap_api;
+    char legacy_buffer[64];
+    const char *legacy = is_sotc ? runtime_sotc_legacy_import(name,legacy_buffer) : name;
+    if (!legacy) return 0;
+    uintptr_t mutex = runtime_mutex_resolve(legacy);
     if (mutex) return mutex;
-    uintptr_t thread = runtime_thread_resolve(name);
+    uintptr_t thread = runtime_thread_resolve(legacy);
     if (thread) return thread;
-    uintptr_t content=runtime_content_resolve(name);
+    uintptr_t content=runtime_content_resolve(legacy);
     if (content) return content;
-    uintptr_t timer = runtime_time_resolve(name);
+    uintptr_t timer = runtime_time_resolve(legacy);
     if (timer) return timer;
-    uintptr_t sema = runtime_sema_resolve(name);
+    uintptr_t sema = runtime_sema_resolve(legacy);
     if (sema) return sema;
-    uintptr_t rwlock = runtime_rwlock_resolve(name);
+    uintptr_t rwlock = runtime_rwlock_resolve(legacy);
     if (rwlock) return rwlock;
-    uintptr_t memory = runtime_memory_resolve(name);
+    uintptr_t memory = runtime_memory_resolve(legacy);
     if (memory) return memory;
-    uintptr_t kernel = runtime_kernel_resolve(name);
+    uintptr_t kernel = runtime_kernel_resolve(legacy);
     if (kernel) return kernel;
-    uintptr_t services = runtime_services_resolve(name);
+    uintptr_t services = runtime_services_resolve(legacy);
     if (services) return services;
-    uintptr_t ajm = runtime_ajm_resolve(name);
+    uintptr_t ajm = runtime_ajm_resolve(legacy);
     if (ajm) return ajm;
-    uintptr_t audio = runtime_audio_resolve(name);
+    uintptr_t videodec = runtime_videodec_resolve(legacy);
+    if (videodec) return videodec;
+    uintptr_t audio = runtime_audio_resolve(legacy);
     if (audio) return audio;
-    uintptr_t pad = runtime_pad_resolve(name);
+    uintptr_t pad = runtime_pad_resolve(legacy);
     if (pad) return pad;
-    uintptr_t rtc = runtime_rtc_resolve(name);
+    uintptr_t rtc = runtime_rtc_resolve(legacy);
     if (rtc) return rtc;
-    uintptr_t save = runtime_savedata_resolve(name);
+    uintptr_t save = runtime_savedata_resolve(legacy);
     if (save) return save;
+    if (getenv("SOTC_PORT")) {
+        extern uintptr_t runtime_sotc_resolve(const char *);
+        uintptr_t sotc = runtime_sotc_resolve(name);
+        if (sotc) return sotc;
+    }
+    if (getenv("SOTC_PORT")) {
+        extern uintptr_t runtime_fiber_resolve(const char *);
+        uintptr_t fiber = runtime_fiber_resolve(name);
+        if (fiber) return fiber;
+    }
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
-    uintptr_t fiber = runtime_fiber_resolve(name);
-    if (fiber) return fiber;
-    /* sotc: the software NGS2 mixer (runtime_ngs2.c) before runtime_sotc.c's silent stand-ins;
-     * the player's own libSceNgs2.sprx still wins when it is linked (probe.c prefer_native). */
-    uintptr_t ngs2 = runtime_ngs2_resolve(name);
-    if (ngs2) return ngs2;
-    uintptr_t sotc = runtime_sotc_resolve(name);
-    if (sotc) return sotc;
-    return bbgpu_resolve(name);
+#ifdef __ANDROID__
+    if (is_sotc) return sotc_gpu_resolve(name);
+#endif
+    return gow3gpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={
 #include "import_names.inc"
 };
+/* Recover the library name required by legacy HLE resolvers from the
+ * verified PS4 NID table. SotC's #0#F etc. scopes are per-dump indices.
+ * Functions new to SotC and not in the legacy table use #libkernel:
+ * e.g. scePthreadAttrGetdetachstate and scePthreadAttrGetstacksize. */
+const char *runtime_sotc_legacy_import(const char *scoped, char fallback[64]) {
+    if (!scoped || !fallback) return NULL;
+    size_t n=strcspn(scoped,"#");
+    if (n!=11) return NULL;
+    for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i) {
+        if (!memcmp(import_names[i].nid,scoped,n) &&
+            import_names[i].nid[n]=='#') return import_names[i].nid;
+    }
+    snprintf(fallback,64,"%.*s#libkernel",(int)n,scoped);
+    return fallback;
+}
+/* Original SotC port NID -> symbol table, kept separate from GoW3's. */
+static const struct { const char *nid, *symbol; } sotc_import_names[]={
+#include "sotc_import_names.inc"
+};
 /* Symbol name for a scoped NID, or NULL when this eboot/libc never imports it. */
 const char *runtime_symbol(const char *nid) {
-    size_t length=strcspn(nid,"#");
+    if (getenv("SOTC_PORT")) {
+        const size_t n=strcspn(nid,"#");
+        for (size_t i=0;i<sizeof(sotc_import_names)/sizeof(*sotc_import_names);++i)
+            if (strlen(sotc_import_names[i].nid)==n &&
+                !memcmp(nid,sotc_import_names[i].nid,n))
+                return sotc_import_names[i].symbol;
+        return NULL;
+    }
     for (size_t i=0;i<sizeof(import_names)/sizeof(*import_names);++i)
-        if (strlen(import_names[i].nid)==length && !memcmp(nid,import_names[i].nid,length)) return import_names[i].symbol;
+        if (!strcmp(nid,import_names[i].nid)) return import_names[i].symbol;
     return NULL;
 }
 /* Same symbol name means same contract whether imported from libkernel or
@@ -279,6 +373,7 @@ uintptr_t runtime_lookup(const RuntimeExport *table,size_t count,const char *nid
     return 0;
 }
 const char *runtime_import_name(const char *name) {
-    const char *symbol=runtime_symbol(name);
+    char canonical[128];
+    const char *symbol=runtime_symbol(canonical_name(name,canonical));
     return symbol ? symbol : "name not resolved; see analysis.json import_name_hints";
 }

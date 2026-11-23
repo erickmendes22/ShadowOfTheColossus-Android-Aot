@@ -8,16 +8,6 @@
 
 namespace Shader::Optimization {
 
-static void AddFlatbuf(Info& info) {
-    if (!info.has_flatbuf) {
-        info.buffers.push_back({
-            .used_types = IR::Type::U32,
-            .buffer_type = BufferType::Flatbuf,
-        });
-        info.has_flatbuf = true;
-    }
-}
-
 void Visit(Info& info, const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::GetAttribute:
@@ -29,7 +19,7 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.stores.Set(inst.Arg(0).Attribute(), inst.Arg(2).U32());
         break;
     case IR::Opcode::GetUserData:
-        AddFlatbuf(info);
+        info.ud_mask.Set(inst.Arg(0).ScalarReg());
         break;
     case IR::Opcode::SetPatch: {
         const auto patch = inst.Arg(0).Patch();
@@ -154,17 +144,17 @@ void Visit(Info& info, const IR::Inst& inst) {
         info.uses_shader_clock = true;
         break;
     case IR::Opcode::ReadConst:
-        AddFlatbuf(info);
+        if (!info.has_readconst) {
+            info.buffers.push_back({
+                .used_types = IR::Type::U32,
+                .buffer_type = BufferType::Flatbuf,
+            });
+            info.has_readconst = true;
+        }
         if (inst.Flags<u32>() == 0) {
             info.readconst_types |= Info::ReadConstType::Immediate;
             info.readconst_types |= Info::ReadConstType::Dynamic;
             info.uses_dma = true;
-        }
-        break;
-    case IR::Opcode::ImageSampleImplicitLod:
-    case IR::Opcode::ImageSampleDrefImplicitLod:
-        if (info.sw_stage == SwStage::Fragment && LodFeedbackEnabled()) {
-            info.uses_lod_feedback = true;
         }
         break;
     case IR::Opcode::PackUfloat10_11_11:
@@ -191,16 +181,6 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         info.readconst_types = Info::ReadConstType::None;
     }
 
-    if (info.uses_lod_feedback) {
-        // The T#s are read from the flat buffer at run time: the bank and size change per draw.
-        AddFlatbuf(info);
-        info.buffers.push_back({
-            .used_types = IR::Type::U32,
-            .buffer_type = BufferType::LodFeedback,
-            .is_written = true,
-        });
-    }
-
     if (info.uses_dma) {
         info.buffers.push_back({
             .used_types = IR::Type::U64,
@@ -213,40 +193,6 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             .is_written = true,
         });
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
-    }
-
-    // sotc: whether the SPIR-V needs 64-bit integers. GPUs without shaderInt64 (Intel Iris Xe)
-    // must not get the Int64 capability, and most shaders keep no 64-bit value after the
-    // optimization passes: a ballot whose uses are all 32-bit unpacks or BallotFindLsb is
-    // emitted as a uvec2 instead (EmitBallot).
-    info.uses_int64 = info.uses_dma || info.readconst_types != Info::ReadConstType::None ||
-                      info.uses_buffer_int64_atomics ||
-                      info.uses_shared_int64_atomics || True(info.shared_types & IR::Type::U64);
-    for (IR::Block* const block : program.post_order_blocks) {
-        for (IR::Inst& inst : block->Instructions()) {
-            if (info.uses_int64) {
-                break;
-            }
-            // A 64-bit immediate argument (InverseBallot of a partial exec mask, FindILsb64 of a
-            // constant) is emitted as a 64-bit constant too.
-            for (size_t i = 0; i < inst.NumArgs(); ++i) {
-                const IR::Value arg = inst.Arg(i);
-                info.uses_int64 |= arg.IsImmediate() && arg.Type() == IR::Type::U64;
-            }
-            if (inst.Type() != IR::Type::U64) {
-                continue;
-            }
-            const bool ballot_halves =
-                inst.GetOpcode() == IR::Opcode::Ballot &&
-                std::ranges::all_of(inst.Uses(), [](const IR::Use& use) {
-                    const auto op = use.user->GetOpcode();
-                    return op == IR::Opcode::UnpackUint2x32 || op == IR::Opcode::BallotFindLsb;
-                });
-            info.uses_int64 |= !ballot_halves;
-        }
-    }
-    for (const auto& buffer : info.buffers) {
-        info.uses_int64 |= True(buffer.used_types & IR::Type::U64);
     }
 }
 

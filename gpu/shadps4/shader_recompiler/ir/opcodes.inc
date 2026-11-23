@@ -20,7 +20,6 @@ OPCODE(ReadConstBuffer,                                     U32,            Opaq
 // Barriers
 OPCODE(Barrier,                                             Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
-OPCODE(SubgroupBarrier,                                     Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
 
 // Geometry shader specific
@@ -421,7 +420,6 @@ OPCODE(ConvertS32S16,                                       U32,            U16,
 
 // Image operations
 OPCODE(ImageHandle,                                         Opaque,         U32x4,          U32x4,                                                          )
-OPCODE(ImageArrayHandle,                                    Opaque,         U32,            U32,                                                            )
 OPCODE(ImageSampleRaw,                                      F32x4,          Opaque,         Opaque,         F32x4,          F32x4,          F32x4,          F32,           )
 OPCODE(ImageSampleImplicitLod,                              F32x4,          Opaque,         F32x4,          F32,            Opaque,                         )
 OPCODE(ImageSampleExplicitLod,                              F32x4,          Opaque,         Opaque,         F32,            Opaque,                         )
@@ -452,10 +450,7 @@ OPCODE(ImageAtomicExchange32,                               U32,            Opaq
 OPCODE(ImageAtomicCmpSwap32,                                U32,            Opaque,         Opaque,         U32,            U32,                            )
 
 // Cube operations - optional, usable if profile.supports_native_cube_calc
-OPCODE(CubeFaceIndex,                                       F32,            F32,            F32,            F32,                                            )
-OPCODE(CubeFaceCoordS,                                      F32,            F32,            F32,            F32,                                            )
-OPCODE(CubeFaceCoordT,                                      F32,            F32,            F32,            F32,                                            )
-OPCODE(CubeFaceMajorAxis,                                   F32,            F32,            F32,            F32,                                            )
+OPCODE(CubeFaceIndex,                                       F32,            F32x3,                                                                          )
 
 // Warp operations
 OPCODE(LaneId,                                              U32,                                                                                            )

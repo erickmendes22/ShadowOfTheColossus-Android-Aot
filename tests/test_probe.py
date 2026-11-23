@@ -6,12 +6,12 @@ import subprocess
 import tempfile
 import unittest
 
-EXE = ROOT / 'out/bb-probe'
+EXE = ROOT / 'out/gow3-probe'
 
 
 def package(code, relocs=(), names=(), capabilities=None):
     image = code.ljust(4096, b'\0')
-    header = struct.pack('<8sQQQQQ', b'BBPROBE1' if capabilities is None else b'BBPROBE2', len(image), 0, 1, len(relocs), len(names))
+    header = struct.pack('<8sQQQQQ', b'G3PROBE1' if capabilities is None else b'G3PROBE2', len(image), 0, 1, len(relocs), len(names))
     if capabilities is not None:
         header += struct.pack('<Q', capabilities)
     segment = struct.pack('<QQQ', 0, len(image), 5)
@@ -25,7 +25,7 @@ def native_package(name='fixture-native', binding_address=4112, binding_kind=1,
     code = b'\x48\x83\xec\x08\xff\x15\x16\0\0\0\x48\x83\xc4\x08\xff\x25\x14\0\0\0'
     image = code.ljust(4096,b'\0') + init.ljust(16,b'\0') + native
     image = image.ljust(12288,b'\0')
-    header=struct.pack('<8s6Q',b'BBPROBE3',len(image),0,3,2,2,1)
+    header=struct.pack('<8s6Q',b'G3PROBE3',len(image),0,3,2,2,1)
     meta=metadata or (4096,8192,4096,8192,32,4,1,256)
     return (header + struct.pack('<8Q',*meta) + struct.pack('<3Q',0,binding_address,binding_kind)
             + struct.pack('<9Q',0,4096,5,4096,4096,lib_flags,8192,4096,6)
@@ -38,8 +38,8 @@ class LoaderTests(unittest.TestCase):
     def test_invalid_content_profile_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path=Path(tmp)/'content.bin'
-            for data in (b'BBCONT01',struct.pack('<8s5I',b'BBCONT01',2,0,0,0,0),
-                         struct.pack('<8s5I',b'BBCONT01',3,0,0,0,0)+b'extra'):
+            for data in (b'G3CONT01',struct.pack('<8s5I',b'G3CONT01',2,0,0,0,0),
+                         struct.pack('<8s5I',b'G3CONT01',3,0,0,0,0)+b'extra'):
                 with self.subTest(data=data):
                     path.write_bytes(data)
                     r=self.run_image(package(b'\xc3'),'--content-profile',str(path))
@@ -66,7 +66,7 @@ class LoaderTests(unittest.TestCase):
         self.assertIn('first unsupported PS4 import: after-native',r.stdout)
 
     def test_host_contract_takes_priority_over_native_export(self):
-        r=self.run_image(native_package(name='bzQExy189ZI#q#q',native=b'\x0f\x0b'))
+        r=self.run_image(native_package(name='bzQExy189ZI#libc',native=b'\x0f\x0b'))
         self.assertEqual(r.returncode,20,r.stdout+r.stderr)
         self.assertIn('_init_env returned',r.stdout)
         self.assertIn('first unsupported PS4 import: after-native',r.stdout)
@@ -121,17 +121,28 @@ class LoaderTests(unittest.TestCase):
     def test_runtime_returns_from_verified_init_env(self):
         # Align stack, call _init_env through +32, then tail-jump to unknown +40.
         code = b'\x48\x83\xec\x08\xff\x15\x16\0\0\0\x48\x83\xc4\x08\xff\x25\x14\0\0\0'
-        data = package(code, [(32,1,0,0),(40,1,1,0)], ['bzQExy189ZI#q#q','after-init'], 1)
+        data = package(code, [(32,1,0,0),(40,1,1,0)], ['bzQExy189ZI#libc','after-init'], 1)
         r = self.run_image(data)
         self.assertEqual(r.returncode,20,r.stderr)
         self.assertIn('first unsupported PS4 import: after-init',r.stdout)
         self.assertIn('_init_env=1',r.stdout)
         strict = self.run_image(data,'--strict-imports')
         self.assertEqual(strict.returncode,20,strict.stderr)
-        self.assertIn('first unsupported PS4 import: bzQExy189ZI#q#q',strict.stdout)
+        self.assertIn('first unsupported PS4 import: bzQExy189ZI#libc',strict.stdout)
+
+    def test_check_imports_lists_missing_without_running(self):
+        code = b'\x0f\x0b'  # would fault if the game ran
+        data = package(code, [(32,1,0,0),(40,1,1,0)], ['bzQExy189ZI#libc','missing#libSceFixture'], 1)
+        r = self.run_image(data,'--check-imports')
+        self.assertEqual(r.returncode,1,r.stderr)
+        self.assertIn('MISSING: missing#libSceFixture',r.stdout)
+        self.assertNotIn('bzQExy189ZI',r.stdout)
+        ok = self.run_image(package(code,[(32,1,0,0)],['bzQExy189ZI#libc'],1),'--check-imports')
+        self.assertEqual(ok.returncode,0,ok.stderr)
+        self.assertIn('Imports: 0 missing',ok.stdout)
 
     def test_unverified_runtime_stays_disabled(self):
-        r = self.run_image(package(b'\xff\x25\x02\0\0\0\x90\x90',[(8,1,0,0)],['bzQExy189ZI#q#q'],0))
+        r = self.run_image(package(b'\xff\x25\x02\0\0\0\x90\x90',[(8,1,0,0)],['bzQExy189ZI#libc'],0))
         self.assertEqual(r.returncode,20,r.stderr)
         self.assertIn('_init_env=0',r.stdout)
 

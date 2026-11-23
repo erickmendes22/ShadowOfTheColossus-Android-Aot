@@ -1,3 +1,6 @@
+#ifdef __ANDROID__
+#include "video_core/renderer_vulkan/vk_swapchain_ahb.h"
+#else
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -47,9 +50,7 @@ public:
     }
 
     vk::SurfaceFormatKHR GetSurfaceFormat() const {
-        return needs_hdr ? vk::SurfaceFormatKHR{.format = vk::Format::eA2B10G10R10UnormPack32,
-                                                .colorSpace = vk::ColorSpaceKHR::eHdr10St2084EXT}
-                         : surface_format;
+        return surface_format;
     }
 
     vk::SwapchainKHR GetHandle() const {
@@ -72,6 +73,10 @@ public:
         return frame_index;
     }
 
+    vk::ImageLayout PresentLayout() const { return vk::ImageLayout::ePresentSrcKHR; }
+    std::pair<u32,u32> AcquireQueues() const { return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED}; }
+    std::pair<u32,u32> ReleaseQueues() const { return {VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED}; }
+
     vk::Extent2D GetExtent() const {
         return extent;
     }
@@ -89,6 +94,10 @@ public:
     }
 
     void SetHDR(bool hdr);
+
+    /// gow3: VSync from the in-game menu (Gow3Settings::vsync); recreates the swapchain when it
+    /// changed. Present thread only.
+    void UpdateVsync();
 
     bool GetHDR() const {
         return needs_hdr;
@@ -121,6 +130,7 @@ private:
     vk::SurfaceFormatKHR surface_format;
     vk::Format view_format;
     vk::PresentModeKHR present_mode;
+    bool vsync = true; ///< the setting present_mode was chosen for
     vk::Extent2D extent;
     vk::SurfaceTransformFlagBitsKHR transform;
     vk::CompositeAlphaFlagBitsKHR composite_alpha;
@@ -139,3 +149,5 @@ private:
 };
 
 } // namespace Vulkan
+
+#endif
