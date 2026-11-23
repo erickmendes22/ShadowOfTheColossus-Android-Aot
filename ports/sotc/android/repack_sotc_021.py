@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Repackage an already ABI-verified SotC strict AOT runtime for UI-only updates.
+"""Repackage strict ARM64 AOT runtime with optional newly linked NGS2 sound host.
 
 Reuses the verified 0.1.69 strict ARM64 native host and renderer. Repackages
 only the updated launcher/scripts plus the hash-verified GameHub DD Turnip.
-No recompilation of GPU, CPU, FFmpeg or AOT compiler is needed. This avoids recompiling FFmpeg, FEX or shadPS4 when
-implementing Android UI and automatic first-use AOT verification.
+When --audio-probe is supplied, replace ONLY the freshly linked native host: 
+all rendering/AOT/driver binaries remain from the already ABI-verified baseline.
 """
 from __future__ import annotations
 import argparse
@@ -49,7 +49,19 @@ def dynamic_symbols(binary: Path, defined: bool) -> set[str]:
     return result
 
 
-def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) -> None:
+def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path,
+           audio_probe: Path | None = None) -> None:
+    new_host = None
+    if audio_probe is not None:
+        new_host = audio_probe.read_bytes()
+        if not new_host.startswith(b"\x7fELF") or len(new_host) < 1000000:
+            raise ValueError("New NGS2 host must be a real ARM64 ELF executable")
+        dynamic = dynamic_symbols(audio_probe, True)
+        if not {"runtime_ngs2_resolve", "runtime_audio_resolve", "runtime_memory_clamp_gap_hits"}.issubset(dynamic):
+            raise ValueError("Compiled host lacks NGS2 mixer or mandatory exported ABIs")
+        if b"NGS2: built-in mixer" not in new_host:
+            raise ValueError("NGS2 host does not contain the upstream software mixer")
+        print("PASS native NGS2 host: "+hashlib.sha256(new_host).hexdigest())
     # The repository release is downloaded by CI. Require the exact known ZIP
     # and ELF hashes; do not add a fallback or an unidentified Turnip version.
     with tempfile.TemporaryDirectory() as driver_tmp:
@@ -93,6 +105,14 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
             manifest["gamehub_dd_turnip_bundled"] = True
             manifest["version"] = RELEASE
             manifest["runtime_name"] = "sotc-daedalus-aot-0.2.0"
+            if new_host is not None:
+                manifest["audio_engine"] = {
+                    "id": "ngs2-software-mixer",
+                    "upstream": "AjncSystem/ShadowOfTheColossus-PC v0.76.2",
+                    "host_sha256": hashlib.sha256(new_host).hexdigest(),
+                    "aot_guest_calls": True,
+                    "fifo_pcm": "s16-stereo-48000"
+                }
             manifest_bytes = (json.dumps(manifest, indent=2, ensure_ascii=False)+"\n").encode()
             stream = io.BytesIO()
             with tarfile.open(fileobj=stream, mode="w:gz", format=tarfile.GNU_FORMAT) as modified:
@@ -105,6 +125,8 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
                         payload = manifest_bytes
                     elif entry.name in ROOTPATHS:
                         payload = ROOTPATHS[entry.name].read_bytes()
+                    elif entry.name == "sotcport/arm64/bin/sotc-probe" and new_host is not None:
+                        payload = new_host
                     elif entry.isfile():
                         infile = original.extractfile(entry)
                         if infile is None:
@@ -155,6 +177,8 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
             raise ValueError("Unresolved internal renderer ABI: " + str(bad_cpp))
         if "runtime_memory_clamp_gap_hits" not in host_exports:
             raise ValueError("Regression: host still missing gap cache counter")
+        if new_host is not None and "runtime_ngs2_resolve" not in host_exports:
+            raise ValueError("New Android host lost the NGS2 mixer export")
         print(f"PASS ABI {len(runtime_imports)} runtime imports from EXACT repackaged host; no internal C++ missing")
 
     with tarfile.open(fileobj=io.BytesIO(new_payload), mode="r:gz") as verify:
@@ -165,7 +189,7 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
         for old in ("gen8", "adreno7xx"):
             if any(f"/drivers/{old}/" in n for n in verify.getnames()):
                 raise ValueError(f"Old {old} driver survived repack")
-    print("PASS 0.2.0: native host/render unchanged; verified GameHub bundled and CUSA08034 patch gate fixed")
+    print("PASS 0.2.0: verified NGS2 sound host if supplied; AOT/render/driver invariant")
     print(f"Runtime payload: {len(new_payload)} bytes, SHA256 {hashlib.sha256(new_payload).hexdigest()}")
 
 
@@ -175,5 +199,7 @@ if __name__ == "__main__":
     parser.add_argument("--assets", type=Path, default=ROOT / "out/android-release/assets")
     parser.add_argument("--jni", type=Path, default=ROOT / "out/bionic/apk-jni")
     parser.add_argument("--gamehub-zip", type=Path, required=True)
+    parser.add_argument("--audio-probe", type=Path, default=None,
+                        help="Newly built ARM64 host with real upstream NGS2 software mixer")
     args = parser.parse_args()
-    repack(args.base_apk, args.assets, args.jni, args.gamehub_zip)
+    repack(args.base_apk, args.assets, args.jni, args.gamehub_zip, args.audio_probe)
