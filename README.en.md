@@ -42,6 +42,7 @@ Executable patches use **strict hashes and original-byte checks**. A matching ti
 
 **Game execution and graphics**
 - On-device **ARM64 AOT compilation**, required for the first launch.
+- **Native audio:** built-in NGS2 mixer adapted from the upstream PC 0.75+ implementation (Oussama268 / HayatoG), outputting stereo 48 kHz PCM on Android without proprietary firmware audio modules. Actual device playback remains to be tested.
 - Previously validated AOT profiles can be reused following app updates; changing game files, patches, or internal resolution may require another compilation.
 - Internal rendering at **720p, 540p, or 360p** with 720p display output.
 - Aspect-ratio preservation or optional screen fill.
