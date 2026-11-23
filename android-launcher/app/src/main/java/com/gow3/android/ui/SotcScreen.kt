@@ -3,6 +3,8 @@ package com.gow3.android.ui
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.ui.platform.LocalConfiguration
+import android.content.res.Configuration
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.ImageBitmap
@@ -116,14 +118,23 @@ internal fun SotcBackdrop() {
  */
 @Composable
 private fun SotcGameArtwork(gameDir: String?) {
-    Image(
-        painter=androidx.compose.ui.res.painterResource(com.gow3.android.R.drawable.sotc_art),
-        contentDescription="Shadow of the Colossus",
-        modifier=Modifier.fillMaxWidth().height(142.dp)
-            .clip(RoundedCornerShape(15.dp)),
-        contentScale=ContentScale.Fit,
-        alignment=Alignment.TopCenter
-    )
+    val art=androidx.compose.ui.res.painterResource(com.gow3.android.R.drawable.sotc_art)
+    val landscape=LocalConfiguration.current.orientation==Configuration.ORIENTATION_LANDSCAPE
+    // The poster is square. A faint cropped duplicate fills a wide banner,
+    // while the foreground poster remains completely visible (including title).
+    val bannerHeight=if(landscape) 230.dp else 208.dp
+    Box(Modifier.fillMaxWidth().height(bannerHeight)
+            .clip(RoundedCornerShape(15.dp))
+            .background(SotcPalette.panel),contentAlignment=Alignment.Center) {
+        Image(painter=art,contentDescription=null,
+            modifier=Modifier.fillMaxSize(),contentScale=ContentScale.Crop,
+            alpha=0.32f)
+        Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(
+            listOf(Color(0xAA071112),Color.Transparent,Color(0xAA071112)))))
+        Image(painter=art,contentDescription="Shadow of the Colossus Android",
+            modifier=Modifier.fillMaxSize(),
+            contentScale=ContentScale.Fit,alignment=Alignment.Center)
+    }
 }
 
 private fun localized(context: Context, pt:String, en:String):String =
@@ -149,6 +160,21 @@ private fun SotcAction(text:String,onClick:()->Unit,modifier:Modifier) {
             .background(SotcPalette.teal)
             .clickable(onClick=onClick)
             .padding(horizontal=16.dp,vertical=14.dp))
+}
+
+@Composable
+private fun SotcCreditLink(context:Context,title:String,detail:String,url:String) {
+    Column(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFF1C3031))
+            .clickable {
+                context.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse(url)))
+            }.padding(horizontal=13.dp,vertical=10.dp),
+        verticalArrangement=Arrangement.spacedBy(3.dp)
+    ) {
+        Text(title,color=SotcPalette.text,fontWeight=FontWeight.SemiBold,fontSize=13.sp)
+        Text(detail,color=SotcPalette.secondary,fontSize=11.sp)
+    }
 }
 
 @Composable
@@ -343,28 +369,62 @@ internal fun SotcScreen(tabIndex:Int,onStartGame:()->Unit,onChooseGameFolder:()-
                     fontFamily=FontFamily.Serif,fontWeight=FontWeight.Bold,fontSize=23.sp)
                 Text(if(pt) "DAEDALUS • ARM64 AOT NATIVO" else "DAEDALUS • NATIVE ARM64 AOT",color=SotcPalette.accent,fontSize=13.sp)
                 SotcPanel {
-                    Text(if(pt) "PORT ANDROID" else "ANDROID PORT",color=SotcPalette.accent,fontWeight=FontWeight.Bold)
-                    Text(if(pt) "Port para Android com renderização Vulkan e compilação ARM64 nativa no dispositivo."
-                         else "Android port with Vulkan rendering and native ARM64 compilation on-device.",
-                         color=SotcPalette.secondary,fontSize=13.sp)
-                    Text("Original PC port: AjncSystem/ShadowOfTheColossus-PC",color=SotcPalette.text,fontSize=13.sp)
-                    SotcAction(if(pt) "Projeto original" else "Original project") {
-                        ctx.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse("https://github.com/AjncSystem/ShadowOfTheColossus-PC")))
-                    }
-                    Text("Android / Daedalus: erickmendes22",color=SotcPalette.text,fontSize=13.sp)
-                    Text("YouTube: @daedalusemulator",color=SotcPalette.secondary)
-                    Text(if(pt) "CRÉDITOS" else "CREDITS",
+                    Text(if(pt) "SOBRE O PROJETO" else "ABOUT THE PROJECT",
                         color=SotcPalette.accent,fontWeight=FontWeight.Bold)
                     Text(if(pt)
-                        "Port original para PC: AjncSystem e colaboradores. Base do carregador: bloodborne_pc (Supermedo, deadinside28 e forks). Renderizador Vulkan: shadPS4, Pink-shadPS4 e colaboradores. AOT ARM64 e infraestrutura Android: trabalhos de ducvd89/Bloodborne-Android, ferramentas bb-recomp, fexdroid e comunidade. Driver: Mesa/Turnip e DD/GameHub. Adaptação Android/Daedalus: erickmendes22."
-                        else "Original PC port: AjncSystem and contributors. Loader foundation: bloodborne_pc (Supermedo, deadinside28 and forks). Vulkan renderer: shadPS4, Pink-shadPS4 and contributors. ARM64 AOT and Android infrastructure: ducvd89/Bloodborne-Android, bb-recomp tools, fexdroid and community. Driver: Mesa/Turnip and DD/GameHub. Android/Daedalus adaptation: erickmendes22.",
+                        "Port Android experimental com Vulkan e compilação ARM64 nativa no aparelho, baseado no trabalho de AjncSystem para PC."
+                        else "Experimental Android port using Vulkan and native ARM64 compilation on-device, derived from AjncSystem's PC project.",
                         color=SotcPalette.secondary,fontSize=12.sp)
-                    Text(if(pt) "Licença GPL-2.0-ou-posterior e licenças de terceiros em CREDITS.md. Sem arquivos do jogo."
-                         else "GPL-2.0-or-later and third-party notices in CREDITS.md. No game files included.",
-                        color=SotcPalette.secondary,fontSize=11.sp)
-                    SotcAction("GitHub") {
-                        ctx.startActivity(Intent(Intent.ACTION_VIEW,Uri.parse("https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot")))
-                    }
+                    SotcCreditLink(ctx,
+                        if(pt) "Projeto original para PC" else "Original PC project",
+                        "AjncSystem / ShadowOfTheColossus-PC",
+                        "https://github.com/AjncSystem/ShadowOfTheColossus-PC")
+                    SotcCreditLink(ctx,
+                        if(pt) "Port Android — Daedalus" else "Android port — Daedalus",
+                        "erickmendes22 / ShadowOfTheColossus-Android-Aot",
+                        "https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot")
+                    SotcCreditLink(ctx,"Daedalus Emulator",
+                        "YouTube: @daedalusemulator",
+                        "https://www.youtube.com/@daedalusemulator")
+                }
+                SotcPanel {
+                    Text(if(pt) "CRÉDITOS E COMPONENTES" else "CREDITS & COMPONENTS",
+                        color=SotcPalette.accent,fontWeight=FontWeight.Bold)
+                    SotcCreditLink(ctx,"bloodborne_pc",
+                        if(pt) "Supermedo, deadinside28 e colaboradores • base do carregador"
+                        else "Supermedo, deadinside28 & contributors • loader foundation",
+                        "https://github.com/Supermedo/bloodborne_pc")
+                    SotcCreditLink(ctx,"shadPS4 / Pink-shadPS4",
+                        if(pt) "Renderização Vulkan e correções gráficas"
+                        else "Vulkan rendering and graphics corrections",
+                        "https://github.com/shadps4-emu/shadPS4")
+                    SotcCreditLink(ctx,"Pink-shadPS4",
+                        if(pt) "Fork e correções de luizgustavs" else "Fork and fixes by luizgustavs",
+                        "https://github.com/luizgustavs/Pink-shadPS4")
+                    SotcCreditLink(ctx,"Bloodborne-Android / AOT",
+                        if(pt) "ducvd89 e comunidade • referências ARM64/Bionic"
+                        else "ducvd89 & community • ARM64/Bionic references",
+                        "https://github.com/ducvd89/Bloodborne-Android")
+                    SotcCreditLink(ctx,"fexdroid",
+                        if(pt) "Infraestrutura Android de exibição e controles"
+                        else "Android display and input infrastructure",
+                        "https://github.com/cobrabm12/fexdroid")
+                    SotcCreditLink(ctx,"Mesa / Turnip + DD GameHub",
+                        if(pt) "Driver Vulkan e componentes do WinlatorComponents"
+                        else "Vulkan driver and WinlatorComponents integration",
+                        "https://github.com/erickmendes22/WinlatorComponents")
+                }
+                SotcPanel {
+                    Text(if(pt) "LICENÇAS E ATRIBUIÇÕES" else "LICENSES & ATTRIBUTIONS",
+                        color=SotcPalette.accent,fontWeight=FontWeight.Bold)
+                    Text(if(pt)
+                        "Código derivado GPL-2.0-ou-posterior, preservando licenças de terceiros. O aplicativo não distribui arquivos do jogo. Todos os colaboradores originais permanecem creditados."
+                        else "GPL-2.0-or-later derivative code, preserving third-party licenses. No game files are distributed. All original contributors retain their credits.",
+                        color=SotcPalette.secondary,fontSize=12.sp)
+                    SotcCreditLink(ctx,
+                        if(pt) "Ver todos os créditos" else "View all credits",
+                        "CREDITS.md",
+                        "https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/blob/main/CREDITS.md")
                 }
                 SotcPanel {
                     Text(if(pt) "DIAGNÓSTICO" else "DIAGNOSTICS",color=SotcPalette.accent,fontWeight=FontWeight.Bold)

@@ -109,6 +109,9 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+        // A change made inside the running game must return here for strict
+        // AOT verification BEFORE another game process can be started.
+        handleSotcGameRestart(intent)
         // Opt-in direct launch is attempted ONCE per launcher creation.
         // Returning from the game to the still-alive launcher never re-enters.
         if (packageName == "com.sotc.android.daedalus" && savedInstanceState == null) {
@@ -132,6 +135,33 @@ class MainActivity : ComponentActivity() {
                 if (!isFinishing && !isDestroyed) {
                     ensureInitialStorage()
                 }
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSotcGameRestart(intent)
+    }
+
+    private fun handleSotcGameRestart(request: Intent?) {
+        if (packageName != "com.sotc.android.daedalus" ||
+            request?.getBooleanExtra("sotc_apply_restart",false) != true) return
+        request.removeExtra("sotc_apply_restart")
+        autoStartAttempted = true
+        window.decorView.post {
+            if (isFinishing || isDestroyed) return@post
+            if (!hasStoragePermission() || !gameFolderManager.hasGameFolder()) {
+                android.widget.Toast.makeText(this,
+                    "Selecione uma pasta válida antes de iniciar o jogo.",
+                    android.widget.Toast.LENGTH_LONG).show()
+                return@post
+            }
+            // Never bypass AOT: verify exact executable, resolution, patch
+            // profile and compiler metadata before launching GameActivity.
+            sotcAotBuilder.ensureReadyThen {
+                startActivity(Intent(this,ro.cobrabm.fexdroid.GameActivity::class.java))
             }
         }
     }
