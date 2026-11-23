@@ -16,12 +16,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sdk=/usr/local/lib/android/sdk
-          manager="$sdk/cmdline-tools/16.0/bin/sdkmanager"
-          test -x "$manager"
-          "$manager" 'build-tools;35.0.0'
-          test -s "$sdk/build-tools/35.0.0/lib/apksigner.jar"
-          cp "$sdk/build-tools/35.0.0/lib/apksigner.jar" /tmp/apksigner.jar
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          found=$(find "$sdk" -path '*/build-tools/*/lib/apksigner.jar' -type f -print -quit 2>/dev/null || true)
+          if [[ -z "$found" ]]; then
+            manager=$(find "$sdk" -name sdkmanager -type f -print -quit 2>/dev/null || true)
+            test -n "$manager"
+            "$manager" 'build-tools;35.0.0'
+            found=$(find "$sdk" -path '*/build-tools/*/lib/apksigner.jar' -type f -print -quit)
+          fi
+          test -s "$found"
+          cp "$found" /tmp/apksigner.jar
       - uses: actions/upload-artifact@v4
         with:
           name: SotC-Android-apksigner-35-JAR-only-NO-KEYS
