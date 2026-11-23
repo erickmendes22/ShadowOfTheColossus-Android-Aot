@@ -33,6 +33,7 @@ jobs:
           set -euo pipefail
           (cd out/base-069 && sha256sum -c Shadow-of-the-Colossus-Daedalus-AOT-0.1.69-unsigned.apk.sha256)
           python3 -m unittest discover -s tests -p 'test_sotc_ux_021.py' -v
+          # Guard accurate native AOT component credits while retaining historical licenses.
           python3 -m unittest discover -s tests -p 'test_sotc_about_020.py' -v
           python3 -m unittest discover -s tests -p 'test_sotc_low_resolution.py' -v
           python3 -m py_compile ports/sotc/android/{bachata_perf,prepare_game,repack_sotc_021,vendor_turnip,verify_sotc_link}.py
