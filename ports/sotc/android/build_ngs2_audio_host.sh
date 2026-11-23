@@ -27,8 +27,11 @@ with zipfile.ZipFile(apk) as archive:
             (dest/name).write_bytes(item.read())
 PY
 # LibAtrac9 sources are in an upstream git submodule, never redistribute game files.
+if [[ ! -f third_party/LibAtrac9/C/src/libatrac9.h ]]; then
+  git submodule update --init --depth=1 third_party/LibAtrac9
+fi
 test -f third_party/LibAtrac9/C/src/libatrac9.h || {
-  echo 'LibAtrac9 submodule missing; checkout with submodules: true' >&2; exit 2;
+  echo 'LibAtrac9 submodule not available' >&2; exit 2;
 }
 # Reuse the pinned FFmpeg 7.1.5 build if the audio-host cache exists.
 if [[ ! -f "$prefix/lib/libavcodec.a" || ! -f "$prefix/lib/libavformat.a" ]]; then
