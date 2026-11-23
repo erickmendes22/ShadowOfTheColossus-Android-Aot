@@ -1,3 +1,8 @@
+/* Android ARM64/Bionic adaptation of upstream NGS2 audio mixer.
+ * Original upstream: AjncSystem/ShadowOfTheColossus-PC blob
+ * 5bd5f68917027af32608f60d641e6e6ec9e054a7 (GPL-2.0-or-later).
+ * Guest callbacks on ARM64 must cross the AOT guest_cpu_call boundary.
+ */
 /* libSceNgs2 reimplemented from scratch: the software mixer Sony's "sndx" middleware drives.
  *
  * Written against the API surface traced from the console module in The Last Guardian and
@@ -52,7 +57,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__SSE__)
 #include <xmmintrin.h>
+#endif
+#ifdef __ANDROID__
+#include "guest_cpu.h"
+#endif
 #include "third_party/LibAtrac9/C/src/libatrac9.h"
 
 #define NGS2_OK 0
@@ -1036,11 +1046,23 @@ static void guest_alloc(const Allocator *a, BufferInfo *info, uint64_t size) {
     info->host_size = size;
     if (!a || !a->alloc) return;
     info->user_data = a->user_data;
+#ifdef __ANDROID__
+    const uint64_t args[1]={(uint64_t)(uintptr_t)info};
+    int32_t r=(int32_t)guest_cpu_call((uintptr_t)a->alloc,1,args);
+#else
     int32_t r = a->alloc(info);
+#endif
     if (r) note("guest allocator returned 0x%08x", (uint32_t)r);
 }
 static void guest_free(const Allocator *a, BufferInfo *info) {
-    if (a && a->free && info->host_buffer) a->free(info);
+    if (a && a->free && info->host_buffer) {
+#ifdef __ANDROID__
+        const uint64_t args[1]={(uint64_t)(uintptr_t)info};
+        guest_cpu_call((uintptr_t)a->free,1,args);
+#else
+        a->free(info);
+#endif
+    }
 }
 
 #define CONTEXT_BUFFER_SIZE 0x1000
@@ -1697,7 +1719,12 @@ static void block_end(Voice *v) {
     int repeat = b->repeats != 0;
     if (v->callback && (v->callback_flags & (repeat ? 2u : 1u))) {
         CallbackInfo info = {v->callback_data, voice_handle(v), repeat ? 2u : 1u, 0, b->user, b->data, b->size, s->repeated, 0, 0};
+#ifdef __ANDROID__
+        const uint64_t args[1]={(uint64_t)(uintptr_t)&info};
+        guest_cpu_call((uintptr_t)v->callback,1,args);
+#else
         v->callback(&info);
+#endif
     }
     if (repeat) {
         if (b->repeats != UINT32_MAX) --b->repeats;
@@ -1957,7 +1984,12 @@ static void call_user_fx(Voice *v, float data[MAX_CH][MAX_GRAIN], uint32_t n) {
     /* Guest code may take its own locks while another game thread holding them waits in
      * VoiceControl: run it without the mixer lock. */
     pthread_mutex_unlock(&lock);
+#ifdef __ANDROID__
+    const uint64_t args[1]={(uint64_t)(uintptr_t)&context};
+    guest_cpu_call((uintptr_t)handler,1,args);
+#else
     handler(&context);
+#endif
     pthread_mutex_lock(&lock);
 }
 static float peak_of(float data[MAX_CH][MAX_GRAIN], uint32_t channels, uint32_t n) {
@@ -2200,8 +2232,16 @@ static ABI int32_t ngs2_render(uintptr_t handle, const RenderBuffer *buffers, ui
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     /* Flush denormals (reverb and filter tails) to zero while mixing: 0x8040 = FTZ | DAZ. */
-    unsigned int csr = _mm_getcsr();
-    _mm_setcsr(csr | 0x8040);
+#if defined(__aarch64__)
+    /* ARM64 FPCR bit 24 is FZ; the PC code enables SSE FTZ/DAZ. */
+    uint64_t old_fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(old_fpcr));
+    uint64_t fpcr=old_fpcr | (UINT64_C(1)<<24);
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#elif defined(__SSE__)
+    unsigned int csr=_mm_getcsr();
+    _mm_setcsr(csr|0x8040);
+#endif
     memset(outputs, 0, sizeof(outputs));
     memset(output_channels, 0, sizeof(output_channels));
     for (Rack *r = s->racks; r; r = r->next) {
@@ -2227,7 +2267,11 @@ static ABI int32_t ngs2_render(uintptr_t handle, const RenderBuffer *buffers, ui
         if (!(s->renders % 500)) wav_update();
     }
     ++s->renders;
+#if defined(__aarch64__)
+    __asm__ volatile("msr fpcr, %0" : : "r"(old_fpcr));
+#elif defined(__SSE__)
     _mm_setcsr(csr);
+#endif
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 + (double)(t1.tv_nsec - t0.tv_nsec);
     stat_render_ns += ns;
