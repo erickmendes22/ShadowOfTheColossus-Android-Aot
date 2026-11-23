@@ -1,8 +1,8 @@
-name: Shadow of the Colossus Android 0.2.1 APK
+name: Shadow of the Colossus Android 0.2.0 (corrected same-version APK)
 # Final UI includes translated dialogs plus corrected COLOSSUS artwork (SHA256-pinned).
 on:
   push:
-    branches: [feature/android-aot-0.2.1, main]
+    branches: [feature/android-aot-0.2.0, main]
     paths:
       - '.github/workflows/sotc-021-apk.yml'
   workflow_dispatch:
@@ -36,8 +36,8 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_sotc_low_resolution.py' -v
           python3 -m py_compile ports/sotc/android/{bachata_perf,prepare_game,repack_sotc_021,vendor_turnip,verify_sotc_link}.py
           bash -n ports/sotc/android/run-sotc-bionic.sh
-          grep -Fq 'versionCode = 20001' android-launcher/app/build.gradle.kts
-          grep -Fq 'versionName = "0.2.1"' android-launcher/app/build.gradle.kts
+          grep -Fq 'versionCode = 20000' android-launcher/app/build.gradle.kts
+          grep -Fq 'versionName = "0.2.0"' android-launcher/app/build.gradle.kts
       - name: Fetch EXACT user GameHub DD Turnip archive from WinlatorComponents release
         shell: bash
         run: |
@@ -69,7 +69,7 @@ jobs:
               for name in must: assert name in names,name
               assert not any('/drivers/gen8/' in x or '/drivers/adreno7xx/' in x for x in names)
               m=json.load(t.extractfile('runtime-manifest.json'))
-              assert m['version']=='0.2.1'
+              assert m['version']=='0.2.0'
               assert m['driver']['id']=='gamehub-dd-26.3' and m['driver']['bundled'] is True
               assert m['gamehub_dd_turnip_bundled'] is True
               b=t.extractfile('sotcport/scripts/bachata_perf.py').read()
@@ -113,12 +113,12 @@ jobs:
           src=android-launcher/app/build/outputs/apk/release/app-arm64-v8a-release-unsigned.apk
           test -s "$src"
           mkdir -p out/release
-          apk=out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-unsigned.apk
+          apk=out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-unsigned.apk
           "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -f 4 "$src" "$apk"
           "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -c 4 "$apk"
           "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$apk" > out/release/sotc-021-badging.txt
           grep -Fq "package: name='com.sotc.android.daedalus'" out/release/sotc-021-badging.txt
-          grep -Fq "versionName='0.2.1'" out/release/sotc-021-badging.txt
+          grep -Fq "versionName='0.2.0'" out/release/sotc-021-badging.txt
           python3 - "$apk" <<'PY'
           from pathlib import Path
           import zipfile,hashlib,sys,io,tarfile,json
@@ -133,14 +133,14 @@ jobs:
                   assert hashlib.sha256(driver).hexdigest()=='4f242a453496ab27fc29be950d632edbae494dcc0c9b7d56c37c7ebdffe42df9'
           print('PASS APK CRC, payload SHA256, compiler JNI, integrated GameHub ELF SHA256')
           PY
-          (cd out/release && sha256sum Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-unsigned.apk > Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-unsigned.apk.sha256)
+          (cd out/release && sha256sum Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-unsigned.apk > Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-unsigned.apk.sha256)
       - name: Publish verified UNSIGNED APK (original user signing key is not in CI)
         uses: actions/upload-artifact@v4
         with:
-          name: Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-UNSIGNED-INCREMENTAL
+          name: Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-CORRECTED-UNSIGNED
           path: |
-            out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-unsigned.apk
-            out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.1-unsigned.apk.sha256
+            out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-unsigned.apk
+            out/release/Shadow-of-the-Colossus-Daedalus-AOT-0.2.0-unsigned.apk.sha256
             out/release/sotc-021-badging.txt
           if-no-files-found: error
           retention-days: 7

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shadow of the Colossus 0.2.1 UI/source drift and AOT validity gates."""
+"""Shadow of the Colossus 0.2.0 UI/source drift and AOT validity gates."""
 from pathlib import Path
 import re, unittest
 ROOT=Path(__file__).resolve().parents[1]
@@ -16,8 +16,8 @@ class Sotc021(unittest.TestCase):
         gradle=src("android-launcher/app/build.gradle.kts")
         self.assertIn('manifestPlaceholders["appIcon"] = "@mipmap/sotc_launcher"',gradle)
         self.assertIn('manifestPlaceholders["appLabel"] = "Shadow of the Colossus Android"',gradle)
-        self.assertIn("versionCode = 20001",gradle)
-        self.assertIn('versionName = "0.2.1"',gradle)
+        self.assertIn("versionCode = 20000",gradle)
+        self.assertIn('versionName = "0.2.0"',gradle)
         adaptive=src("android-launcher/app/src/main/res/mipmap-anydpi-v26/sotc_launcher.xml")
         self.assertIn('@drawable/sotc_art',adaptive)
         home=src("android-launcher/app/src/main/java/com/gow3/android/ui/SotcScreen.kt")
