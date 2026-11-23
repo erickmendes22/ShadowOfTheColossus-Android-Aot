@@ -1,51 +1,120 @@
-# Shadow of the Colossus Android — Daedalus AOT 0.2.0
+<p align="center">
+  <img src="android-launcher/app/src/main/res/drawable-nodpi/sotc_art.webp" alt="Arte de Shadow of the Colossus Android" width="260">
+</p>
 
-[English](README.en.md) · [Créditos completos](CREDITS.md) · [Licença GPL-2.0-or-later](LICENSE)
+<h1 align="center">Shadow of the Colossus — Android</h1>
+<p align="center"><strong>Daedalus · ARM64 AOT nativo · Vulkan · Versão 0.2.0</strong></p>
+<p align="center">
+  <a href="README.en.md">English</a> ·
+  <a href="#instalação">Instalação</a> ·
+  <a href="#recursos">Recursos</a> ·
+  <a href="#compilação-e-código-fonte">Código-fonte</a> ·
+  <a href="CREDITS.md">Créditos</a> ·
+  <a href="https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/issues">Reportar problema</a>
+</p>
 
-Port **experimental para Android ARM64** mantido por **[erickmendes22 / Daedalus Emulator](https://www.youtube.com/@daedalusemulator)**, derivado do port de PC **[AjncSystem/ShadowOfTheColossus-PC](https://github.com/AjncSystem/ShadowOfTheColossus-PC)** e do trabalho de seus colaboradores e de outros projetos abertos.
+Port **experimental e não oficial para Android**, mantido por **[erickmendes22 / Daedalus Emulator](https://www.youtube.com/@daedalusemulator)** e baseado no **[ShadowOfTheColossus-PC de AjncSystem](https://github.com/AjncSystem/ShadowOfTheColossus-PC)** e em diversos projetos abertos.
 
-> **Não contém jogo, PKGs, arquivos da Sony, chaves nem dumps.** Use sua cópia própria de Shadow of the Colossus (PS4). Projeto não afiliado à Sony Interactive Entertainment ou Bluepoint Games.
+> [!IMPORTANT]
+> O repositório **não distribui o jogo**, PKGs, arquivos proprietários, firmware nem chaves de descriptografia. Você precisa utilizar os arquivos de sua própria cópia de *Shadow of the Colossus* para PS4. Este port não é afiliado à Sony Interactive Entertainment ou à Bluepoint Games.
 
-## Recursos da versão 0.2.0
+## Estado do projeto
 
-- **Edições no port Android:** CUSA08809 (**EU 1.00**) e CUSA08034 (**US 1.00**), com verificação de hash e bytes do executável antes de aplicar patches. Executáveis diferentes não são aceitos automaticamente.
-- **CPU:** ARM64 AOT nativo, sem FEX e sem TSO; compilação no aparelho, reutilização de perfis válidos após atualização e recompilação somente quando a validação exigir.
-- **GPU:** Vulkan Bionic/AHardwareBuffer; apenas a **Turnip GameHub DD 26.3** integrada e verificada por SHA-256.
-- **Vídeo:** resolução interna 720p, 540p ou 360p, saída 720p, opção de preencher a tela. Arte original exibida em banner que ocupa a largura disponível, preservando o pôster completo.
-- **HUD:** FPS + CPU/GPU quando houver medidores disponíveis, somente FPS ou desativada.
-- **Controles:** touch personalizável e controle físico; ajuste de layout e sensibilidade.
-- **Instalação e saves:** PKG base em subpasta automática, seleção de pasta do jogo, exportação/importação de saves e exportação de logs.
-- **Idiomas:** português brasileiro e inglês no launcher; idioma do jogo depende dos arquivos disponíveis.
+| Item | Implementação |
+| --- | --- |
+| Versão do aplicativo | **0.2.0** · `versionCode 20000` |
+| CPU do jogo | **ARM64 AOT nativo**, sem FEX e sem TSO |
+| Gráficos | Vulkan, Bionic e AHardwareBuffer |
+| Driver fornecido | **Turnip GameHub DD 26.3** — único driver integrado, validado por SHA-256 |
+| Idiomas do launcher | Português (Brasil) e inglês |
+| Situação | Experimental; funcionamento e desempenho dependem do aparelho e do jogo |
+
+### Edições compatíveis
+
+| Região | Title ID | Versão do jogo |
+| --- | --- | --- |
+| Europa | **CUSA08809** | **1.00** |
+| Estados Unidos | **CUSA08034** | **1.00** |
+
+Os patches exigem validação do executável original, inclusive **hash e bytes esperados**. O ID sozinho não garante suporte a outro `eboot.bin` ou atualização do jogo.
+
+## Recursos
+
+**Execução e desempenho**
+- Compilação AOT **no próprio aparelho** na primeira utilização.
+- Cache de perfis AOT: compilações ainda válidas podem ser reutilizadas após atualizar o APK; alterações nos patches, na resolução ou no executável podem exigir nova compilação.
+- Resolução interna **720p, 540p ou 360p**, com apresentação do jogo em 720p.
+- Tela cheia opcional: proporção original ou preenchimento da tela.
+- HUD configurável: **FPS + CPU + GPU**, somente FPS ou desativada. Os dados de CPU/GPU dependem dos medidores disponíveis no dispositivo.
+
+**Launcher e controles**
+- Controles virtuais editáveis, ajuste de tamanho e sensibilidade da câmera; compatibilidade com controle físico.
+- Menu durante o jogo: resolução e patches com reinício e validação AOT; tela cheia e HUD sem reinício.
+- PKG base instalado em **subpasta criada automaticamente**; também é possível selecionar uma pasta do jogo extraída.
+- Exportação/importação de dados salvos e exportação de logs.
 
 ## Instalação
 
-1. Baixe um APK **assinado** em [Releases](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/releases), quando publicado.
-2. Para atualizar por cima, o certificado de assinatura precisa ser **idêntico**. Não desinstale se quiser preservar dados e compilações.
-3. Escolha a pasta do jogo que contém **eboot.bin** e **sce_sys/param.sfo**, ou instale seu próprio PKG base.
-4. Na primeira execução, compile o código ARM64 AOT. Perfis anteriores são reutilizados após verificação; alterar jogo, resolução ou patches pode exigir recompilação.
+> [!NOTE]
+> **Ainda não há um Release público do APK assinado neste repositório.** A página [GitHub Actions](../../actions) contém builds de desenvolvimento; os artefatos publicados pelo workflow são **não assinados** e não devem ser confundidos com um APK pronto para atualizar uma instalação existente.
 
-Nenhum FPS ou compatibilidade total é garantido; o desempenho depende do dispositivo e da GPU.
+1. Utilize um APK **assinado com o mesmo certificado** do aplicativo que já está instalado. Ao atualizar, não desinstale o aplicativo: isso pode apagar saves e caches.
+2. Abra o launcher e selecione a pasta da sua cópia do jogo, contendo `eboot.bin` e `sce_sys/param.sfo`. Alternativamente, use a opção **Instalar PKG** para extrair seu PKG base em uma nova subpasta.
+3. Inicie o jogo. Na primeira execução, o launcher prepara os arquivos e realiza a compilação **ARM64 AOT**.
+4. Em execuções posteriores, a compilação existente é verificada antes de ser reutilizada. Mudanças de patches e resolução são aplicadas após reiniciar o jogo e validar o perfil correspondente.
 
-## Código e compilação
+**Requisitos atuais:** dispositivo Android **ARM64** com GPU Adreno e suporte a Vulkan. A validação da Turnip GameHub integrada no launcher exige **Android 14 (API 34) ou superior**. Outros drivers/GPU e versões anteriores do Android não têm suporte confirmado neste pacote.
 
-Fontes: **android-launcher/**, **ports/sotc/android/**, **src/**, **gpu/** e **cpu/**. O workflow para APK é **.github/workflows/sotc-020-apk.yml**. É obrigatória a validação de ABI dos ELFs ARM64 por **ports/sotc/android/verify_sotc_link.py**. A chave privada da assinatura **não está no repositório**.
+## Configurações durante o jogo
 
-## Créditos e licença
+| Ajuste | Quando entra em vigor |
+| --- | --- |
+| Resolução interna | Reinicia o jogo; valida ou recompila o AOT se necessário |
+| Patches do jogo | Reinicia o jogo; valida ou recompila o AOT se necessário |
+| Tela cheia / manter proporção | **Imediatamente**, sem reiniciar |
+| HUD de FPS, CPU e GPU | **Imediatamente**, sem reiniciar |
 
-O port Android é uma adaptação derivada das implementações abaixo. Os autores originais mantêm seus direitos e atribuições:
+**Salvar antes de reiniciar:** o progresso ainda não salvo no jogo será perdido.
 
-- **[AjncSystem / ShadowOfTheColossus-PC](https://github.com/AjncSystem/ShadowOfTheColossus-PC)** — base original do port para PC e comunidade de colaboradores.
-- **[bloodborne_pc — Supermedo, deadinside28 e forks](https://github.com/Supermedo/bloodborne_pc)** — carregador e arquitetura de runtime.
-- **[shadPS4](https://github.com/shadps4-emu/shadPS4)** e **[Pink-shadPS4 — luizgustavs](https://github.com/luizgustavs/Pink-shadPS4)** — tradução gráfica e correções Vulkan.
-- **[ducvd89 / Bloodborne-Android](https://github.com/ducvd89/Bloodborne-Android)** e **[ferramentas de recompilação](https://github.com/ducvd89/Bloodborne-android-rebuild-tool)** — referências da infraestrutura Bionic e AOT ARM64.
-- **[cobrabm12 / fexdroid](https://github.com/cobrabm12/fexdroid)** — interfaces, controles e pontes de apresentação Android; a execução do jogo usa AOT ARM64 sem FEX.
-- **[Mesa / Turnip](https://gitlab.freedesktop.org/mesa/mesa)**, **[Droid-Deck / Drivers](https://github.com/Droid-Deck/Drivers)** e **[WinlatorComponents — GameHub DD](https://github.com/erickmendes22/WinlatorComponents)** — driver Vulkan e integração.
-- **[erickmendes22 / Daedalus Emulator](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot)** — adaptação e manutenção do aplicativo Android.
+## Por que há referências a FEX no código?
 
-Os demais colaboradores e avisos estão em **[CREDITS.md](CREDITS.md)** e **[THIRD_PARTY_LICENSES.txt](android-launcher/app/src/main/assets/THIRD_PARTY_LICENSES.txt)**. Licença de código derivado **[GPL-2.0-or-later](LICENSE)** onde aplicável; os componentes de terceiros preservam suas licenças.
+**O jogo não é executado pelo FEX.** O APK Android 0.2.0 foi conferido: seu manifesto declara `fex_runtime_included: false` e o pacote não contém o executável nem o runtime de tradução dinâmica FEX. O caminho ativo do jogo utiliza **AOT ARM64 nativo, sem TSO**.
 
-## Melhorias 0.2.0
+Alguns **nomes de pacote e fontes herdadas** ainda fazem referência a `fexdroid` ou à implementação FEX utilizada em estágios anteriores ou no código de origem. Isso não significa que o FEX execute o jogo. Arquivos de licença e créditos históricos precisam ser preservados por respeito à autoria e às licenças. O código legado do repositório não deve ser confundido com os componentes incluídos no APK.
 
-A tela inicial exibe a arte original em um banner responsivo, sem cortar o pôster principal. A aba Sobre reúne créditos organizados com links. No menu durante o jogo, a resolução e os patches podem ser alterados com reinício e verificação AOT; a tela cheia e os modos de HUD podem ser alterados imediatamente, sem reiniciar.
+## Compilação e código-fonte
 
-[Issues](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/issues) · [@daedalusemulator](https://www.youtube.com/@daedalusemulator)
+O desenvolvimento do Android está principalmente em:
+
+- [Launcher Android](android-launcher/)
+- [Runtime, compilador e patches do SotC](ports/sotc/android/)
+- [CPU](cpu/) e [GPU](gpu/) herdadas e adaptadas do upstream
+- [Workflow de compilação do APK 0.2.0](.github/workflows/sotc-021-apk.yml)
+- [Critérios obrigatórios de build e verificação](AGENTS.md)
+
+A distribuição do runtime depende da checagem **ABI ARM64** dos binários finais por [`verify_sotc_link.py`](ports/sotc/android/verify_sotc_link.py). Builds nativos e testes estáticos não substituem testes de execução em aparelho. **A chave privada usada para assinar o APK não está no repositório.**
+
+## Créditos e licenças
+
+Este é um **trabalho derivado**. A adaptação Android é de **erickmendes22**, mas o projeto depende das contribuições dos autores e comunidades abaixo:
+
+| Projeto / autores | Contribuição |
+| --- | --- |
+| [AjncSystem / ShadowOfTheColossus-PC](https://github.com/AjncSystem/ShadowOfTheColossus-PC) | Port original para PC e colaboradores |
+| [bloodborne_pc — Supermedo e colaboradores](https://github.com/Supermedo/bloodborne_pc) | Carregador e infraestrutura inicial |
+| [shadPS4](https://github.com/shadps4-emu/shadPS4) e [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) | Renderização e compatibilidade Vulkan |
+| [ducvd89 / Bloodborne-Android](https://github.com/ducvd89/Bloodborne-Android) | Referências e ferramentas de infraestrutura Android/AOT |
+| [cobrabm12 / fexdroid](https://github.com/cobrabm12/fexdroid) | Base histórica de componentes Android; **não é o CPU runtime do jogo** |
+| [Mesa / Turnip](https://gitlab.freedesktop.org/mesa/mesa) e [Droid-Deck / Drivers](https://github.com/Droid-Deck/Drivers) | Driver Vulkan e contribuições |
+| [WinlatorComponents](https://github.com/erickmendes22/WinlatorComponents) | Distribuição do driver GameHub DD |
+| [erickmendes22 / Daedalus](https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot) | Adaptação, testes, launcher e manutenção Android |
+
+Confira **[CREDITS.md](CREDITS.md)** para as atribuições completas, [LICENSE](LICENSE) para a licença principal e [THIRD_PARTY_LICENSES.txt](android-launcher/app/src/main/assets/THIRD_PARTY_LICENSES.txt) para avisos de terceiros. O código derivado é distribuído sob **GPL-2.0-or-later**, quando aplicável. *Shadow of the Colossus* pertence aos seus respectivos titulares.
+
+---
+
+<p align="center">
+  <a href="https://github.com/erickmendes22/ShadowOfTheColossus-Android-Aot/issues">Problemas e sugestões</a>
+  · <a href="https://www.youtube.com/@daedalusemulator">YouTube @daedalusemulator</a>
+  · <a href="README.en.md">English</a>
+</p>
