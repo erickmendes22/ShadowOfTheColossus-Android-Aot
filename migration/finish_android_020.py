@@ -44,6 +44,27 @@ assert "AjncSystem e colaboradores" in (ROOT/ui).read_text()
 assert "EU 1.01" not in (ROOT/ui).read_text()
 assert "ContentScale.Fit" in (ROOT/ui).read_text()
 assert 'versionCode = 20000' in (ROOT/"android-launcher/app/build.gradle.kts").read_text()
+# Make new-fork GitHub Actions self-contained and replace obsolete release labels.
+source_workflow=ROOT/".github/workflows/sotc-074-fast-apk.yml"
+if not source_workflow.is_file():
+    raise RuntimeError("Expected last known good incremental 0.1.74 workflow")
+w=source_workflow.read_text()
+w=w.replace("name: SotC 0.1.74 Display AOT HUD Icons APK (incremental)",
+            "name: Shadow of the Colossus Android 0.2.0 incremental APK")
+w=w.replace("feature/sotc-074-display-aot-icons-hud","feature/android-aot-0.2.0, main")
+w=w.replace("sotc-074-fast-apk.yml","sotc-020-apk.yml")
+w=w.replace("sotc-074-gamehub-bundle","sotc-020-gamehub-bundle")
+w=w.replace("sotc-074-badging","sotc-020-badging")
+w=w.replace("repack_sotc_074","repack_sotc_020")
+w=w.replace("test_sotc_ux_074.py","test_sotc_ux_020.py")
+w=w.replace("0.1.74-video-aot-hud-icons","0.2.0")
+w=w.replace("0.1.74","0.2.0")
+w=w.replace("10074","20000")
+w=w.replace("          run-id: 45076980313",
+            "          run-id: 45076980313\n          repository: erickmendes22/gow3_android_daedalus_fork")
+(ROOT/".github/workflows/sotc-020-apk.yml").write_text(w)
+assert "repack_sotc_020.py" in w
+assert "versionName = " not in w or "0.2.0" in w
 # Retain source-drift tests but bind expectations to the 0.2.0 UI and version.
 oldtest=(ROOT/"tests/test_sotc_ux_074.py").read_text()
 newtest=(oldtest.replace("Sotc074","Sotc020")
