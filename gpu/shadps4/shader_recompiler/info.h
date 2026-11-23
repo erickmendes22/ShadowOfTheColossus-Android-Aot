@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <array>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -26,19 +25,6 @@ struct Archive;
 
 namespace Shader {
 
-/// sotc: which copy of the per-draw shader data (InfoRuntime) this thread uses. The command
-/// processor fills copy 0 when it resolves a pipeline; with SOTC_CP_THREADS the draw thread
-/// (liverpool.h) binds the draw from copy 1, which it fills from what the command processor
-/// captured, so the command processor can resolve the next draws meanwhile.
-inline thread_local u32 g_info_slot = 0;
-
-/// sotc: the per-draw part of Info (changes with every draw of the same shader).
-struct InfoRuntime {
-    std::span<const u32> user_data;
-    std::vector<u32> flattened_ud_buf;
-    VAddr pgm_base{};
-};
-
 enum class Qualifier : u8 {
     None,
     Smooth,
@@ -57,8 +43,24 @@ struct InfoPersistent {
     ImageResourceList images;
     SamplerResourceList samplers;
     FMaskResourceList fmasks;
-    SharpTableList sharp_tables;
 
+    struct UserDataMask {
+        void Set(IR::ScalarReg reg) noexcept {
+            mask |= 1 << static_cast<u32>(reg);
+        }
+
+        u32 Index(IR::ScalarReg reg) const noexcept {
+            const u32 reg_mask = (1 << static_cast<u32>(reg)) - 1;
+            return std::popcount(mask & reg_mask);
+        }
+
+        u32 NumRegs() const noexcept {
+            return std::popcount(mask);
+        }
+
+        u32 mask;
+    };
+    UserDataMask ud_mask{};
     u32 fetch_shader_sgpr_base{};
     u32 shared_memory_scratch_size{};
 
@@ -115,7 +117,8 @@ struct Info : InfoPersistent {
         Qualifier auxiliary;
     };
 
-    std::array<InfoRuntime, 2> runtime{}; // sotc: see g_info_slot
+    std::span<const u32> user_data;
+    std::vector<u32> flattened_ud_buf;
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -125,13 +128,12 @@ struct Info : InfoPersistent {
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
 
+    VAddr pgm_base;
     bool has_storage_images{};
     bool has_discard{};
     bool has_image_gather{};
     bool has_image_query{};
-    bool has_flatbuf{};
-    /// sotc: implicit-LOD samples report their mip to the LOD feedback buffer (sotc_lod_stats.h)
-    bool uses_lod_feedback{};
+    bool has_readconst{};
     bool uses_buffer_atomic_float_min_max{};
     bool uses_image_atomic_float_min_max{};
     bool uses_lane_id{};
@@ -142,8 +144,6 @@ struct Info : InfoPersistent {
     IR::Type shared_types{};
     bool uses_fp16{};
     bool uses_fp64{};
-    /// sotc: the SPIR-V needs 64-bit integers (Int64 capability); see CollectShaderInfoPass.
-    bool uses_int64{};
     bool uses_pack_10_11_11{};
     bool uses_unpack_10_11_11{};
     bool uses_buffer_int64_atomics{};
@@ -156,82 +156,94 @@ struct Info : InfoPersistent {
 
     Info() = default;
     Info(HwStage stage_, SwStage l_stage_, ShaderParams params)
-        : InfoPersistent(stage_, l_stage_, params.hash) {
-        PgmBase() = params.Base();
-        UserData() = params.user_data;
+        : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
+          user_data{params.user_data} {}
+
+    /// gow3: user data of this stage as a draw saw it. The GPU command thread refreshes
+    /// user_data/flattened_ud_buf for every draw it decodes, while the draw recording thread
+    /// (vk_draw_pipe.h) may still work on an earlier draw: that thread installs snapshots here.
+    struct UdSnapshot {
+        const Info* info;
+        const u32* user_data;
+        u32 user_data_size;
+        const u32* flat;
+        u32 flat_size;
+        VAddr pgm_base;
+    };
+    static constexpr u32 MaxUdSnapshots = 6;
+    static inline thread_local UdSnapshot ud_snapshots[MaxUdSnapshots];
+    static inline thread_local u32 num_ud_snapshots = 0;
+
+    const UdSnapshot* Snapshot() const noexcept {
+        for (u32 i = 0; i < num_ud_snapshots; ++i) {
+            if (ud_snapshots[i].info == this) {
+                return &ud_snapshots[i];
+            }
+        }
+        return nullptr;
+    }
+    std::span<const u32> UserData() const noexcept {
+        if (const auto* snapshot = Snapshot()) [[unlikely]] {
+            return {snapshot->user_data, snapshot->user_data_size};
+        }
+        return user_data;
+    }
+    std::span<const u32> FlatUserData() const noexcept {
+        if (const auto* snapshot = Snapshot()) [[unlikely]] {
+            return {snapshot->flat, snapshot->flat_size};
+        }
+        return flattened_ud_buf;
     }
 
-    std::span<const u32>& UserData() noexcept {
-        return runtime[g_info_slot].user_data;
-    }
-    const std::span<const u32>& UserData() const noexcept {
-        return runtime[g_info_slot].user_data;
-    }
-    std::vector<u32>& FlatBuf() noexcept {
-        return runtime[g_info_slot].flattened_ud_buf;
-    }
-    const std::vector<u32>& FlatBuf() const noexcept {
-        return runtime[g_info_slot].flattened_ud_buf;
-    }
-    VAddr& PgmBase() noexcept {
-        return runtime[g_info_slot].pgm_base;
-    }
-    VAddr PgmBase() const noexcept {
-        return runtime[g_info_slot].pgm_base;
+    VAddr ProgramBase() const noexcept {
+        if (const auto* snapshot = Snapshot()) [[unlikely]] {
+            return snapshot->pgm_base;
+        }
+        return pgm_base;
     }
 
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&FlatBuf()[sharp_idx]);
+        return *reinterpret_cast<const T*>(&FlatUserData()[sharp_idx]);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const auto& user_data = UserData();
-        const u32* base = user_data.data();
+        const auto ud = UserData();
+        const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
         return data;
     }
 
-    void AddBindings(Backend::Bindings& bnd) const {
-        bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
-        for (const auto& image : images) {
-            // Descriptor arrays take array_size + 1 bindings
-            bnd.unified += image.array_size;
+    void PushUd(Backend::Bindings& bnd, PushData& push) const {
+        const auto ud = UserData();
+        u32 mask = ud_mask.mask;
+        while (mask) {
+            const u32 index = std::countr_zero(mask);
+            ASSERT(bnd.user_data < NUM_USER_DATA_REGS && index < NUM_USER_DATA_REGS);
+            mask &= ~(1U << index);
+            push.ud_regs[bnd.user_data++] = ud[index];
         }
     }
 
+    void AddBindings(Backend::Bindings& bnd) const {
+        bnd.buffer += buffers.size();
+        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.user_data += ud_mask.NumRegs();
+    }
+
     void RefreshFlatBuf() {
-        const auto& user_data = UserData();
-        auto& flattened_ud_buf = FlatBuf();
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
-            srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindow,
-                                 GetSrtWalkerContext());
+            srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }
-        if (!sharp_tables.empty()) {
-            RefreshSharpTables();
-        }
-    }
-
-    /// Copies every SharpTable from guest memory into the flat buffer (zeros if unmapped)
-    void RefreshSharpTables();
-
-    /// Flat buffer dwords that hold sharp tables rather than SRT walker output
-    u32 SharpTableDwords() const noexcept {
-        u32 dwords = 0;
-        for (const auto& table : sharp_tables) {
-            dwords += table.NumDwords();
-        }
-        return dwords;
     }
 
     void ReadTessConstantBuffer(TessellationDataConstantBuffer& tess_constants) const {
@@ -248,12 +260,5 @@ struct Info : InfoPersistent {
     bool Deserialize(Serialization::Archive& ar);
 };
 DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
-
-/// Per-game dynamic_tsharp_array_size, clamped to 64 elements (0 = off)
-u32 DynamicTsharpArraySize();
-
-/// sotc: fragment shaders measure the mip their streamed textures are sampled at, as the
-/// hardware's LOD counters do (sotc_lod_stats.h). SOTC_LOD_FEEDBACK=1 turns it on.
-bool LodFeedbackEnabled();
 
 } // namespace Shader

@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
+#include <span>
 
+#include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
@@ -13,10 +14,6 @@
 
 namespace Vulkan {
 
-namespace DrawPhase { // sotc: SOTC_DRAW_PHASES laps defined in vk_rasterizer.cpp
-void SubPipe(unsigned which);
-}
-
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
                    bool is_compute_ /*= false*/)
@@ -25,18 +22,16 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
 
 Pipeline::~Pipeline() = default;
 
+
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
-    const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
-
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    static const bool phases = std::getenv("SOTC_DRAW_PHASES") != nullptr;
-    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
-    if (phases) {
-        DrawPhase::SubPipe(0);
-    }
+    const vk::PipelineLayout layout = *pipeline_layout;
+    scheduler.Record([layout, stage_flags, push_data](vk::CommandBuffer cmdbuf) {
+        cmdbuf.pushConstants(layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    });
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -44,19 +39,52 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     if (uses_push_descriptors) {
-        cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
-        if (phases) {
-            DrawPhase::SubPipe(1);
+        if (!scheduler.IsRecordingDeferred()) {
+            scheduler.Record([&](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
+            });
+            return;
         }
+        // Writes and the infos they point to are laid out in the recording chunk, with the
+        // pointers already aimed at those copies: the command only carries a span.
+        size_t bytes = set_writes.size() * sizeof(vk::WriteDescriptorSet) + 64;
+        for (const auto& write : set_writes) {
+            bytes += write.descriptorCount *
+                         (sizeof(vk::DescriptorBufferInfo) + sizeof(vk::DescriptorImageInfo) +
+                          sizeof(vk::BufferView)) +
+                     32;
+        }
+        scheduler.ReserveRecordData(bytes);
+        const auto writes = scheduler.RecordData(std::span<const vk::WriteDescriptorSet>{set_writes});
+        auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
+        for (size_t i = 0; i < writes.size(); ++i) {
+            auto& write = patched[i];
+            if (write.pBufferInfo) {
+                write.pBufferInfo = scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
+            }
+            if (write.pImageInfo) {
+                write.pImageInfo = scheduler.RecordData(std::span{write.pImageInfo, write.descriptorCount}).data();
+            }
+            if (write.pTexelBufferView) {
+                write.pTexelBufferView =
+                    scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
+            }
+        }
+        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        });
         return;
     }
 
+    // Descriptor set updates are device calls: they stay on this thread.
     const auto desc_set = desc_heap.Commit(*desc_layout);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
+        cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
+    });
 }
 
 std::string Pipeline::GetDebugString() const {

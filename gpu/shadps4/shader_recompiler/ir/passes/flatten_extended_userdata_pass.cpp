@@ -1,16 +1,28 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <atomic>
-#include <mutex>
-#include <cstdlib>
-#include <optional>
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
+#include <cstring>
 #include <queue>
+#include "common/arch.h"
+#ifdef ARCH_X86_64
+#include <mutex>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
-#include "common/arch.h"
+#else
+#include <atomic>
+#include <vector>
+#include <memory>
+#include <mutex>
+#include <cstdlib>
+#ifdef ARCH_ARM64
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#include "shader_recompiler/ir/passes/srt_arm64.h"
+#include "../../../../../src/runtime.h"
+#endif
 #include "common/decoder.h"
 #include "common/io_file.h"
 #include "common/logging/log.h"
@@ -21,137 +33,26 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
-#include "core/memory.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/ir/srt_gvn_table.h"
 #include "shader_recompiler/ir/value.h"
-#include "video_core/sotc_stats.h"
 
 #ifdef ARCH_X86_64
 
 using namespace Xbyak::util;
 
-// Every walker of the pipeline cache is loaded here at startup. Walkers with clean-load
-// checks are several times larger, and a long-played game's cache overflowed 32 MB (Xbyak
-// throws, the emulator died at boot). Untouched pages of the buffer are never used.
-static constexpr size_t SrtCodegenSize = 256_MB;
-static Xbyak::CodeGenerator g_srt_codegen(SrtCodegenSize);
-// sotc: graphics shaders are also translated on pipeline workers (SOTC_ASYNC_TRANSLATE): one
-// walker is generated at a time. Running walkers only read code that is already complete.
-static std::mutex g_srt_codegen_mutex;
-
-/// True when size more bytes fit in the walker buffer; logs the first overflow.
-static bool SrtCodeFits(size_t size) {
-    if (g_srt_codegen.getSize() + size <= SrtCodegenSize) {
-        return true;
-    }
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true)) {
-        LOG_CRITICAL(Render_Recompiler,
-                     "SRT walker code buffer full ({} of {} bytes used): walkers that do not "
-                     "fit are recompiled or skipped",
-                     g_srt_codegen.getSize(), SrtCodegenSize);
-    }
-    return false;
-}
+static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
-
-namespace {
-bool SrtWalkerSignalHandler(void* context, void* fault_address);
-} // namespace
-
-// Walkers read guest pointers unconditionally, so a null or unmapped SRT pointer must be caught by
-// the fault handler for every walker, including ones restored from the pipeline cache.
-static void EnsureSrtWalkerFaultHandler() {
-    if (g_srt_codegen_start == nullptr) {
-        g_srt_codegen_start = g_srt_codegen.getCode();
-        // Call after the memory invalidation handler
-        constexpr u32 priority = 1;
-        Core::Signals::Instance()->RegisterAccessViolationHandler(SrtWalkerSignalHandler,
-                                                                  priority);
-    }
-}
+// gow3: the shader compiler and the background cache warm-up append walkers from different
+// threads.
+static std::mutex g_srt_codegen_mutex;
 
 namespace Shader {
 
-// Copies a window of guest memory from the backing pages, so neither unmapped nor
-// tracking-protected pages beyond the end of a table can fault inside the walker.
-void SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
-    Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
-}
-
-bool IsSrtWalkerCode(const void* code) {
-    const u8* code_start = g_srt_codegen_start;
-    return code_start && code >= code_start && code < code_start + g_srt_codegen.getSize();
-}
-
-namespace {
-bool NoCleanLoad(u64, u32, u64*) {
-    return false;
-}
-
-SrtWalkerContext& WalkerContext() {
-    static SrtWalkerContext context{
-        .clean_pages = [] {
-            // One bit per 4 KiB page; untouched parts of the bitmap are never committed. Always
-            // allocated: walkers restored from the pipeline cache test it unconditionally
-            // (SOTC_CLEAN_READS=0 only stops marking pages).
-            auto* const pages =
-                static_cast<u64*>(std::calloc(SrtCleanPageLimit >> 18, sizeof(u64)));
-            ASSERT_MSG(pages, "No memory for the SRT clean page bitmap");
-            return pages;
-        }(),
-        .clean_load = &NoCleanLoad,
-    };
-    return context;
-}
-} // namespace
-
-const SrtWalkerContext* GetSrtWalkerContext() {
-    return &WalkerContext();
-}
-
-void SetSrtCleanLoad(bool (*clean_load)(u64, u32, u64*)) {
-    WalkerContext().clean_load = clean_load;
-}
-
-void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
-    auto& context = WalkerContext();
-    if (!context.clean_pages || size == 0 || address >= SrtCleanPageLimit) {
-        return;
-    }
-    const u64 last = std::min<u64>((address + size - 1) >> 12, (SrtCleanPageLimit >> 12) - 1);
-    for (u64 page = address >> 12; page <= last; ++page) {
-        u64* word = &context.clean_pages[page >> 6];
-        const u64 bit = 1ULL << (page & 63);
-        if (read_protected) {
-            __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
-        } else {
-            __atomic_fetch_and(word, ~bit, __ATOMIC_RELAXED);
-        }
-    }
-}
-
-void MarkSrtCleanPages(u64 address, u32 size) {
-    auto& context = WalkerContext();
-    if (!context.clean_pages) {
-        return;
-    }
-    for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
-        if ((page << 12) < SrtCleanPageLimit) {
-            context.clean_pages[page >> 6] |= 1ULL << (page & 63);
-        }
-    }
-}
-
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     std::scoped_lock lock{g_srt_codegen_mutex};
-    EnsureSrtWalkerFaultHandler();
-    if (!SrtCodeFits(size)) {
-        return nullptr;
-    }
     const auto func_addr = (PFN_SrtWalker)g_srt_codegen.getCurr();
     g_srt_codegen.db(ptr, size);
     g_srt_codegen.ready();
@@ -187,7 +88,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
     }
 }
 
-bool SrtWalkerSignalHandler(void* context, void* fault_address) {
+static bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     // Only handle if the fault address is within the SRT code range
     const u8* code_start = g_srt_codegen_start;
     const u8* code_end = code_start + g_srt_codegen.getSize();
@@ -196,11 +97,7 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
-    // sotc: the load reads zero, this time only. Upstream patched the instruction to zero the
-    // register for good, which broke the shader for the rest of the session when its SRT
-    // pointer was only null for a while (a table the command processor read before it was
-    // written, with the draw thread) and went into the pipeline cache with the walker code,
-    // so every later session rendered with it (black frames at the Shrine of Worship).
+    // Patch instruction to zero register
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
@@ -210,30 +107,236 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
            operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
            operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
 
+    size_t len = instruction.length;
+    const size_t patch_size = 3;
+    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
+
     // We can only encounter rdi or r10d as the first operand in a
     // fault memory access for SRT walker.
     switch (operands[0].reg.value) {
     case ZYDIS_REGISTER_RDI:
-        Common::SkipLoadAsZero(context, 7, instruction.length);
+        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
+        code_patch[0] = 0x48;
+        code_patch[1] = 0x31;
+        code_patch[2] = 0xFF;
         break;
     case ZYDIS_REGISTER_R10D:
-        Common::SkipLoadAsZero(context, 10, instruction.length);
+        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
+        code_patch[0] = 0x45;
+        code_patch[1] = 0x31;
+        code_patch[2] = 0xD2;
         break;
     default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker fault");
+        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
         return false;
     }
 
-    // sotc: rate-limited, a pointer that stays null faults on every draw now.
-    static std::atomic<u32> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
-        LOG_WARNING(Render_Recompiler, "SRT walker read zero at {}, fault address {}", code,
-                    fault_address);
-    }
-    SotcStats::srt_walker_faults.fetch_add(1, std::memory_order_relaxed);
+    // Fill nops
+    memset(code_patch + patch_size, 0x90, len - patch_size);
+
+    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
+                fault_address);
+
     return true;
 }
 
+#else
+
+namespace {
+using namespace Shader::Arm64Srt;
+} // namespace
+
+namespace Shader {
+
+struct NativeSrtCode {
+    using Function = void (*)(const u32*, u32*);
+    Function function{};
+    std::atomic<bool> enabled{true};
+    void* mapping = nullptr;
+    size_t size{};
+    ~NativeSrtCode() {
+#ifdef ARCH_ARM64
+        if (mapping) munmap(mapping, size);
+#endif
+    }
+};
+
+static NativeSrtCode* CompileNativeSrt(std::span<const u32> program) {
+#ifdef ARCH_ARM64
+    static const bool enabled = [] {
+        const char* value = std::getenv("GOW3_SRT_NATIVE");
+        return !value || value[0] != '0';
+    }();
+    if (!enabled) return nullptr;
+    const auto code = Arm64Srt::Compile(program);
+    if (code.empty()) return nullptr;
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return nullptr;
+    auto native = std::make_unique<NativeSrtCode>();
+    native->size = (code.size() * sizeof(u32) + size_t(page) - 1) & ~(size_t(page) - 1);
+    native->mapping = mmap(nullptr, native->size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (native->mapping == MAP_FAILED) { native->mapping = nullptr; return nullptr; }
+    std::memcpy(native->mapping, code.data(), code.size() * sizeof(u32));
+    auto* begin = static_cast<char*>(native->mapping);
+    __builtin___clear_cache(begin, begin + native->size);
+    if (mprotect(native->mapping, native->size, PROT_READ | PROT_EXEC)) return nullptr;
+    native->function = reinterpret_cast<NativeSrtCode::Function>(native->mapping);
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<NativeSrtCode>> mappings;
+    std::scoped_lock lock{mutex};
+    auto* result = native.get();
+    mappings.push_back(std::move(native));
+    return result;
+#else
+    (void)program;
+    return nullptr;
+#endif
+}
+
+struct SrtProgram {
+    std::vector<u32> words;
+    NativeSrtCode* native{};
+};
+
+const void* SrtProgramCode(const SrtProgram* program) {
+    return program ? program->words.data() : nullptr;
+}
+
+void RunSrtWalker(SrtProgram* stored, const u32* user_data, u32* flat) {
+    const auto* program = stored->words.data();
+    auto* native = stored->native;
+    if (native && native->enabled.load(std::memory_order_relaxed)) {
+        // Use the runtime's existing fault boundary. A fault retries with the interpreter,
+        // which zeros just the failing operation and retains the original cache bytecode.
+        sigjmp_buf* const previous = runtime_fault_recover;
+        sigjmp_buf recover;
+        if (sigsetjmp(recover, 0) == 0) {
+            runtime_fault_recover = &recover;
+            native->function(user_data, flat);
+            runtime_fault_recover = previous;
+            return;
+        }
+        runtime_fault_recover = previous;
+        native->enabled.store(false, std::memory_order_relaxed);
+    }
+    RunSrtProgram(program, user_data, flat);
+}
+
+
+PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    u32 magic = 0;
+    if (size < 8 || size % 4 != 0 ||
+        (std::memcpy(&magic, ptr, sizeof(magic)), magic != SrtMagic)) {
+        LOG_ERROR(Render_Recompiler, "SRT walker in shader cache is not an SRT program");
+        return {};
+    }
+    auto program = std::make_unique<SrtProgram>();
+    program->words.resize(size / sizeof(u32));
+    std::memcpy(program->words.data(), ptr, size);
+    program->native = CompileNativeSrt(program->words);
+    static std::mutex mutex;
+    static std::vector<std::unique_ptr<SrtProgram>> programs;
+    std::scoped_lock lock{mutex};
+    auto* result = program.get();
+    programs.push_back(std::move(program));
+    return SrtWalker{result};
+}
+
+void RunSrtProgram(const u32* program, const u32* user_data, u32* flat) {
+    u32* const code = const_cast<u32*>(program);
+    sigjmp_buf* const previous = runtime_fault_recover;
+    sigjmp_buf recover;
+    u32* volatile faulted = nullptr;
+    if (sigsetjmp(recover, 0)) {
+        __atomic_fetch_or(faulted, OpZeroed, __ATOMIC_RELAXED);
+        LOG_WARNING(Render_Recompiler, "SRT walker load faulted; using zero");
+    }
+    runtime_fault_recover = &recover;
+    const u8* stack[MaxDepth];
+    u32 values[MaxValues];
+    u32 depth = 0, count = 0;
+    const u8* pointer = reinterpret_cast<const u8*>(user_data);
+
+    for (u32 pc = 1;;) {
+        u32* const at = &code[pc++];
+        const u32 word = __atomic_load_n(at, __ATOMIC_RELAXED);
+        const u32 op = word & ~OpZeroed;
+        const bool zeroed = (word & OpZeroed) != 0;
+        switch (op) {
+        case OpEnd:
+            runtime_fault_recover = previous;
+            return;
+        case OpPushImm:
+        case OpPushDyn: {
+            const u32 offset = (op == OpPushImm ? code[pc++] : values[--count]) << 2;
+            u64 next = 0;
+            if (!zeroed) {
+                faulted = at;
+                std::memcpy(&next, pointer + offset, sizeof(next));
+            }
+            stack[depth++] = pointer;
+            pointer = reinterpret_cast<const u8*>(next & 0xFFFFFFFFFFFFull);
+            break;
+        }
+        case OpPop:
+            pointer = stack[--depth];
+            break;
+        case OpCopyImm:
+        case OpCopyDyn: {
+            const u32 offset = (op == OpCopyImm ? code[pc++] : values[--count]) << 2;
+            u32 value = 0;
+            if (!zeroed) {
+                faulted = at;
+                std::memcpy(&value, pointer + offset, sizeof(value));
+            }
+            flat[code[pc++]] = value;
+            break;
+        }
+        case OpUserData:
+        case OpFlat:
+            values[count++] = flat[code[pc++]];
+            break;
+        case OpImm:
+            values[count++] = code[pc++];
+            break;
+        case OpNot:
+            values[count - 1] = ~values[count - 1];
+            break;
+        case OpBitFieldUExtract: {
+            const u32 bits = values[--count];
+            const u32 offset = values[--count];
+            u32& base = values[count - 1];
+            base = (base >> (offset & 31)) & ((1u << (bits & 31)) - 1);
+            break;
+        }
+        default: {
+            const u32 b = values[--count];
+            u32& a = values[count - 1];
+            switch (op) {
+            case OpAdd: a += b; break;
+            case OpSub: a -= b; break;
+            case OpMul: a *= b; break;
+            case OpShl: a <<= b & 31; break;
+            case OpShr: a >>= b & 31; break;
+            case OpAnd: a &= b; break;
+            case OpOr: a |= b; break;
+            case OpXor: a ^= b; break;
+            case OpUMin: a = std::min(a, b); break;
+            case OpUMax: a = std::max(a, b); break;
+            default: UNREACHABLE_MSG("Bad SRT program op {}", op);
+            }
+            break;
+        }
+        }
+    }
+}
+
+} // namespace Shader
+
+#endif
+
+namespace {
 using namespace Shader;
 
 struct PassInfo {
@@ -284,13 +387,6 @@ struct PassInfo {
     // Bumped during codegen to assign offsets to readconsts
     u16 dst_off_dw;
 
-    // Walker loads test the clean-page bitmap (SrtWalkerContext in r13)
-    bool clean_loads = false;
-    // sotc: emplaced and reset under g_srt_codegen_mutex: a used label unregisters itself from
-    // the shared code generator when destroyed.
-    std::optional<Xbyak::Label> clean_load_stub;
-    bool uses_clean_load_stub = false;
-
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
         auto it = pointer_uses.find(inst);
         if (it != pointer_uses.end()) {
@@ -324,17 +420,6 @@ static inline u16 GetFlatbufOffset(const IR::Inst* inst) {
     UNREACHABLE_MSG("Instruction not supported");
 }
 
-/// Copies the flattened-buffer placement of a ReadConst, including the dynamic window flag.
-static inline void CopyFlatbufPlacement(IR::Inst* dst, const IR::Inst* src) {
-    if (src->GetOpcode() == IR::Opcode::ReadConst) {
-        dst->SetFlags(src->Flags<u32>());
-        return;
-    }
-    auto inst_info = dst->Flags<IR::BufferInstInfo>();
-    inst_info.flatbuf_off_dw.Assign(GetFlatbufOffset(src));
-    dst->SetFlags(inst_info);
-}
-
 static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
     if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
         auto inst_info = inst->Flags<IR::BufferInstInfo>();
@@ -349,6 +434,7 @@ static inline void SetFlatbufOffset(IR::Inst* inst, u16 offset) {
     UNREACHABLE_MSG("Instruction not supported");
 }
 
+#ifdef ARCH_X86_64
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw);
 
@@ -617,6 +703,8 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
+#endif
+
 static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -640,6 +728,7 @@ static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     }
 }
 
+#ifdef ARCH_X86_64
 static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& pass_info,
                           const IR::Value& off_dw) {
     ASSERT(reg != ecx && reg != edx);
@@ -692,111 +781,24 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        // sotc: first few only: ~1000 per session while shaders translate on the draw path (the
-        // walker falls back), each a stderr line costing milliseconds there.
-        if (static std::atomic<u32> shown{0}; shown.fetch_add(1, std::memory_order_relaxed) < 4) {
-            LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                      magic_enum::enum_name(inst->GetOpcode()));
-        }
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                  magic_enum::enum_name(inst->GetOpcode()));
         return false;
     }
 }
 
-enum class GuestLoadDst { Rdi, R10d };
-
-/// Loads guest memory at src into rdi (8 bytes) or r10d (4 bytes). The address goes to r11 and
-/// its page is tested in SrtWalkerContext::clean_pages (r13 = context): on a set bit the shared
-/// stub calls clean_load, and the plain load only runs when that declines. Clobbers rax, r9 and
-/// r11, which the rest of the walker does not use. From Pink-shadPS4 (luizgustavs).
-static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoadDst dst,
-                          const Xbyak::Address& src) {
-    if (!pass_info.clean_loads) {
-        if (dst == GuestLoadDst::Rdi) {
-            c.mov(rdi, src);
-        } else {
-            c.mov(r10d, src);
-        }
-        return;
-    }
-    Xbyak::Label plain, done;
-    const u32 size = dst == GuestLoadDst::Rdi ? 8 : 4;
-    c.lea(r11, src);
-    c.mov(rax, r11);
-    c.shr(rax, 12);
-    c.cmp(rax, static_cast<u32>(SrtCleanPageLimit >> 12));
-    c.jae(plain, Xbyak::CodeGenerator::T_NEAR);
-    c.mov(r9, qword[r13]);
-    c.bt(qword[r9], rax);
-    c.jnc(plain, Xbyak::CodeGenerator::T_NEAR);
-    c.mov(eax, size);
-    c.call(*pass_info.clean_load_stub);
-    pass_info.uses_clean_load_stub = true;
-    c.test(al, al);
-    c.jz(plain, Xbyak::CodeGenerator::T_NEAR);
-    if (dst == GuestLoadDst::Rdi) {
-        c.mov(rdi, r9);
-    } else {
-        c.mov(r10d, r9d);
-    }
-    c.jmp(done, Xbyak::CodeGenerator::T_NEAR);
-    c.L(plain);
-    if (dst == GuestLoadDst::Rdi) {
-        c.mov(rdi, qword[r11]);
-    } else {
-        c.mov(r10d, dword[r11]);
-    }
-    c.L(done);
-}
-
-/// Shared by the guest loads of one walker, emitted after its ret so the code stays position
-/// independent: calls clean_load(r11, eax, &value) with the walker registers saved and the stack
-/// aligned. Returns the result in al and the value in r9.
-static void EmitCleanLoadStub(Xbyak::CodeGenerator& c, PassInfo& pass_info) {
-    c.L(*pass_info.clean_load_stub);
-    c.push(rcx);
-    c.push(rdx);
-    c.push(rsi);
-    c.push(rdi);
-    c.push(r8);
-    c.push(r10);
-    c.push(r11);
-    c.push(rbx);
-    c.sub(rsp, 8); // value
-    c.mov(rbx, rsp);
-    c.and_(rsp, ~15);
-#ifdef _WIN32
-    c.sub(rsp, 32); // Shadow space
-    c.mov(rcx, r11);
-    c.mov(edx, eax);
-    c.mov(r8, rbx);
-#else
-    c.mov(rdi, r11);
-    c.mov(esi, eax);
-    c.mov(rdx, rbx);
 #endif
-    c.call(ptr[r13 + 8]);
-    c.mov(rsp, rbx);
-    c.pop(r9);
-    c.pop(rbx);
-    c.pop(r11);
-    c.pop(r10);
-    c.pop(r8);
-    c.pop(rdi);
-    c.pop(rsi);
-    c.pop(rdx);
-    c.pop(rcx);
-    c.ret();
-}
 
+#ifdef ARCH_X86_64
 static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const IR::Value& off_dw) {
     c.push(rdi);
     if (off_dw.IsImmediate()) {
-        EmitGuestLoad(c, pass_info, GuestLoadDst::Rdi, ptr[rdi + (off_dw.U32() << 2)]);
+        c.mov(rdi, ptr[rdi + (off_dw.U32() << 2)]);
     } else {
         ABORT_ON_FAILURE(ComputeOffset(c, r10d, pass_info, off_dw));
         c.shl(r10d, 2);
         c.mov(r10d, r10d);
-        EmitGuestLoad(c, pass_info, GuestLoadDst::Rdi, ptr[rdi + r10]);
+        c.mov(rdi, ptr[rdi + r10]);
     }
     c.mov(r10, 0xFFFFFFFFFFFFULL);
     c.and_(rdi, r10);
@@ -804,32 +806,6 @@ static inline bool PushPtr(Xbyak::CodeGenerator& c, PassInfo& pass_info, const I
 }
 
 static inline void PopPtr(Xbyak::CodeGenerator& c) {
-    c.pop(rdi);
-}
-
-// Emits a call to SrtCopyWindow(flat_dst + dst_off_dw, rdi, window size), preserving the
-// walker state (rdi = current table, rsi = flattened buffer, r12 = SrtCopyWindow).
-static void EmitCopyWindow(Xbyak::CodeGenerator& c, u32 dst_off_dw) {
-    c.push(rdi);
-    c.push(rsi);
-    c.push(rbx);
-    c.mov(rbx, rsp);
-    c.and_(rsp, ~15);
-#ifdef _WIN32
-    c.sub(rsp, 32); // Shadow space
-    c.lea(rcx, ptr[rsi + (dst_off_dw << 2)]);
-    c.mov(rdx, rdi);
-    c.mov(r8, u64{ReadConstDynamicWindowDwords} * sizeof(u32));
-#else
-    c.mov(rdx, u64{ReadConstDynamicWindowDwords} * sizeof(u32));
-    c.mov(rax, rdi);
-    c.lea(rdi, ptr[rsi + (dst_off_dw << 2)]);
-    c.mov(rsi, rax);
-#endif
-    c.call(r12); // SrtCopyWindow, passed in by the caller (the code is cached across builds)
-    c.mov(rsp, rbx);
-    c.pop(rbx);
-    c.pop(rsi);
     c.pop(rdi);
 }
 
@@ -853,29 +829,17 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
     // flattened buffer.
     // TODO src and dst are contiguous. Optimize with wider loads/stores
     // TODO if this subtree is dynamically indexed, don't compact it (keep it sparse)
-    std::optional<u32> dynamic_window;
     for (auto [src_off_dw, use] : *use_list) {
         if (src_off_dw.IsImmediate()) {
-            EmitGuestLoad(c, pass_info, GuestLoadDst::R10d, ptr[rdi + (src_off_dw.U32() << 2)]);
+            c.mov(r10d, ptr[rdi + (src_off_dw.U32() << 2)]);
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
-                if (use->GetOpcode() != IR::Opcode::ReadConst) {
-                    LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
-                    continue;
-                }
-                // The index is only known while the shader runs (e.g. a loop counter): copy a
-                // window of the table so the shader can index it from the flattened buffer.
-                if (!dynamic_window) {
-                    dynamic_window = pass_info.dst_off_dw;
-                    EmitCopyWindow(c, pass_info.dst_off_dw);
-                    pass_info.dst_off_dw += ReadConstDynamicWindowDwords;
-                }
-                use->SetFlags(*dynamic_window | ReadConstDynamicWindowFlag);
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
                 continue;
             }
             c.shl(r10d, 2);
             c.mov(r10d, r10d);
-            EmitGuestLoad(c, pass_info, GuestLoadDst::R10d, ptr[rdi + r10]);
+            c.mov(r10d, dword[rdi + r10]);
         }
         c.mov(ptr[rsi + (pass_info.dst_off_dw << 2)], r10d);
 
@@ -899,30 +863,18 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     if (pass_info.srt_roots.empty()) {
         return;
     }
-
     std::scoped_lock lock{g_srt_codegen_mutex};
-    struct LabelReset {
-        PassInfo& pass_info;
-        ~LabelReset() {
-            pass_info.clean_load_stub.reset();
-        }
-    } label_reset{pass_info}; // destroyed before the lock (declared after it)
-    EnsureSrtWalkerFaultHandler();
-    // A walker is at most a few hundred KB; without that much room left, skip it (the shader
-    // then reads zeros from its flattened user data) rather than overflow the buffer.
-    if (!SrtCodeFits(1_MB)) {
-        return;
+
+    // Register the signal handler for SRT walker, if not already registered
+    if (g_srt_codegen_start == nullptr) {
+        g_srt_codegen_start = c.getCurr();
+        auto* signals = Core::Signals::Instance();
+        // Call after the memory invalidation handler
+        constexpr u32 priority = 1;
+        signals->RegisterAccessViolationHandler(SrtWalkerSignalHandler, priority);
     }
 
-    pass_info.clean_load_stub.emplace();
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
-    // Keep the copy helper (third argument) and the walker context (fourth) in registers the
-    // generated code does not use.
-    c.push(r12);
-    c.push(r13);
-    c.mov(r12, rdx);
-    c.mov(r13, rcx);
-    pass_info.clean_loads = GetSrtWalkerContext()->clean_pages != nullptr;
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
@@ -930,12 +882,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
     }
 
-    c.pop(r13);
-    c.pop(r12);
     c.ret();
-    if (pass_info.uses_clean_load_stub) {
-        EmitCleanLoadStub(c, pass_info);
-    }
     c.ready();
 
     info.srt_info.walker_func_size =
@@ -948,6 +895,129 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
 }
+
+#else
+
+using SrtProgram = std::vector<u32>;
+
+#define ABORT_ON_FAILURE(expr)                                                                     \
+    if (!(expr)) {                                                                                 \
+        return false;                                                                              \
+    }
+
+static bool ComputeOffset(SrtProgram& p, PassInfo& pass_info, const IR::Value& off_dw);
+
+static bool EmitOperand(SrtProgram& p, PassInfo& pass_info, const IR::Value& value) {
+    if (value.IsImmediate()) {
+        p.insert(p.end(), {OpImm, value.U32()});
+        return true;
+    }
+    return ComputeOffset(p, pass_info, value);
+}
+
+static bool EmitComputeOffsetOp(SrtProgram& p, PassInfo& pass_info, IR::Inst* inst,
+                                SrtOp op, size_t args) {
+    ASSERT(!inst->AreAllArgsImmediates());
+    for (size_t i = 0; i < args; ++i) {
+        ABORT_ON_FAILURE(EmitOperand(p, pass_info, inst->Arg(i)));
+    }
+    p.push_back(op);
+    return true;
+}
+
+static bool ComputeOffset(SrtProgram& p, PassInfo& pass_info, const IR::Value& off_dw) {
+    auto inst = off_dw.Inst();
+    switch (inst->GetOpcode()) {
+    case IR::Opcode::GetUserData:
+        p.insert(p.end(), {OpUserData, static_cast<u32>(inst->Arg(0).ScalarReg())});
+        return true;
+    case IR::Opcode::ReadConst:
+    case IR::Opcode::ReadConstBuffer:
+        if (u16 offset = GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)); offset != 0) {
+            p.insert(p.end(), {OpFlat, offset});
+            return true;
+        }
+        return false;
+    case IR::Opcode::IAdd32: return EmitComputeOffsetOp(p, pass_info, inst, OpAdd, 2);
+    case IR::Opcode::ISub32: return EmitComputeOffsetOp(p, pass_info, inst, OpSub, 2);
+    case IR::Opcode::IMul32: return EmitComputeOffsetOp(p, pass_info, inst, OpMul, 2);
+    case IR::Opcode::ShiftLeftLogical32: return EmitComputeOffsetOp(p, pass_info, inst, OpShl, 2);
+    case IR::Opcode::ShiftRightLogical32: return EmitComputeOffsetOp(p, pass_info, inst, OpShr, 2);
+    case IR::Opcode::BitwiseAnd32: return EmitComputeOffsetOp(p, pass_info, inst, OpAnd, 2);
+    case IR::Opcode::BitwiseOr32: return EmitComputeOffsetOp(p, pass_info, inst, OpOr, 2);
+    case IR::Opcode::BitwiseXor32: return EmitComputeOffsetOp(p, pass_info, inst, OpXor, 2);
+    case IR::Opcode::BitwiseNot32: return EmitComputeOffsetOp(p, pass_info, inst, OpNot, 1);
+    case IR::Opcode::UMin32: return EmitComputeOffsetOp(p, pass_info, inst, OpUMin, 2);
+    case IR::Opcode::UMax32: return EmitComputeOffsetOp(p, pass_info, inst, OpUMax, 2);
+    case IR::Opcode::BitFieldUExtract:
+        return EmitComputeOffsetOp(p, pass_info, inst, OpBitFieldUExtract, 3);
+    default:
+        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                  magic_enum::enum_name(inst->GetOpcode()));
+        return false;
+    }
+}
+
+static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& pass_info,
+                         SrtProgram& p) {
+    if (subtree->GetOpcode() == IR::Opcode::ReadConst && subtree->Flags<u16>() == 0 ||
+        subtree->GetOpcode() == IR::Opcode::ReadConstBuffer &&
+            subtree->Flags<IR::BufferInstInfo>().flatbuf_off_dw == 0) {
+        return;
+    }
+    if (off_dw.IsImmediate()) {
+        p.insert(p.end(), {OpPushImm, off_dw.U32()});
+    } else {
+        SrtProgram offset;
+        if (!ComputeOffset(offset, pass_info, off_dw)) {
+            LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+            return;
+        }
+        p.insert(p.end(), offset.begin(), offset.end());
+        p.push_back(OpPushDyn);
+    }
+    auto* use_list = pass_info.GetUsesAsPointer(subtree);
+    ASSERT(use_list);
+    for (auto [src_off_dw, use] : *use_list) {
+        if (src_off_dw.IsImmediate()) {
+            p.insert(p.end(), {OpCopyImm, src_off_dw.U32(), pass_info.dst_off_dw});
+        } else {
+            SrtProgram offset;
+            if (!ComputeOffset(offset, pass_info, src_off_dw)) {
+                LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                continue;
+            }
+            p.insert(p.end(), offset.begin(), offset.end());
+            p.insert(p.end(), {OpCopyDyn, pass_info.dst_off_dw});
+        }
+        SetFlatbufOffset(use, pass_info.dst_off_dw++);
+    }
+    for (const auto [src_off_dw, use] : *use_list) {
+        if (pass_info.GetUsesAsPointer(use)) {
+            VisitPointer(src_off_dw, use, pass_info, p);
+        }
+    }
+    p.push_back(OpPop);
+}
+
+static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
+    if (pass_info.srt_roots.empty()) {
+        return;
+    }
+    SrtProgram program{SrtMagic};
+    pass_info.dst_off_dw = NUM_USER_DATA_REGS;
+    ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
+    for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
+        VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, program);
+    }
+    program.push_back(OpEnd);
+    const size_t size = program.size() * sizeof(u32);
+    info.srt_info.walker_func = RegisterWalkerCode(reinterpret_cast<const u8*>(program.data()), size);
+    info.srt_info.walker_func_size = size;
+    info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+}
+
+#endif
 
 static bool IsReadConstSource(const IR::Value base) {
     auto* inst = base.TryInst();
@@ -1130,48 +1200,10 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
     for (IR::Inst* readconst : all_readconsts) {
         ASSERT(pass_info.vn_to_inst.contains(pass_info.gvn_table.GetValueNumber(readconst)));
         IR::Inst* original = pass_info.DeduplicateInstruction(readconst);
-        CopyFlatbufPlacement(readconst, original);
+        SetFlatbufOffset(readconst, GetFlatbufOffset(original));
     }
 
     program.info.RefreshFlatBuf();
 }
 
 } // namespace Shader::Optimization
-
-#else
-
-namespace Shader {
-
-void SrtCopyWindow(u32* dst, u64 src, u64 bytes) {
-    Core::Memory::Instance()->CopySparseMemory(src, reinterpret_cast<u8*>(dst), bytes);
-}
-
-PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
-    UNREACHABLE_MSG("RegisterWalkerCode unimplemented for target architecture.");
-}
-
-bool IsSrtWalkerCode(const void* code) {
-    return false;
-}
-
-const SrtWalkerContext* GetSrtWalkerContext() {
-    static const SrtWalkerContext context{};
-    return &context;
-}
-
-void SetSrtCleanLoad(bool (*)(u64, u32, u64*)) {}
-
-void MarkSrtCleanPages(u64, u32) {}
-void SetSrtReadProtectedPages(u64, u64, bool) {}
-
-namespace Optimization {
-
-void FlattenExtendedUserdataPass(IR::Program& program) {
-    UNREACHABLE_MSG("FlattenExtendedUserdataPass unimplemented for target architecture.");
-}
-
-} // namespace Optimization
-
-} // namespace Shader
-
-#endif

@@ -1,10 +1,11 @@
+#ifndef __ANDROID__
 /* libSceAudioOut on SDL3 audio streams. sceAudioOutOutput returns once per
  * buffer period on a steady clock, like PS4 hardware: FMOD's output thread
  * reads 256-frame slots out of its mixer's 512-frame ring, and returning in
  * bursts (whenever the device pulls a quantum) lets it overtake the mixer and
  * play stale halves - a click every 10.7 ms. The lowest SDL queue level of
  * each window is steered to two buffers (silence prefill on underrun, ±3%
- * cadence corrections), which also absorbs device clock drift. Without an audio device (headless runs, BB_AUDIO=none)
+ * cadence corrections), which also absorbs device clock drift. Without an audio device (headless runs, GOW3_AUDIO=none)
  * ports only follow the clock. */
 #define _GNU_SOURCE
 #include "runtime.h"
@@ -13,7 +14,6 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
-#include <math.h>
 #include <SDL3/SDL.h>
 
 #define PORTS 25
@@ -32,18 +32,16 @@
 
 typedef struct {
     int used, type, channels, is_float, frames, sample_bytes, std_layout;
-    float limiter_gain; /* sotc: SOTC_AUDIO_LIMITER, the gain the limiter applies now (1 = none) */
-    int out_channels;               /* sotc: what the stream gets (SOTC_AUDIO_CHANNELS downmix) */
+    int output_channels, output_sample_bytes;
     int32_t volume[8];
     SDL_AudioStream *stream;
     uint64_t next_deadline_ns; /* next return of sceAudioOutOutput */
     int64_t adjust_ns; int window_min, window_count; /* queue level control */
     uint64_t last_output_us;
     pthread_mutex_t lock;
-    FILE *dump;                     /* BB_AUDIO_DUMP: raw converted PCM per port */
+    FILE *dump;                     /* GOW3_AUDIO_DUMP: raw converted PCM per port */
     int stats;
-    uint64_t stat_start_ns, stat_last_ns, stat_max_gap_ns; /* BB_AUDIO_STATS */
-    float stat_peak[8]; /* sotc: loudest sample per channel as the game wrote it (before volume) */
+    uint64_t stat_start_ns, stat_last_ns, stat_max_gap_ns; /* GOW3_AUDIO_STATS */
     unsigned stat_starved, stat_buffers; int stat_min_queued;
 } Port;
 typedef struct { uint16_t output; uint8_t channel, reserved; int16_t volume; uint16_t reroute; uint64_t flag, reserved64[2]; } PortState;
@@ -52,6 +50,7 @@ _Static_assert(sizeof(PortState)==32,"AudioOut port state layout");
 static pthread_mutex_t table_lock=PTHREAD_MUTEX_INITIALIZER;
 static Port ports[PORTS];
 static int initialized, sdl_ready=-1;
+static int android_disk;
 static size_t buffers_out, ports_opened;
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000u+(uint64_t)t.tv_nsec; }
@@ -66,51 +65,15 @@ static void sleep_until(uint64_t deadline) {
 }
 static int sdl_audio(void) {
     if (sdl_ready<0) {
-        const char *mode=getenv("BB_AUDIO");
+        const char *mode=getenv("GOW3_AUDIO");
+        const char *driver=getenv("SDL_AUDIO_DRIVER");
+        android_disk=getenv("GOW3_ANDROID_INPUT") && !strcmp(getenv("GOW3_ANDROID_INPUT"),"1") &&
+            driver && !strcmp(driver,"disk");
         sdl_ready = (!mode || strcmp(mode,"none")) && SDL_InitSubSystem(SDL_INIT_AUDIO);
-        printf("Runtime: audio backend %s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)");
+        printf("Runtime: audio backend %s%s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)",
+               android_disk ? " (Android PCM bridge: s16 stereo 48 kHz)" : "");
     }
     return sdl_ready;
-}
-/* sotc: SOTC_AUDIO_CHANNELS = auto (default: the 8 channels go to the device and Windows/SDL fit them
- * to it), 2 (stereo), 6 (5.1) or 8 (7.1): with 2 or 6 the port mixes the game's 7.1 down itself (ITU
- * coefficients, soft limiter). SOTC_AUDIO_LFE=0 leaves the subwoofer channel out of the stereo mix. */
-static int audio_channels_mode(void) {
-    static int mode=-1;
-    if (mode<0) {
-        const char *e=getenv("SOTC_AUDIO_CHANNELS");
-        int v=e ? atoi(e) : 0;
-        mode = v==2 || v==6 || v==8 ? v : 0;
-    }
-    return mode;
-}
-static float audio_lfe_gain(void) {
-    static float gain=-1.0f;
-    if (gain<0.0f) { const char *e=getenv("SOTC_AUDIO_LFE"); gain = e && e[0]=='0' ? 0.0f : 0.5f; }
-    return gain;
-}
-/* sotc: SOTC_AUDIO_DEVICE = (part of) a playback device's name; empty or not found: the Windows
- * default. */
-static SDL_AudioDeviceID audio_device(void) {
-    static int done;
-    static SDL_AudioDeviceID chosen=SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
-    if (done) return chosen;
-    done=1;
-    const char *want=getenv("SOTC_AUDIO_DEVICE");
-    int count=0;
-    SDL_AudioDeviceID *devices=SDL_GetAudioPlaybackDevices(&count);
-    for (int i=0;devices && i<count;++i) {
-        const char *name=SDL_GetAudioDeviceName(devices[i]);
-        printf("Runtime: audio device %d: %s\n",i,name ? name : "?");
-        if (want && want[0] && name && SDL_strcasestr(name,want) && chosen==SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) {
-            chosen=devices[i];
-            printf("Runtime: audio device chosen: %s (SOTC_AUDIO_DEVICE)\n",name);
-        }
-    }
-    if (want && want[0] && chosen==SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
-        printf("Runtime: audio device \"%s\" not found; the Windows default plays the sound\n",want);
-    SDL_free(devices);
-    return chosen;
 }
 static int port_range(int type, int *first, int *last) {
     switch (type) {
@@ -157,18 +120,32 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     pthread_mutex_init(&p->lock,NULL);
     p->used=1; p->type=type; p->channels=channels[format]; p->is_float=format>=3 && format!=6;
     p->sample_bytes=p->is_float ? 4 : 2; p->frames=(int)length; p->std_layout=format>=6;
-    p->out_channels=p->channels;
-    if (p->channels==8 && (audio_channels_mode()==2 || audio_channels_mode()==6)) p->out_channels=audio_channels_mode();
-    for (int c=0;c<8;++c) p->volume[c]=VOLUME_0DB;
-    p->limiter_gain=1.0f;
-    if (sdl_audio()) {
-        SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->out_channels, 48000};
-        p->stream=SDL_OpenAudioDeviceStream(audio_device(),&spec,NULL,NULL);
-        if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
-        else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
+    sdl_audio();
+    p->output_channels=android_disk ? 2 : p->channels;
+    p->output_sample_bytes=android_disk ? 2 : p->sample_bytes;
+    if (android_disk && !sdl_ready) {
+        fprintf(stderr,"Runtime: Android audio backend unavailable; refusing silent port %d\n",id);
+        p->used=0; pthread_mutex_destroy(&p->lock);
+        pthread_mutex_unlock(&table_lock);
+        return ERR_NOT_OPENED;
     }
-    p->stats=getenv("BB_AUDIO_STATS")!=NULL;
-    const char *dump=getenv("BB_AUDIO_DUMP");
+    for (int c=0;c<8;++c) p->volume[c]=VOLUME_0DB;
+    if (sdl_ready) {
+        SDL_AudioSpec spec={android_disk ? SDL_AUDIO_S16 : (p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16),
+                            p->output_channels, 48000};
+        p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
+        if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
+        else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink (type %d, %d ch)\n",
+                     SDL_GetError(),id,type,p->channels);
+        if (android_disk && !p->stream) {
+            fprintf(stderr,"Runtime: Android audio stream unavailable; refusing silent port %d\n",id);
+            p->used=0; pthread_mutex_destroy(&p->lock);
+            pthread_mutex_unlock(&table_lock);
+            return ERR_NOT_OPENED;
+        }
+    }
+    p->stats=getenv("GOW3_AUDIO_STATS")!=NULL;
+    const char *dump=getenv("GOW3_AUDIO_DUMP");
     if (dump) {
         char path[4096];
         snprintf(path,sizeof(path),"%s.port%d.%dch.%s",dump,id,p->channels,p->is_float ? "f32" : "s16");
@@ -176,7 +153,8 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     }
     ++ports_opened;
     pthread_mutex_unlock(&table_lock);
-    printf("Runtime: audio port %d opened (type %d, %d ch -> %d ch, %s, %u frames)\n",id,type,p->channels,p->out_channels,p->is_float ? "float" : "s16",length);
+    printf("Runtime: audio port %d opened (type %d, %d ch %s -> %d ch s16, %u frames)\n",id,type,p->channels,
+           p->is_float ? "float" : "s16",p->output_channels,length);
     return (type<<16) | id | 0x20000000;
 }
 static ABI int32_t audio_close(int32_t handle) {
@@ -189,66 +167,12 @@ static ABI int32_t audio_close(int32_t handle) {
         if (p->dump) fclose(p->dump);
         p->dump=NULL;
         p->stream=NULL; p->used=0;
+        printf("Runtime: audio port %d closed\n",(int)(p-ports));
         pthread_mutex_unlock(&p->lock);
     }
     pthread_mutex_unlock(&table_lock);
     return p ? 0 : error;
 }
-/* SOTC_VOLUME: master volume in percent (default 100, 25-500; #95, the game is quiet). Above
- * 100 the peaks go through a soft limiter instead of clipping hard. */
-static volatile float master_volume_value=-1.0f;
-static float master_volume(void) {
-    float v=master_volume_value;
-    if (v<0.0f) {
-        const char *e=getenv("SOTC_VOLUME");
-        double pct=e && e[0] ? atof(e) : 100.0;
-        if (pct<25.0) pct=25.0;
-        if (pct>500.0) pct=500.0;
-        v=(float)(pct/100.0);
-        master_volume_value=v;
-    }
-    return v;
-}
-/* The in-game menu's volume (bbport_overlay.cpp): percent, applied from the next buffer. */
-void runtime_audio_set_volume_percent(int pct);
-int runtime_audio_volume_percent(void);
-void runtime_audio_set_volume_percent(int pct) {
-    if (pct<25) pct=25;
-    if (pct>500) pct=500;
-    master_volume_value=(float)pct/100.0f;
-}
-int runtime_audio_volume_percent(void) { return (int)(master_volume()*100.0f+0.5f); }
-
-/* Linear up to 0.8 of full scale, then a tanh knee that never reaches 1. */
-static inline float soft_limit(float v) {
-    float a=fabsf(v);
-    if (a<=0.8f) return v;
-    float o=0.8f+0.2f*tanhf((a-0.8f)/0.2f);
-    return v<0.0f ? -o : o;
-}
-
-/* sotc (#426): above 100% (and in the downmix, whose sums can pass full scale) a limiter with an
- * envelope keeps the loud moments under the knee: the gain drops in ~1 ms when a frame would pass
- * 0.8 and comes back over ~250 ms, the same for every channel of the port (the image stays put).
- * soft_limit() alone squashed every loud sample on its own: in fights the impacts and the LFE
- * hit it all the time and buried the music. soft_limit() still catches what the 1 ms attack lets
- * through. SOTC_AUDIO_LIMITER=0: only soft_limit(), as before. */
-#define LIMITER_THRESHOLD 0.8f
-static int audio_limiter(void) {
-    static int value=-1;
-    if (value<0) { const char *e=getenv("SOTC_AUDIO_LIMITER"); value=!(e && e[0]=='0'); }
-    return value;
-}
-static inline void limit_frame(Port *p, float *v, int n) {
-    static const float attack=0.0206f, release=0.0000833f; /* 1 - exp(-1/(48 kHz * 1 ms / 250 ms)) */
-    float peak=0.0f;
-    for (int c=0;c<n;++c) { float a=fabsf(v[c]); if (a>peak) peak=a; }
-    float target=peak>LIMITER_THRESHOLD ? LIMITER_THRESHOLD/peak : 1.0f, g=p->limiter_gain;
-    g+=(target-g)*(target<g ? attack : release);
-    p->limiter_gain=g;
-    for (int c=0;c<n;++c) v[c]=soft_limit(v[c]*g);
-}
-
 /* `pace`: wait for this port's next period. sceAudioOutOutputs waits once for all its ports. */
 static int32_t output_port(int32_t handle, const void *data, int pace) {
     int32_t error=0;
@@ -258,76 +182,44 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     if (!p) return error;
     pthread_mutex_lock(&p->lock);
     size_t samples=(size_t)p->frames*(size_t)p->channels;
-    size_t bytes=(size_t)p->frames*(size_t)p->out_channels*(size_t)p->sample_bytes; /* what the stream gets */
+    size_t output_samples=(size_t)p->frames*(size_t)p->output_channels;
+    size_t bytes=output_samples*(size_t)p->output_sample_bytes;
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
     if (data) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
         unsigned char converted[2048*8*4];
         static const int remap[8]={0,1,2,3,6,7,4,5};
-        const float master=master_volume();
-        const int limit=master>1.0f, use_limiter=audio_limiter();
-        if (p->out_channels!=p->channels) {
-            /* sotc: SOTC_AUDIO_CHANNELS 2 / 6: the PS4 7.1 (L R C LFE SL SR BL BR) mixed down here. */
-            const float k=0.70710678f, lfe=audio_lfe_gain();
-            for (size_t f=0;f<(size_t)p->frames;++f) {
-                float in[8];
-                for (int c=0;c<8;++c) {
-                    size_t from=f*8u+(size_t)c;
+        for (size_t f=0;f<(size_t)p->frames;++f) {
+            if (android_disk) {
+                float left=0, right=0;
+                for (int c=0;c<p->channels;++c) {
+                    size_t from=f*(size_t)p->channels+(size_t)c;
                     float v;
                     if (p->is_float) memcpy(&v,(const char *)data+from*4,4);
-                    else { int16_t s16; memcpy(&s16,(const char *)data+from*2,2); v=(float)s16/32768.0f; }
-                    in[c]=v*(float)p->volume[c]/VOLUME_0DB*master;
+                    else { int16_t s; memcpy(&s,(const char *)data+from*2,2); v=(float)s/32768.0f; }
+                    v*=(float)p->volume[c]/VOLUME_0DB;
+                    if (p->channels==1) { left+=v; right+=v; }
+                    else if (c==0) left+=v;
+                    else if (c==1) right+=v;
+                    else if (c==2) { left+=v*0.7071f; right+=v*0.7071f; }
+                    else if (c==3) { left+=v*0.35f; right+=v*0.35f; }
+                    else if ((c&1)==0) left+=v*0.5f;
+                    else right+=v*0.5f;
                 }
-                float out[6]; int n;
-                if (p->out_channels==2) {
-                    out[0]=in[0]+k*in[2]+k*in[4]+k*in[6]+lfe*in[3];
-                    out[1]=in[1]+k*in[2]+k*in[5]+k*in[7]+lfe*in[3];
-                    n=2;
-                } else { /* SDL 5.1 order: FL FR FC LFE BL BR */
-                    out[0]=in[0]; out[1]=in[1]; out[2]=in[2]; out[3]=in[3];
-                    out[4]=in[4]+k*in[6]; out[5]=in[5]+k*in[7];
-                    n=6;
-                }
-                if (use_limiter) limit_frame(p,out,n);
-                else for (int c=0;c<n;++c) out[c]=soft_limit(out[c]);
-                for (int c=0;c<n;++c) {
-                    float v=out[c];
-                    size_t to=f*(size_t)n+(size_t)c;
-                    if (p->is_float) memcpy(converted+to*4,&v,4);
-                    else { int16_t s16=(int16_t)(v*32767.0f); memcpy(converted+to*2,&s16,2); }
-                }
-            }
-        } else
-        for (size_t f=0;f<(size_t)p->frames;++f) {
-            float v[8];
-            int n=p->channels<8 ? p->channels : 8;
-            for (int c=0;c<n;++c) {
-                size_t from=f*(size_t)p->channels+(size_t)c;
-                float gain=(float)p->volume[c]/VOLUME_0DB*master;
-                if (p->is_float) { memcpy(&v[c],(const char *)data+from*4,4); v[c]*=gain; }
-                else { int16_t s16; memcpy(&s16,(const char *)data+from*2,2); v[c]=(float)s16*gain/32768.0f; }
-            }
-            if (limit) {
-                if (use_limiter) limit_frame(p,v,n);
-                else for (int c=0;c<n;++c) v[c]=soft_limit(v[c]);
-            }
-            for (int c=0;c<n;++c) {
+                if (left>1) left=1; if (left<-1) left=-1;
+                if (right>1) right=1; if (right<-1) right=-1;
+                int16_t out[2]={(int16_t)(left*32767.0f),(int16_t)(right*32767.0f)};
+                memcpy(converted+f*sizeof(out),out,sizeof(out));
+            } else for (int c=0;c<p->channels;++c) {
                 int target=p->channels==8 && !p->std_layout ? remap[c] : c;
-                size_t to=f*(size_t)p->channels+(size_t)target;
-                if (p->is_float) memcpy(converted+to*4,&v[c],4);
-                else { int16_t s16=(int16_t)(v[c]*32767.0f); memcpy(converted+to*2,&s16,2); }
+                size_t from=f*(size_t)p->channels+(size_t)c, to=f*(size_t)p->channels+(size_t)target;
+                float gain=(float)p->volume[c]/VOLUME_0DB;
+                if (p->is_float) { float v; memcpy(&v,(const char *)data+from*4,4); v*=gain; memcpy(converted+to*4,&v,4); }
+                else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
             }
         }
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {
-            for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels && c<8;++c) {
-                size_t from=f*(size_t)p->channels+(size_t)c;
-                float v;
-                if (p->is_float) memcpy(&v,(const char *)data+from*4,4);
-                else { int16_t s16; memcpy(&s16,(const char *)data+from*2,2); v=(float)s16/32768.0f; }
-                v=fabsf(v);
-                if (v>p->stat_peak[c]) p->stat_peak[c]=v;
-            }
             uint64_t now=now_ns();
             if (!p->stat_start_ns) { p->stat_start_ns=now; p->stat_min_queued=1<<30; }
             else if (now-p->stat_last_ns>p->stat_max_gap_ns) p->stat_max_gap_ns=now-p->stat_last_ns;
@@ -341,12 +233,6 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
                 printf("Audio stats port %d: %u buffers/5s (expected %u), max gap %.2f ms, min queued %d bytes, starved %u\n",
                        (int)(p-ports),p->stat_buffers,(unsigned)(5u*48000u/(unsigned)p->frames),p->stat_max_gap_ns/1e6,
                        p->stat_min_queued,p->stat_starved);
-                char levels[256]=""; size_t at=0;
-                for (int c=0;c<p->channels && c<8;++c) {
-                    at+=(size_t)snprintf(levels+at,sizeof(levels)-at," %.3f@%d%%",p->stat_peak[c],(int)(p->volume[c]*100LL/VOLUME_0DB));
-                    p->stat_peak[c]=0.0f;
-                }
-                printf("Audio levels port %d (type %d, %d ch, master %.2f): peak@volume%s\n",(int)(p-ports),p->type,p->channels,master,levels);
                 p->stat_start_ns=now; p->stat_max_gap_ns=0; p->stat_starved=0; p->stat_buffers=0; p->stat_min_queued=1<<30;
             }
         }
@@ -438,3 +324,5 @@ static const RuntimeExport exports[]={
 };
 uintptr_t runtime_audio_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_audio_report(void) { printf("Runtime: audio ports opened=%zu, buffers output=%zu\n",ports_opened,buffers_out); }
+
+#endif

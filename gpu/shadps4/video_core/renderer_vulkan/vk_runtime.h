@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_barrier_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -16,6 +16,9 @@ class BlitHelper;
 
 namespace Vulkan {
 
+class GpuProfiler;
+class SceneTargets;
+
 class Instance;
 class Scheduler;
 
@@ -23,6 +26,10 @@ class Runtime {
 public:
     explicit Runtime(const Instance& instance, Scheduler& scheduler);
     ~Runtime() = default;
+
+    Scheduler& GetScheduler() {
+        return scheduler;
+    }
 
     const Instance& GetInstance() const {
         return instance;
@@ -33,6 +40,7 @@ public:
     }
 
     void TickFrame();
+    SceneTargets* scene_targets = nullptr;
 
     void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                     std::span<const vk::BufferCopy> copies);
@@ -45,12 +53,27 @@ public:
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});
 
+    /// GOW3_GPU_PROFILE: a profiler segment for a transfer of `image` while it lives; the
+    /// segment it interrupted continues afterwards.
+    class TransferMark {
+    public:
+        TransferMark(Runtime& runtime, const char* what, const VideoCore::Image& image);
+        ~TransferMark();
+        TransferMark(const TransferMark&) = delete;
+        TransferMark& operator=(const TransferMark&) = delete;
+
+    private:
+        GpuProfiler* profiler = nullptr;
+        u64 resume = 0;
+    };
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
 
     void CopyImage(VideoCore::Image* src, VideoCore::Image* dst);
+    /// gow3: mip 0 of an image sharing guest memory with `dst` (texture_cache aliasing).
+    void CopyAliasImage(VideoCore::Image* src, VideoCore::Image* dst, const vk::Extent3D& extent);
     void CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                              const VideoCore::Buffer* buffer, u64 offset);
     void CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice);
@@ -76,69 +99,39 @@ public:
 
     void FlushBarriers();
 
-    /// sotc: image barriers waiting for FlushBarriers (SOTC_DEPTHFAST_VERIFY compares it).
-    [[nodiscard]] size_t PendingImageBarriers() const {
-        return static_cast<size_t>(image_barriers.size());
+    /// gow3: runs before this thread changes image state (layouts, pending image
+    /// barriers): the rasterizer joins its texture binding helper there (BindHelper).
+    void SetImageAccessHook(void (*hook)(void*), void* context) {
+        image_access_hook = hook;
+        image_access_context = context;
+    }
+    void BeforeImageAccess() {
+        if (image_access_hook) {
+            image_access_hook(image_access_context);
+        }
     }
 
 private:
-    void MakeCurrent(const VideoCore::Buffer* handle);
-
-private:
+    void (*image_access_hook)(void*) = nullptr;
+    void* image_access_context = nullptr;
     const Instance& instance;
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    struct BufferBarriers {
-        const VideoCore::Buffer* handle;
-        using AccessList = IntervalList<Interval>;
-        AccessList read_ranges;
-        AccessList write_ranges;
-    };
-public:
-    /// sotc: SOTC_CULL_QUEUE: the barrier tracking of another command stream (the cull queue's);
-    /// swapped in while its commands are recorded so the graphics tracking stays untouched.
-    struct BarrierState {
-        std::vector<BufferBarriers> resources;
-        std::size_t active_resources{};
-        BufferBarriers* resource{};
-        vk::MemoryBarrier2 memory_barrier{};
-        VideoCore::Image::Barriers image_barriers;
-    };
-    void SwapBarrierState(BarrierState& state);
-    /// sotc: forgets the pending accesses without recording a barrier (a new command buffer
-    /// that starts with a full barrier of its own).
-    void ResetBarrierState();
-    [[nodiscard]] bool HasPendingImageBarriers() const {
-        return !image_barriers.empty();
-    }
-
-private:
-    BufferBarriers* resource{};
-    std::vector<BufferBarriers> resources;
-    // sotc: entries [0, active_resources) are live. With access_reuse the rest keep their list
-    // capacity across barriers (no malloc for the first ranges after every FlushBarriers);
-    // SOTC_ACCESS_REUSE=0 clears the vector as before. access_union: IntervalList::AddUnion
-    // (SOTC_ACCESS_UNION=0: Add).
-    std::size_t active_resources{};
-    bool access_reuse{true};
-    bool access_union{true};
-    // sotc: BbToggle::DrawBindMemo. The accesses applied since the last FlushBarriers (the epoch),
-    // direct mapped: applying the same one again changes neither range list nor barrier masks, so
-    // a draw that binds what the previous one bound skips them (AccessBuffer).
-    struct AccessMemo {
-        const VideoCore::Buffer* handle{};
-        u64 offset{};
-        u64 size{};
-        u64 stage{};
-        u64 access{};
-        u64 epoch{};
-    };
-    static constexpr std::size_t NumAccessMemos = 64;
-    std::array<AccessMemo, NumAccessMemos> access_memos{};
-    u64 access_epoch{1};
+    BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
+    // gow3: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
+    // contained range is a no-op, and draws re-bind the same ranges constantly.
+    struct AccessMemo {
+        u64 resource;
+        u64 start;
+        u64 end;
+        u32 epoch;
+        u32 access;
+    };
+    std::array<AccessMemo, 512> access_memo{};
+    u32 access_epoch = 1;
 };
 
 } // namespace Vulkan

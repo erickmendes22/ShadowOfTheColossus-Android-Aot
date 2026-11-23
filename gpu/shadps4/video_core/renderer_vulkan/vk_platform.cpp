@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Include the vulkan platform specific header
-#if defined(ANDROID)
+#if defined(__ANDROID__)
 #define VK_USE_PLATFORM_ANDROID_KHR
 #elif defined(_WIN64)
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -14,6 +14,9 @@
 #endif
 
 #include <vector>
+#ifdef __ANDROID__
+#include "vk_driver_loader.h"
+#endif
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
@@ -21,8 +24,8 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
-#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_dlss.h"
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -123,18 +126,6 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
     }
 
     return surface;
-}
-
-// sotc: whether this queue family can present at all, without needing a surface (the present
-// queue is chosen at device creation, before the swapchain exists). Windows only; elsewhere the
-// graphics family is assumed, as before.
-bool QueueFamilyCanPresent(vk::PhysicalDevice physical_device, u32 family_index,
-                           u32 graphics_family_index) {
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-    return physical_device.getWin32PresentationSupportKHR(family_index);
-#else
-    return family_index == graphics_family_index;
-#endif
 }
 
 static auto GetLayerExtensions(std::vector<const char*>&& extensions,
@@ -283,14 +274,15 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 
+#ifdef __ANDROID__
+    auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(gow3_vk_get_instance_proc_addr());
+    ASSERT_MSG(gipa, "Unable to load the selected Android Vulkan driver");
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(gipa);
+#else
     static vk::detail::DynamicLoader dl;
-    // sotc: SOTC_DLSSG=1 loads Vulkan through Streamline's interposer (DLSS Frame Generation).
-    PFN_vkGetInstanceProcAddr get_instance_proc_addr = Dlssg::LoadInterposer();
-    if (!get_instance_proc_addr) {
-        get_instance_proc_addr =
-            dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
-    }
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(
+        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+#endif
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion
@@ -305,6 +297,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    // gow3: DLSS (optional bridge DLL) needs its own instance extensions.
+    if (Dlss* dlss = Dlss::Get()) {
+        dlss->AppendInstanceExtensions(extensions);
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

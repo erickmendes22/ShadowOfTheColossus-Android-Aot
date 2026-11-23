@@ -1,8 +1,10 @@
 out/
+.deps/
+.local/
 __pycache__/
 user/
 *.mp4
-bbport.ini
+gow3.ini
 fsr4_shaders/
 pgo/
 *.png
@@ -20,7 +22,11 @@ perf.data
 /docs/savedata_route/
 /docs/route*.txt
 /docs/route_run.log
+mods.json
 patches.json
-!launcher/sotc.png
-out/
-sotc.ini
+!launcher/gow3.png
+.local-deps/
+.gradle
+local.properties
+.idea
+game

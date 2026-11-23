@@ -3,18 +3,16 @@
 
 #pragma once
 
-#include <array>
-#include <atomic>
+#include <cstdlib>
+
 #include <condition_variable>
+#include <deque>
 #include <coroutine>
 #include <exception>
-#include <memory>
-#include <deque>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <span>
-#include <string>
-#include <source_location>
 #include <thread>
 #include <vector>
 #include <queue>
@@ -28,26 +26,15 @@
 
 namespace Vulkan {
 class Rasterizer;
-class Pipeline;
-}
-
-namespace Shader {
-struct Info;
 }
 
 namespace Libraries::VideoOut {
 struct VideoOutPort;
 }
 
-// sotc: BbToggle::MicroCostSweep (gpu/shim/bbport_toggles.h) is read by OnBackThread below; the
-// header is not included here because the shader tests include this one without the runtime.
-extern "C" std::uint64_t runtime_disabled_optimizations;
-
 namespace AmdGpu {
 
-/// sotc: true on the draw thread only (Liverpool::BackLoop sets it when the thread starts, the
-/// thread never changes). Replaces the std::this_thread::get_id() comparison of OnBackThread.
-inline thread_local bool t_on_back_thread = false;
+union PM4Header;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -81,6 +68,30 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// gow3: register blocks written since the last draw handed to the draw recording thread
+    /// (Rasterizer::PostDraw sends them along).
+    RegDirty pipe_dirty;
+    /// gow3: fence writes handed to the draw recording thread and not yet done there: a
+    /// WaitRegMem on one of them is met in stream order without waiting for that thread.
+    struct PendingFence {
+        VAddr address;
+        u64 data;
+        u32 num_bytes;
+        u64 position;
+    };
+    std::deque<PendingFence> pending_fences;
+    void NotePendingFences(const auto& event);
+    bool PendingFenceValue(VAddr address, u32& value);
+    void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);
+    /// gow3: running checksum of graphics-register packets (see ApplyGraphicsRegisterPacket).
+    u64 gfx_reg_checksum{};
+    /// Top-level graphics submissions, numbered for the draw preparation workers.
+    static constexpr u64 NoSeq = ~0ull;
+    u64 gfx_submit_seq{};
+    static u64 HashRegisterPacket(u64 checksum, const u32* words, u32 count);
+    /// `dirty` (draw-preparation scanner) records the register blocks written.
+    static void ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
+                                            RegDirty* dirty = nullptr);
 
 public:
     explicit Liverpool();
@@ -98,19 +109,18 @@ public:
     }
 
     void WaitGpuIdle() noexcept {
-        {
-            std::unique_lock lk{submit_mutex};
-            submit_cv.wait(lk, [this] { return num_submits == 0; });
-        }
-        // sotc: and until the draw thread ran what the command processor queued.
-        while (back_tail.load(std::memory_order_acquire) != back_head.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
+        std::unique_lock lk{submit_mutex};
+        submit_cv.wait(lk, [this] { return num_submits == 0; });
     }
 
+    /// gow3: also the draw recording thread and the fences it deferred are done (see
+    /// work_retired). sceGnmSubmitDone does not block the guest when this is true.
     bool IsGpuIdle() const {
-        return num_submits == 0 &&
-               back_tail.load(std::memory_order_acquire) == back_head.load(std::memory_order_acquire);
+        static const bool use_retired = [] {
+            const char* env = std::getenv("GOW3_WORK_RETIRED");
+            return !(env && env[0] == '0');
+        }();
+        return num_submits == 0 && (work_retired || !use_retired);
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -121,16 +131,21 @@ public:
         rasterizer = rasterizer_;
     }
 
+    /// Returns true when the PM4 packet currently being processed has the predicate bit set.
+    bool IsPacketPredicated() const {
+        return packet_predicated;
+    }
+
+    /// ZPASS counter pairs (16 in Neo mode, 8 otherwise).
+    u32 CounterPairs() const {
+        return num_counter_pairs;
+    }
+
+    /// Restores the index base staged by a GPU-predicated DrawIndex2 (see the draw handler).
+    void RestorePredicatedIndexBase();
+
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
-        // sotc: from the command processor itself (it forwards the queue to the draw thread).
-        if (back_threaded && std::this_thread::get_id() == gpu_id) {
-            QueueBackFunc(Common::UniqueFunction<void>{std::move(func)}, true, 1);
-            if constexpr (wait_done) {
-                DrainBack();
-            }
-            return;
-        }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -142,75 +157,13 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
-            WakeBack();
             sem.acquire();
         } else {
-            {
-                std::scoped_lock lk{submit_mutex};
-                command_queue.emplace(std::move(func));
-                ++num_commands;
-                submit_cv.notify_one();
-            }
-            WakeBack();
+            std::scoped_lock lk{submit_mutex};
+            command_queue.emplace(std::move(func));
+            ++num_commands;
+            submit_cv.notify_one();
         }
-    }
-
-    /// sotc: SOTC_RB_SAFEPOINT=1 (plan PLANO-TROCA-DE-AREA etapa 3): the finish of a guest
-    /// readback (applying data the GPU already copied) waits in a queue of its own that the draw
-    /// thread serves between ops, like the commands, and also at safe points inside long ops
-    /// (between the buffers and the textures of a bind: Safepoint). func(at_safepoint) returns
-    /// false to stay queued (a finish that would record GPU work waits for the normal point).
-    /// Blocks until it ran. Off, or from the command processor: SendCommand<true> as before.
-    static bool SafepointEnabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("SOTC_RB_SAFEPOINT");
-            return v && v[0] == '1';
-        }();
-        return on;
-    }
-    void SendFinish(Common::UniqueFunction<bool, bool>&& func) {
-        if (!SafepointEnabled() || !back_threaded || std::this_thread::get_id() == gpu_id) {
-            SendCommand<true>([&func] { func(false); });
-            return;
-        }
-        std::binary_semaphore sem{0};
-        {
-            std::scoped_lock lk{finish_mutex};
-            finish_queue.emplace_back([&sem, &func](bool at_safepoint) {
-                if (!func(bool{at_safepoint})) {
-                    return false;
-                }
-                sem.release();
-                return true;
-            });
-            num_finishes.fetch_add(1, std::memory_order_release);
-        }
-        WakeBack();
-        sem.acquire();
-    }
-    /// Draw thread: runs the queued finishes (at_safepoint: only the ones that accept it).
-    void ServeFinishes(bool at_safepoint);
-    /// A safe point inside a long op (draw thread only; nothing to do off the draw thread).
-    void Safepoint() {
-        if (num_finishes.load(std::memory_order_acquire) != 0 && OnBackThread()) {
-            ServeFinishes(true);
-        }
-    }
-
-    /// sotc: a command that must run at the command processor's point of the command stream,
-    /// after the work it queued so far (SendCommand runs before that work with the draw thread:
-    /// readbacks for guest threads do not wait for the queue).
-    /// tag: SOTC_SLOW_OPS key of the op (3 by default; 4 flips, 5 memory releases).
-    void SendOrderedCommand(Common::UniqueFunction<void>&& func, u32 tag = 3) {
-        if (!back_threaded) {
-            SendCommand(std::move(func));
-            return;
-        }
-        std::scoped_lock lk{submit_mutex};
-        ordered_queue.emplace(std::move(func));
-        ordered_tags.push(tag);
-        ++num_ordered;
-        submit_cv.notify_one();
     }
 
     void ReserveCopyBufferSpace() {
@@ -240,142 +193,9 @@ public:
         return gpu_id;
     }
 
-    /// sotc: the draw thread (SOTC_CP_THREADS, on by default). The command processor parses the
-    /// command buffers and resolves the pipeline of every draw and dispatch, and the draw thread
-    /// binds and records them, in the same order: the pipeline lookup (~20% of the command
-    /// processor time) runs while the previous draws are bound. Every other operation that
-    /// touches the GPU state or writes guest memory for the GPU is queued to the draw thread as
-    /// well, so it keeps the command stream order. The draw thread owns copies of the registers
-    /// (updated from the chunks the command processor changed), of the compute registers and of
-    /// the per-draw shader data (Shader::InfoRuntime, slot 1).
-    bool IsBackThreaded() const noexcept {
-        return back_threaded;
-    }
-    /// sotc: a register chunk was written since the last captured operation, so the GPU state is
-    /// no longer the one the last graphics pipeline was built from (PipelineKeyMemo). Always
-    /// false without the draw thread: MarkRegs does not track chunks then.
-    bool HasDirtyRegChunks() const noexcept {
-        for (const u64 word : dirty_chunks) {
-            if (word != 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-    bool OnBackThread() const noexcept {
-        // sotc: 1u << 23 is BbToggle::MicroCostSweep (static_assert in liverpool.cpp). Clear: one
-        // thread_local read, the same value as the thread id comparison (set: the old path).
-        if (!(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & (1u << 23)))
-            [[likely]] {
-#ifdef SOTC_VERIFY_ON_BACK_THREAD
-            ASSERT_MSG(t_on_back_thread == (back_threaded && std::this_thread::get_id() == back_id),
-                       "OnBackThread flag differs from the thread id");
-#endif
-            return back_threaded && t_on_back_thread;
-        }
-        return back_threaded && std::this_thread::get_id() == back_id;
-    }
-    /// The command processor or the draw thread: both work on the GPU state.
-    bool IsGpuSideThread() const noexcept {
-        const auto id = std::this_thread::get_id();
-        return id == gpu_id || (back_threaded && id == back_id);
-    }
-    /// A fault on the command processor thread: the draw thread must be idle before the fault
-    /// handler touches the GPU state (it may also produce what the faulting read wants).
-    void PrepareGpuSideFault() {
-        if (back_threaded && std::this_thread::get_id() == gpu_id) {
-            DrainBack();
-        }
-    }
-    /// Registers of the draw or dispatch being bound (the draw thread's copy on that thread).
-    const Regs& DrawRegs() const noexcept {
-        return OnBackThread() ? back_regs : regs;
-    }
-    const ComputeProgram& DrawCsRegs() noexcept {
-        return OnBackThread() ? back_cs : GetCsRegs();
-    }
-    const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& DrawCbExtent() const noexcept {
-        return OnBackThread() ? back_cb_extent : last_cb_extent;
-    }
-    const CbDbExtent& DrawDbExtent() const noexcept {
-        return OnBackThread() ? back_db_extent : last_db_extent;
-    }
-    /// sotc: draw thread. The number of ops it has executed, and whether any of the register chunks
-    /// listed changed in value after the op with serial `since` (a chunk the command stream wrote
-    /// with the same value does not count). Always true off the draw thread, so a memo built on it
-    /// then recomputes every time.
-    [[nodiscard]] u32 DrawRegSerial() const noexcept {
-        return back_serial;
-    }
-    /// sotc: BbToggle::DepthFastPath. Draw thread. Three serials, each moving (by one per op) whenever
-    /// an op changed in value a register dword the rasterizer marked relevant to it
-    /// (SetRenderRelevance): RelRender for the depth side of the render target block (depth
-    /// registers, depth extent), RelColor for its colour side (colour target registers and
-    /// extents), RelDynamic for the dynamic state derivation. Ops that changed only other dwords
-    /// (index base, counts, user data...) leave them. Until the masks are set every op moves all.
-    enum RelKind : u32 { RelRender = 0, RelDynamic = 1, RelColor = 2, NumRelKinds };
-    [[nodiscard]] u32 DrawRelSerial(RelKind kind) const noexcept {
-        return back_rel_serial[kind];
-    }
-    /// sotc: the dwords of Regs (bit per dword, RegChunkDwords per entry) one block reads
-    /// (Rasterizer::DepthFastEnsureRelevance). Called on the draw thread, before the first draw
-    /// that uses DrawRelSerial; the masks count as set after the last kind.
-    /// sotc: a dword of which only the bits in `bits` matter to `kind` (leave it out of the mask
-    /// given to SetRenderRelevance for that kind): the serial then moves only when one of those
-    /// bits changed. DB_DEPTH_CONTROL is one for the render target block: of its depth function,
-    /// stencil functions... only the enable bits reach the targets.
-    void SetRelevancePartial(RelKind kind, u32 dword, u32 bits) {
-        if (rel_partial_n[kind] < rel_partial[kind].size()) {
-            rel_partial[kind][rel_partial_n[kind]++] = {dword, bits};
-        }
-    }
-    void SetRenderRelevance(RelKind kind, const u64* mask, size_t chunks) {
-        for (size_t i = 0; i < chunks && i < rel_mask[kind].size(); ++i) {
-            rel_mask[kind][i] = mask[i];
-        }
-        back_rel_ready = kind == RelColor;
-    }
-    [[nodiscard]] bool DrawChunksChangedSince(const u16* chunks, size_t count,
-                                              u32 since) const noexcept {
-        if (!OnBackThread()) {
-            return true;
-        }
-        for (size_t i = 0; i < count; ++i) {
-            if (back_chunk_serial[chunks[i]] > since) {
-                return true;
-            }
-        }
-        return false;
-    }
-    /// Command processor: waits until the draw thread ran everything queued.
-    void DrainBack();
-    /// sotc: frees a finished nested command buffer task's frame once the draw thread has run
-    /// the work queued until now (PR #219 freed it at once: garbage textures, heap corruption).
-    void FreeTaskFrame(std::coroutine_handle<> frame);
-    /// True on the command processor thread while the draw thread does the GPU work.
-    bool RunsGpuWorkElsewhere() const noexcept {
-        return back_threaded && std::this_thread::get_id() == gpu_id;
-    }
-    /// Command processor: runs func on the draw thread after what is queued, and waits for it.
-    void RunOnBackThread(Common::UniqueFunction<void>&& func) {
-        QueueBackFunc(std::move(func), true, 2);
-        DrainBack();
-    }
-
-    /// sotc: SOTC_HASH_STATS=1. Appends to `out` the top 15 (op kind, shader hash) keys of the draw
-    /// thread's time since the last call and a coverage line, then clears the table counters.
-    /// Called by the report thread (videoout/driver.cpp); `seconds` is the window length.
-    void HashStatsReport(std::string& out, double seconds);
-
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
     u32 GetGpuCommandProcessorThreadId() {
         return gpu_tid;
-    }
-    /// sotc: IsGpuSideThread by Linux thread id (the userfaultfd handler thread asks for the
-    /// faulting thread): a draw-thread write fault handled as a guest one would wait for the
-    /// draw thread itself.
-    bool IsGpuSideThreadId(u32 tid) const noexcept {
-        return tid == gpu_tid || (back_threaded && tid == back_tid);
     }
 #endif
 
@@ -402,11 +222,6 @@ private:
                 }
             }
             void return_void() {}
-            /// sotc: SOTC_TASK_GUARD=1 gives every task frame pages of its own that become
-            /// inaccessible when it is freed (and stay so for a while): a later read of a freed
-            /// frame faults where it happens (hunting the garbage textures of PR #219).
-            static void* operator new(std::size_t size);
-            static void operator delete(void* frame, std::size_t size);
             struct empty {};
             std::suspend_always yield_value(empty&&) {
                 return {};
@@ -419,21 +234,12 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, bool nested = false);
-    /// sotc: SOTC_COMPUTE_PREFETCH (default on): before a submission runs, its packets (and its
-    /// indirect buffers) are walked for compute dispatches whose shader was never seen, and those
-    /// are handed to the translation workers. The dispatch then takes the worker's result instead
-    /// of translating on the command processor (new areas: ~150 compute shaders, ~1 ms each).
-    void PrefetchComputeShaders(std::span<const u32> cb, ComputeProgram& cs, int depth);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = NoSeq);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
-    /// Writes an EOP/EOS fence value, keeping GPU caches of that memory coherent.
-    void WriteFenceValue(void* address, u64 data, u32 num_bytes);
-    /// sotc: moves a compute queue read pointer (guest memory) by `dwords` (liverpool.cpp).
-    void AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -444,19 +250,6 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
-        // sotc: lock-free hint for Process()'s round-robin so it can skip m_access entirely for
-        // queues with nothing queued, instead of locking every queue every pass just to find
-        // most of them empty. Set true under the lock on push, re-synced under the lock on pop;
-        // read without the lock as a hint only (a stale false just defers that queue to the next
-        // pass - num_submits keeps the outer loop going - a stale true costs one wasted lock).
-        //
-        // A single shared bitmask + bit-scan (std::countr_zero) to jump straight to the next
-        // queue with work, instead of this per-queue flag, measured *worse* here: it drains each
-        // batch faster, so submit_cv parks and wakes this thread more often for the same work,
-        // and each wake is a costlier kernel round-trip on Windows than the iterations it saves
-        // (own-code share 23.3%->16%, but ntdll wait share 37%->45%, reproduced over 2 runs).
-        // Keep the simpler per-queue hint; see git history for the bitmask version and numbers.
-        std::atomic<bool> has_work{false};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
@@ -464,6 +257,8 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    bool packet_predicated{};
+    std::optional<std::pair<u32, u32>> saved_index_base{};
 
     struct ConstantEngine {
         void Reset() {
@@ -488,191 +283,20 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    /// gow3: false from a submission until its draws and deferred fences are done (stage A
+    /// decrements num_submits once it has decoded a submission, before that). Under
+    /// submit_mutex with num_submits.
+    std::atomic<bool> work_retired{true};
     std::atomic<u32> num_commands{};
-    std::atomic<u32> num_finishes{}; ///< sotc: SOTC_RB_SAFEPOINT finish_queue size
-    std::mutex finish_mutex;
-    std::deque<Common::UniqueFunction<bool, bool>> finish_queue;
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
-    std::queue<Common::UniqueFunction<void>> ordered_queue{}; // sotc: SendOrderedCommand
-    std::queue<u32> ordered_tags{};                           // sotc: their SOTC_SLOW_OPS tags
-    std::atomic<u32> num_ordered{};
     std::thread::id gpu_id;
-#ifdef __linux__
-    u32 gpu_tid;
-    u32 back_tid{}; // sotc: the draw thread's (IsGpuSideThreadId)
+#if defined(__linux__) || defined(_WIN32)
+    u32 gpu_tid{};
 #endif
     s32 curr_qid{-1};
-    /// sotc: BbToggle::CpPollBackoff. Command processor thread only. Set by a packet wait loop
-    /// the first time a resume reaches it (the resume got that far, so it made progress); a resume
-    /// that only re-checks a wait that is still false leaves it clear, and Process then counts the
-    /// pass over the queues as stalled.
-    bool cp_progress{};
-
-    // sotc: the draw thread (see IsBackThreaded).
-    struct BackStage {
-        Shader::Info* info;
-        std::array<u32, 16> user_data; // ShaderParams::NumShaderUserData
-        u32 num_user_data; // ~0u: no user data bound
-        VAddr pgm_base;
-        std::vector<u32> flat;
-    };
-    struct BackOp {
-        enum class Kind : u8 { Func, Draw, DrawIndirect, Dispatch, DispatchIndirect };
-        Kind kind{};
-        bool is_indexed{};
-        u16 vertex_sgpr_offset{};
-        u16 instance_sgpr_offset{};
-        u32 index_offset{};
-        u32 offset{};
-        u32 stride{};
-        u32 max_count{};
-        u32 size{};
-        VAddr address{};
-        VAddr count_address{};
-        const Vulkan::Pipeline* pipeline{};
-        /// per changed chunk: its index, a 64-bit mask of the dwords that differ (two u32), then
-        /// those dwords (BackAlloc / ExecuteBackOp)
-        std::vector<u32> reg_chunks;
-        /// SOTC_DRAW_OPT_VERIFY: the whole content of every dirty chunk, as the command processor
-        /// had it (chunk index, RegChunkDwords dwords), to compare with the draw thread's copy.
-        std::vector<u32> verify_chunks;
-        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
-        CbDbExtent db_extent{};
-        ComputeProgram cs{};
-        std::array<BackStage, 5> stages{};
-        u32 num_stages{};
-        u32 line{}; ///< sotc: SOTC_SLOW_OPS: the source line that queued a Func op (liverpool.cpp/.h)
-        Common::UniqueFunction<void> func;
-    };
-    static constexpr u32 RegChunkDwords = 64;
-    static constexpr u32 NumRegChunks = Regs::NumRegs / RegChunkDwords;
-    // sotc: A/B knobs of the draw thread ring, read once in the constructor. SOTC_BACK_RING is
-    // the ring capacity (power of two, clamped to [512, 8192]), SOTC_BACK_SPIN the CpuRelax
-    // iterations before blocking (clamped to [0, 65536]). The defaults (512, 4096) are the
-    // behaviour from before the knobs; the backing array is sized for the maximum capacity.
-    static constexpr u64 BackRingMin = 512;
-    static constexpr u64 BackRingMax = 8192;
-    static constexpr u32 BackSpinDefault = 4096;
-    static constexpr u32 BackSpinMax = 65536;
-
-    template <typename F>
-    void BackOrRun(F&& func, bool writes_memory = true,
-                   std::source_location loc = std::source_location::current()) {
-        if (!back_threaded) {
-            func();
-            return;
-        }
-        QueueBackFunc(Common::UniqueFunction<void>{std::forward<F>(func)}, writes_memory,
-                      loc.line());
-    }
-    /// line: where it was queued (SOTC_SLOW_OPS); 1 SendCommand, 2 RunOnBackThread, 3 ordered.
-    void QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory, u32 line = 0);
-    void SubmitDraw(bool is_indexed, u32 index_offset);
-    void SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride, u32 max_count,
-                            VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
-    void SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size);
-    BackOp& BackAlloc();
-    void BackPublish(bool writes_memory);
-    void CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline);
-    /// Before reading guest memory the queued work may write (pipeline lookups read the SRTs):
-    /// waits for the last queued op that writes guest memory from the CPU (WRITE_DATA, DMA), or
-    /// with SOTC_CP_STRICT=1 also for GPU writes (dispatches, storage writes, fences). GPU-written
-    /// memory the command processor reads is read-protected once the draw thread recorded the
-    /// writer, and its faults run on the draw thread after that; the SRTs and sharp tables are
-    /// written by the CPU.
-    void WaitBackWrites() {
-        if (back_threaded && back_tail.load(std::memory_order_acquire) < back_write_seq) {
-            WaitBackTail(back_write_seq);
-        }
-    }
-    void WaitBackTail(u64 target);
-    void MarkRegs(u32 first_dword, u32 num_dwords) {
-        if (!back_threaded || num_dwords == 0) {
-            return;
-        }
-        const u32 last = std::min(first_dword + num_dwords - 1, Regs::NumRegs - 1);
-        for (u32 chunk = first_dword / RegChunkDwords; chunk <= last / RegChunkDwords; ++chunk) {
-            const u64 bit = u64{1} << (chunk % 64);
-            if (!(dirty_chunks[chunk / 64] & bit)) {
-                dirty_chunks[chunk / 64] |= bit;
-                dirty_list.push_back(static_cast<u16>(chunk));
-            }
-        }
-    }
-    void MarkRegs(const void* field, size_t bytes) {
-        const auto offset = static_cast<u32>(reinterpret_cast<const u32*>(field) -
-                                             regs.reg_array.data());
-        MarkRegs(offset, static_cast<u32>((bytes + 3) / 4));
-    }
-    void ExecuteBackOp(BackOp& op);
-    /// sotc: ExecuteBackOp with the SOTC_HASH_STATS accounting around it.
-    void ExecuteBackOpTimed(BackOp& op);
-    /// sotc: SOTC_HASH_STATS table, one slot per (op kind, VS/CS hash, PS hash). Written only by
-    /// the draw thread: the key fields before `used` is published (release) and never changed
-    /// afterwards, the counters with relaxed fetch_add. The report thread reads a slot only after
-    /// an acquire load of `used` and takes the counters with exchange(0), so there is no lock and
-    /// no data race (a slot's counters may be read between two of its updates: harmless).
-    struct HashSlot {
-        std::atomic<u32> used{0};
-        u32 kind{};
-        u64 h1{}; ///< VS (draw) or CS (dispatch) pgm_hash
-        u64 h2{}; ///< PS pgm_hash
-        std::atomic<u64> ticks{0}, ops{0}, protects{0}, readbacks{0}, finishes{0}, upload{0};
-    };
-    static constexpr u32 HashSlotBits = 13;
-    static constexpr u32 HashSlots = 1u << HashSlotBits; ///< the extra slot at [HashSlots] is the overflow bucket
-    HashSlot& HashFind(u32 kind, u64 h1, u64 h2);
-    std::unique_ptr<HashSlot[]> hash_slots; ///< HashSlots + 1 entries, allocated only with SOTC_HASH_STATS
-    u32 hash_used{};                        ///< draw thread only: slots in use
-    u64 hash_tsc0{};                        ///< TSC and steady clock (ns) when the table was created,
-    u64 hash_ns0{};                         ///< to calibrate ticks to ns at report time
-    void BackLoop(std::stop_token stoken);
-    void WakeBack() {
-        if (back_threaded) {
-            std::scoped_lock lk{back_mutex};
-            back_cv.notify_one();
-        }
-    }
-
-    bool back_threaded{};
-    bool back_strict{};
-    std::thread::id back_id{};
-    u64 back_ring_capacity{BackRingMin}; ///< sotc: SOTC_BACK_RING (power of two)
-    u64 back_ring_mask{BackRingMin - 1}; ///< sotc: back_ring_capacity - 1, the wrap-around mask
-    u32 back_spin{BackSpinDefault};      ///< sotc: SOTC_BACK_SPIN, iterations before blocking
-    std::vector<BackOp> back_ring;       ///< sotc: sized to the capacity read at startup
-    std::atomic<u64> back_head{0};
-    std::atomic<u64> back_tail{0};
-    /// sotc: finished task frames and the back_head they wait for (FreeTaskFrame)
-    std::vector<std::pair<std::coroutine_handle<>, u64>> finished_frames;
-    std::atomic<bool> back_sleeping{false};
-    std::atomic<bool> drain_waiting{false};
-    std::mutex back_mutex;
-    std::condition_variable back_cv;
-    std::condition_variable drain_cv;
-    u64 back_write_seq{0};
-    Regs back_regs{};
-    std::array<u32, NumRegChunks> back_chunk_serial{}; ///< per chunk: serial of its last change
-    u32 back_serial{};                                  ///< ops executed (draw thread only)
-    std::array<std::array<u64, NumRegChunks>, 3> rel_mask{}; ///< sotc: see SetRenderRelevance
-    std::array<u32, 3> back_rel_serial{};                    ///< sotc: see DrawRelSerial
-    struct RelPartial {
-        u32 dword;
-        u32 bits;
-    };
-    std::array<std::array<RelPartial, 2>, 3> rel_partial{};
-    std::array<u32, 3> rel_partial_n{};
-    bool back_rel_ready{};
-    std::vector<u32> back_shadow; ///< CP side: the registers as the draw thread will hold them (BackAlloc)
-    ComputeProgram back_cs{};
-    std::array<CbDbExtent, NUM_COLOR_BUFFERS> back_cb_extent{};
-    CbDbExtent back_db_extent{};
-    std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
-    std::vector<u16> dirty_list;
-    std::jthread back_thread{};
 };
 
 } // namespace AmdGpu

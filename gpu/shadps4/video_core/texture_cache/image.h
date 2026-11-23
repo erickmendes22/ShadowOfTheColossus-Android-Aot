@@ -10,7 +10,6 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
-#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -35,6 +34,7 @@ enum ImageFlagBits : u32 {
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
+    Aliased = 1 << 8,     ///< gow3: another image has the same guest address (alias_states)
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
@@ -50,17 +50,15 @@ struct UniqueImage {
     UniqueImage(UniqueImage&& other)
         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
-          size_bytes{std::exchange(other.size_bytes, 0)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
     UniqueImage& operator=(UniqueImage&& other) {
-        // sotc: release an image this one still holds (it was overwritten and leaked before).
+        if (this == &other) return *this;
         Destroy();
         device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
-        size_bytes = std::exchange(other.size_bytes, 0);
         return *this;
     }
 
@@ -84,8 +82,6 @@ public:
     vk::ImageCreateInfo image_ci{};
     vk::DeviceSize size_bytes{};
 };
-
-extern u64 g_sotc_fence_epoch; // sotc: bumped at every fence the command processor retires
 
 struct Image {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
@@ -133,31 +129,49 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
-    /// sotc: BbToggle::DepthFastPath. True when GetBarriers with these arguments would add no
-    /// barrier and change no state (full or partial transition alike), so its caller can skip it.
-    [[nodiscard]] bool TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                                     vk::PipelineStageFlags2 dst_stage,
-                                     const std::optional<SubresourceRange>& subres_range) const;
-
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
                      std::optional<SubresourceRange> subres_range = {});
 
 public:
-    Vulkan::Runtime* runtime;
-    Common::SlotVector<ImageView>* slot_image_views;
-    ImageInfo info;
-    vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
-    vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
+    struct BackingImage;
+    // gow3: fields every binding of the image reads, together ahead of the large ImageInfo
+    // (they were spread over several cache lines: one miss each per texture per draw).
     ImageFlagBits flags = ImageFlagBits::Dirty;
+    struct {
+        u32 is_bound : 1;
+        u32 is_target : 1;
+        u32 needs_rebind : 1;
+        u32 force_general : 1;
+    } binding{};
+    struct {
+        u32 texture : 1;
+        u32 storage : 1;
+        u32 render_target : 1;
+        u32 depth_target : 1;
+        u32 vo_surface : 1;
+    } usage{};
+    bool scene_proxy = false; ///< gow3: SceneTargets holds a reduced-size proxy of it
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    VAddr guest_begin = 0; ///< info.guest_address
+    VAddr guest_end = 0;   ///< info.guest_address + info.guest_size
+    BackingImage* backing{};
+    /// gow3: gc tick of the last LRU touch; skips the LRU list (a cache miss) when current.
+    mutable u64 lru_touched_tick = ~0ULL;
+    u64 tick_accessed_last{};
     ImageId depth_id{};
-    /// sotc: the depth/colour twin parked by ResolveDepthOverlap (unregistered, untracked, kept
-    /// for the next conversion back); deleted together with this image.
-    ImageId parked_twin{};
     u64 depth_uid{};
+    u64 image_uid{};
+    /// gow3: order of the last GPU write, to sync images sharing memory (texture_cache.h).
+    u64 alias_generation{};
+
+    ImageInfo info;
+    Vulkan::Runtime* runtime;
+    Common::SlotVector<ImageView>* slot_image_views;
+    vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
+    vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
@@ -172,82 +186,16 @@ public:
         std::vector<State> subresource_states;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
+        u32 last_view = 0; ///< gow3: index of the view FindView returned last
         u32 num_samples;
-        // sotc: index of the view FindView returned last (SOTC_TEX_BIND_P1). The view lists
-        // only grow and their entries never change, so an index stays valid for the backing's
-        // lifetime; ~0u = none yet.
-        u32 last_view = ~0u;
     };
     std::deque<BackingImage> backing_images;
-    BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
-    u64 image_uid{};
-    /// sotc: a new identity for a reused (unparked) image: associations made with the old uid
-    /// (stencil -> depth) no longer match, as with a newly created image.
-    void RenewIdentity() {
-        image_uid = global_image_uid.Next();
-    }
     u64 lru_id{};
-    u64 tick_accessed_last{};
     u64 hash{};
-    /// sotc: a GPU copy wrote this image (Runtime::CopyImage and friends) without marking it
-    /// GpuModified (the source was not): its bytes are not just guest memory, so the cold sweep
-    /// (BbToggle::ColdImageSweep) leaves it alone.
-    bool sotc_gpu_copied{};
-    u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
-    /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
-    u64 sotc_shadow_saving{};
-    /// sotc: F9: the next upload reads guest memory itself, not the buffer cache's GPU copy.
-    bool sotc_upload_from_guest{};
-    /// sotc: the upload budget (RefreshImage): guest data uploaded once / zeros put in meanwhile.
-    bool sotc_has_data{};
-    bool sotc_zero_filled{};
-    /// sotc: the flip of the image's first deferral (~0: never deferred); deferrals stop 2 flips on.
-    u64 sotc_deferred_flip{~0ull};
-    /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
-    u64 sotc_first_hash{};
-    u32 sotc_uploads{};
-    /// sotc: SOTC_POOL_FREEZE: until this tick a CPU-dirty refresh is held back (the game freed
-    /// the pages under the image while still drawing it; T51).
-    u64 sotc_freeze_until{};
-
-    struct {
-        u32 texture : 1;
-        u32 storage : 1;
-        u32 render_target : 1;
-        u32 depth_target : 1;
-        u32 vo_surface : 1;
-    } usage{};
-
-    struct {
-        u32 is_bound : 1;
-        u32 is_target : 1;
-        u32 needs_rebind : 1;
-        u32 force_general : 1;
-    } binding{};
 
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;
 };
-
-/// sotc: moves when an image first gains GPU writes outside a writer FindImage (copy and clear
-/// fast paths): memoized mip-tail decisions are made again (TextureCache::MemoLookup), since
-/// they refuse a tail that a GPU-written image overlaps.
-inline std::atomic<u64> gpu_modified_epoch{0};
-
-/// sotc: counts and reports a GPU write to a mip-tail image (they must never be written).
-void NoteMipTailWrite(const Image& image);
-
-inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
-        if (bump_epoch) {
-            gpu_modified_epoch.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (image.info.sotc_first_mip) {
-            NoteMipTailWrite(image);
-        }
-    }
-    image.flags |= ImageFlagBits::GpuModified;
-}
 
 } // namespace VideoCore

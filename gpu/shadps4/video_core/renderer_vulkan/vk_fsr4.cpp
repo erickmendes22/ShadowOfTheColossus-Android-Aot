@@ -1,287 +1,398 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 
-#include <windows.h>
-
 #include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <deque>
+#include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "../../../../third_party/amd-fsr-sdk/api/include/vk/ffx_api_vk.h"
-#include "../../../../third_party/amd-fsr-sdk/upscalers/include/ffx_upscale.h"
-
+#include "ffx_vk_fsr4_v07.h"
+#include "ffx_vk_fsr4_v07_assets.h"
+#include "gow3_settings.h"
+#include "video_core/renderer_vulkan/fsr411/fsr411.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 
-namespace Vulkan::Fsr4 {
+namespace Vulkan {
 
 namespace {
 
-struct Api {
-    HMODULE dll{};
-    PfnFfxCreateContext create{};
-    PfnFfxDestroyContext destroy{};
-    PfnFfxQuery query{};
-    PfnFfxDispatch dispatch{};
-} api;
-
-VkDeviceContext device_context{};
-bool available = false;
-u64 version_id = 0; ///< SOTC_FSR_VERSION's pick; 0 = the SDK's default (the newest for this GPU)
-std::string name = "FSR";
-std::atomic<const char*> name_ptr{"FSR"};
-
-ffxContext context{};
-u32 ctx_render_w = 0, ctx_render_h = 0, ctx_out_w = 0, ctx_out_h = 0;
-bool ctx_inverted = false;
-bool ctx_failed = false; ///< the last create failed for this size: not retried every frame
-std::chrono::steady_clock::time_point last_dispatch{};
-
-void OnMessage(uint32_t type, const wchar_t* message) {
-    static u32 count = 0;
-    if (count++ < 50) {
-        std::fprintf(stderr, "SOTC FSR: %s: %ls\n",
-                     type == FFX_API_MESSAGE_TYPE_ERROR ? "error" : "warning", message);
-    }
+std::string AssetDir() {
+    const char* dir = std::getenv("GOW3_FSR4_DIR");
+    return dir && dir[0] ? dir : "fsr4_shaders";
 }
 
-/// "AMD FSR 4.1.2 ..." -> "FSR 4.1.2" (the label shown in the overlay).
-std::string ShortName(const char* version_name) {
-    std::string s = version_name ? version_name : "";
-    const size_t digit = s.find_first_of("0123456789");
-    if (digit == std::string::npos) {
-        return s.empty() ? "FSR" : s;
-    }
-    size_t end = digit;
-    while (end < s.size() && (std::isdigit(static_cast<unsigned char>(s[end])) || s[end] == '.')) {
-        ++end;
-    }
-    return "FSR " + s.substr(digit, end - digit);
-}
-
-FfxApiResource Resource(const Image& image, bool depth, bool output) {
-    FfxApiResource r{};
-    r.resource = static_cast<VkImage>(image.image);
-    r.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
-    r.description.format = ffxApiGetSurfaceFormatVK(static_cast<VkFormat>(image.format));
-    r.description.width = image.width;
-    r.description.height = image.height;
-    r.description.depth = 1;
-    r.description.mipCount = 1;
-    r.description.flags = FFX_API_RESOURCE_FLAGS_NONE;
-    r.description.usage = output  ? FFX_API_RESOURCE_USAGE_UAV
-                          : depth ? FFX_API_RESOURCE_USAGE_DEPTHTARGET
-                                  : FFX_API_RESOURCE_USAGE_READ_ONLY;
-    r.state = output ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS
-                     : FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
-    return r;
-}
-
-void DestroyContext() {
-    if (context) {
-        api.destroy(&context, nullptr);
-        context = nullptr;
-    }
-}
-
-bool CreateContext(const Params& p) {
-    ffxCreateContextDescUpscale desc{};
-    desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    // The scene is tonemapped (0..1, as DLSS gets it): no HDR, no auto exposure.
-    desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
-    if (p.depth_inverted) {
-        desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    }
-    if (const char* v = std::getenv("SOTC_FSR_DEBUG"); v && v[0] == '1') {
-        desc.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING;
-    }
-    desc.maxRenderSize = {p.render_width, p.render_height};
-    desc.maxUpscaleSize = {p.out_width, p.out_height};
-    desc.fpMessage = OnMessage;
-
-    ffxCreateContextDescUpscaleVersion version{};
-    version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
-    version.version = FFX_UPSCALER_VERSION;
-    ffxCreateBackendVKDesc backend{};
-    backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-    backend.deviceContext = device_context;
-    ffxOverrideVersion override_version{};
-    override_version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
-    override_version.versionId = version_id;
-    desc.header.pNext = &version.header;
-    version.header.pNext = &backend.header;
-    if (version_id) {
-        backend.header.pNext = &override_version.header;
-    }
-    const ffxReturnCode_t r = api.create(&context, &desc.header, nullptr);
-    if (r != FFX_API_RETURN_OK) {
-        context = nullptr;
-        std::fprintf(stderr, "SOTC FSR: context %ux%u -> %ux%u failed (%u)\n", p.render_width,
-                     p.render_height, p.out_width, p.out_height, r);
+bool ReadFile(const std::string& path, std::vector<u8>& data) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
         return false;
     }
-    ffxQueryGetProviderVersion provider{};
-    provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    if (api.query(&context, &provider.header) == FFX_API_RETURN_OK && provider.versionName) {
-        name = ShortName(provider.versionName);
-        name_ptr.store(name.c_str(), std::memory_order_relaxed);
+    data.resize(size_t(file.tellg()));
+    file.seekg(0);
+    return bool(file.read(reinterpret_cast<char*>(data.data()), std::streamsize(data.size())));
+}
+
+FfxFsr4ModelPreset ModelPreset(int preset) {
+    switch (preset) {
+    case 0:
+        return FFX_FSR4_MODEL_PRESET_NATIVE_AA;
+    case 1:
+        return FFX_FSR4_MODEL_PRESET_QUALITY;
+    case 2:
+        return FFX_FSR4_MODEL_PRESET_BALANCED;
+    case 3:
+        return FFX_FSR4_MODEL_PRESET_PERFORMANCE;
+    default:
+        return FFX_FSR4_MODEL_PRESET_ULTRA_PERFORMANCE;
     }
-    std::fprintf(stderr, "SOTC FSR: %s upscaling %ux%u -> %ux%u (depth %s)\n", name.c_str(),
-                 p.render_width, p.render_height, p.out_width, p.out_height,
-                 p.depth_inverted ? "inverted" : "normal");
-    return true;
 }
 
 } // namespace
 
-bool Init(const Instance& instance) {
-    wchar_t path[MAX_PATH];
-    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-    std::wstring dir(path, n);
-    const size_t slash = dir.find_last_of(L"\\/");
-    dir = slash == std::wstring::npos ? std::wstring(L".") : dir.substr(0, slash);
-    const std::wstring loader = dir + L"\\amd_fidelityfx_loader_vk.dll";
-    api.dll = LoadLibraryExW(loader.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!api.dll) {
-        std::fprintf(stderr, "SOTC FSR: amd_fidelityfx_loader_vk.dll not found next to "
-                             "bb-probe.exe (error %lu), FSR 1 instead\n",
-                     GetLastError());
-        return false;
-    }
-    api.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(api.dll, "ffxCreateContext"));
-    api.destroy =
-        reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(api.dll, "ffxDestroyContext"));
-    api.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(api.dll, "ffxQuery"));
-    api.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(api.dll, "ffxDispatch"));
-    if (!api.create || !api.destroy || !api.query || !api.dispatch) {
-        std::fprintf(stderr, "SOTC FSR: amd_fidelityfx_loader_vk.dll has no FSR API\n");
-        return false;
-    }
-    device_context.vkDevice = static_cast<VkDevice>(instance.GetDevice());
-    device_context.vkPhysicalDevice = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice());
-    device_context.vkDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+struct Fsr4Upscaler::Impl {
+    const Instance& instance;
+    Scheduler& scheduler;
+    std::vector<u8> scratch;
+    FfxInterface backend{};
+    bool backend_ok = false;
+    ffxContext context{};
+    bool context_ok = false;
+    int model = -1;
+    u32 out_width = 0, out_height = 0;
+    std::string problem;
+    bool fatal = false;
+    u64 next_frame_id = 1;
+    std::deque<std::pair<u64, u64>> in_flight; ///< provider frame id, scheduler tick
+    // gow3: FSR 4.1.1 (upscaler=fsr411): the replay of AMD's 4.1.1 DLL (fsr411/).
+    std::unique_ptr<Fsr411::Upscaler> fsr411;
+    std::deque<u64> fsr411_ticks; ///< scheduler ticks of its recent frames (constant ring)
+    std::string fsr411_described;
 
-    // The versions this GPU runs, newest first; SOTC_FSR_VERSION=3 (or 4, 3.1.5...) picks the
-    // first whose name has it (comparisons on an RDNA card).
-    ffxQueryDescGetVersions versions{};
-    versions.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-    versions.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    versions.device = &device_context;
-    u64 count = 0;
-    versions.outputCount = &count;
-    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK || count == 0) {
-        std::fprintf(stderr, "SOTC FSR: no FSR upscaler for this GPU, FSR 1 instead\n");
-        return false;
+    Impl(const Instance& instance_, Scheduler& scheduler_)
+        : instance{instance_}, scheduler{scheduler_} {}
+
+    ~Impl() {
+        Destroy();
     }
-    std::vector<u64> ids(count);
-    std::vector<const char*> names(count);
-    versions.versionIds = ids.data();
-    versions.versionNames = names.data();
-    if (api.query(nullptr, &versions.header) != FFX_API_RETURN_OK) {
-        return false;
-    }
-    const char* wanted = std::getenv("SOTC_FSR_VERSION");
-    std::string list;
-    for (u64 i = 0; i < count; ++i) {
-        const char* version_name = names[i] ? names[i] : "?";
-        list += (i ? ", " : "") + std::string(version_name);
-        if (wanted && *wanted && !version_id && std::strstr(version_name, wanted)) {
-            version_id = ids[i];
-            name = ShortName(version_name);
+
+    /// `recording`: called while a frame's command buffer is being recorded; it is left open
+    /// (Finish() would submit it under the caller).
+    void Destroy(bool recording = false) {
+        if (!backend_ok && !context_ok) {
+            return;
         }
+        if (recording) {
+            scheduler.WaitSubmitted();
+        } else {
+            scheduler.Finish();
+        }
+        if (context_ok) {
+            ffxFsr4V07DestroyContext(&context, nullptr);
+            context_ok = false;
+        }
+        if (backend_ok) {
+            ffxFsr4VkDestroyContext(reinterpret_cast<FfxFsr4VkContext*>(scratch.data()));
+            backend_ok = false;
+        }
+        backend = {};
+        in_flight.clear();
+        model = -1;
     }
-    if (!version_id) {
-        name = ShortName(names[0]);
+
+    void Fail(std::string reason, bool permanent) {
+        if (problem != reason) {
+            std::printf("Upscaler: FSR 4 unavailable: %s\n", reason.c_str());
+        }
+        problem = std::move(reason);
+        fatal |= permanent;
     }
-    name_ptr.store(name.c_str(), std::memory_order_relaxed);
-    std::fprintf(stderr, "SOTC FSR: AMD FSR SDK loaded, versions for this GPU: %s; using %s\n",
-                 list.c_str(), name.c_str());
-    available = true;
-    return true;
-}
 
-bool Available() {
-    return available;
-}
-
-const char* Name() {
-    return name_ptr.load(std::memory_order_relaxed);
-}
-
-bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
-    if (!available) {
-        return false;
-    }
-    const bool same = context && ctx_render_w == p.render_width &&
-                      ctx_render_h == p.render_height && ctx_out_w == p.out_width &&
-                      ctx_out_h == p.out_height && ctx_inverted == p.depth_inverted;
-    if (!same) {
-        const bool size_changed = ctx_render_w != p.render_width ||
-                                  ctx_render_h != p.render_height || ctx_out_w != p.out_width ||
-                                  ctx_out_h != p.out_height || ctx_inverted != p.depth_inverted;
-        if (ctx_failed && !size_changed) {
+    bool CreateBackend(int preset, u32 ow, u32 oh) {
+        FfxFsr4V07AssetSet assets{};
+        if (!ffxFsr4V07BuildAssetSet(ModelPreset(preset), ow, oh, &assets)) {
+            Fail("output size is not supported by the v07 model", true);
             return false;
         }
-        if (context) {
-            // The old context may still be in use by submitted frames (a rare event: a size or
-            // depth layout change).
-            static_cast<void>(VULKAN_HPP_DEFAULT_DISPATCHER.vkDeviceWaitIdle(device_context.vkDevice));
-            DestroyContext();
+        const std::string dir = AssetDir() + "/";
+        std::array<std::vector<u8>, FFX_FSR4_VK_PASS_COUNT> code;
+        std::vector<u8> initializer, weights;
+        // gow3: tools/fsr4_optimize.sh puts fixed or faster passes into opt/ (post through
+        // shared memory, pass 11 without out-of-bounds writes); GOW3_FSR4_OPT=0 keeps the originals.
+        const char* opt_env = std::getenv("GOW3_FSR4_OPT");
+        const bool use_opt = !(opt_env && opt_env[0] == '0');
+        u32 optimized = 0;
+        const auto load = [&](const char* name, std::vector<u8>& data) {
+            if (use_opt && ReadFile(dir + "opt/" + name, data)) {
+                ++optimized;
+                return true;
+            }
+            if (ReadFile(dir + name, data)) {
+                return true;
+            }
+            Fail("missing " + dir + name + " (run tools/fetch_fsr4_assets.sh)", true);
+            return false;
+        };
+        if (!load(assets.pre, code[0])) return false;
+        for (u32 pass = 0; pass < FFX_FSR4_MODEL_PASS_COUNT; ++pass) {
+            if (!load(assets.model[pass], code[1 + pass])) return false;
         }
-        ctx_render_w = p.render_width;
-        ctx_render_h = p.render_height;
-        ctx_out_w = p.out_width;
-        ctx_out_h = p.out_height;
-        ctx_inverted = p.depth_inverted;
-        ctx_failed = !CreateContext(p);
-        if (ctx_failed) {
+        if (!load(assets.post, code[13]) || !load(assets.rcas, code[14]) ||
+            !load(assets.spdAutoExposure, code[15]) || !load(assets.initializer, initializer) ||
+            !load(assets.prePassWeights, weights)) {
             return false;
         }
-    }
-    const auto now = std::chrono::steady_clock::now();
-    float frame_ms = 16.7f;
-    if (last_dispatch.time_since_epoch().count() != 0) {
-        frame_ms = std::clamp(
-            std::chrono::duration<float, std::milli>(now - last_dispatch).count(), 1.0f, 100.0f);
-    }
-    last_dispatch = now;
-
-    ffxDispatchDescUpscale d{};
-    d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-    d.commandList = cmdbuf;
-    d.color = Resource(p.color, false, false);
-    d.depth = Resource(p.depth, true, false);
-    d.motionVectors = Resource(p.mvec, false, false);
-    d.output = Resource(p.output, false, true);
-    d.jitterOffset = {p.jitter_x, p.jitter_y};
-    d.motionVectorScale = {p.mvec_scale_x, p.mvec_scale_y};
-    d.renderSize = {p.render_width, p.render_height};
-    d.upscaleSize = {p.out_width, p.out_height};
-    d.enableSharpening = false; // the presenter's RCAS sharpens (SOTC_DLSS_SHARPEN)
-    d.sharpness = 0.0f;
-    d.frameTimeDelta = frame_ms;
-    d.preExposure = 1.0f;
-    d.reset = p.reset;
-    d.cameraNear = p.z_near;
-    d.cameraFar = std::min(p.z_far, 1.0e6f);
-    d.cameraFovAngleVertical = p.fov_y;
-    d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
-    const ffxReturnCode_t r = api.dispatch(&context, &d.header);
-    if (r != FFX_API_RETURN_OK) {
-        static u32 errors = 0;
-        if (errors++ < 5) {
-            std::fprintf(stderr, "SOTC FSR: dispatch failed (%u)\n", r);
+        if (initializer.size() != FFX_FSR4_V07_INITIALIZER_BYTES ||
+            weights.size() != FFX_FSR4_V07_PRE_PASS_WEIGHTS_BYTES) {
+            Fail("model weights have an unexpected size", true);
+            return false;
         }
-        return false;
+        if (optimized) {
+            std::printf("Upscaler: FSR 4, %u passes from %sopt/\n", optimized, dir.c_str());
+        }
+        static const std::array<std::string, FFX_FSR4_VK_PASS_COUNT> entries = [] {
+            std::array<std::string, FFX_FSR4_VK_PASS_COUNT> names;
+            names.fill("main");
+            for (u32 pass = 1; pass <= FFX_FSR4_MODEL_PASS_COUNT; ++pass) {
+                names[pass] = "fsr4_model_v07_i8_pass" + std::to_string(pass);
+            }
+            return names;
+        }();
+        FfxFsr4VkCreateInfo ci{};
+        ci.device = instance.GetDevice();
+        ci.physicalDevice = instance.GetPhysicalDevice();
+        for (u32 i = 0; i < FFX_FSR4_VK_PASS_COUNT; ++i) {
+            if (code[i].size() % 4) {
+                Fail("invalid SPIR-V asset", true);
+                return false;
+            }
+            ci.shaders[i] = {reinterpret_cast<const uint32_t*>(code[i].data()), code[i].size(),
+                             entries[i].c_str()};
+        }
+        ci.modelInitializer = initializer.data();
+        ci.modelInitializerSize = initializer.size();
+        ci.prePassWeights = weights.data();
+        ci.prePassWeightsSize = weights.size();
+        scratch.assign(ffxFsr4VkGetScratchMemorySize(), 0);
+        ci.scratchBuffer = scratch.data();
+        ci.scratchBufferSize = scratch.size();
+        if (const VkResult result = ffxFsr4VkCreateContext(&ci, &backend);
+            result != VK_SUCCESS) {
+            Fail("Vulkan backend creation failed (" + std::to_string(int(result)) + ")", true);
+            backend = {};
+            return false;
+        }
+        backend_ok = true;
+
+        ffxCreateContextDescUpscale desc{};
+        desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+        desc.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE | FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+        // Any preset's render size fits: the context is not recreated for a size change.
+        desc.maxRenderSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+        desc.maxUpscaleSize = {(ow + 7) & ~7u, (oh + 7) & ~7u};
+        ffxFsr4V07SetBackendInterface(&backend);
+        const auto created = ffxFsr4V07CreateContext(&context, &desc.header, nullptr);
+        ffxFsr4V07SetBackendInterface(nullptr);
+        if (created != FFX_API_RETURN_OK) {
+            Fail("provider context creation failed (" + std::to_string(created) + ")", true);
+            return false;
+        }
+        context_ok = true;
+        model = preset;
+        out_width = ow;
+        out_height = oh;
+        std::printf("Upscaler: FSR 4 v07 INT8 %s model, %s tier, output %ux%u\n",
+                    ffxFsr4ModelPresetName(ModelPreset(preset)), assets.tier, ow, oh);
+        return true;
     }
-    return true;
+
+    void Retire() {
+        while (!in_flight.empty() && scheduler.IsFree(in_flight.front().second)) {
+            ffxFsr4VkRetireFrame(&backend, in_flight.front().first);
+            in_flight.pop_front();
+        }
+    }
+
+    VkResult Register(const Image& image, VkAccessFlags access) {
+        const FfxFsr4VkExternalImageState state{
+            .structSize = sizeof(FfxFsr4VkExternalImageState),
+            .image = image.image,
+            .view = image.view,
+            .layout = VK_IMAGE_LAYOUT_GENERAL,
+            .stageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            .accessMask = access,
+            .restoreLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .restoreStageMask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            .restoreAccessMask = access,
+        };
+        return ffxFsr4VkSetExternalImageState(&backend, &state);
+    }
+
+    bool Record411(const Frame& f) {
+        if (!instance.IsFsr411Supported()) {
+            Fail("FSR 4.1.1 needs INT8 dot products and VK_VALVE_shader_mixed_float_dot_product", true);
+            return false;
+        }
+        if (!fsr411) {
+            const char* env = std::getenv("GOW3_FSR411_DIR");
+            fsr411 = std::make_unique<Fsr411::Upscaler>(instance.GetPhysicalDevice(), instance.GetDevice(),
+                                                        env && env[0] ? env : "fsr4_411");
+        }
+        // Its constant ring holds kFramesInFlight frames: the oldest must be done.
+        while (fsr411_ticks.size() >= Fsr411::kFramesInFlight) {
+            scheduler.Wait(fsr411_ticks.front());
+            fsr411_ticks.pop_front();
+        }
+        Fsr411::Frame g;
+        g.cmdbuf = f.cmdbuf;
+        g.color = {f.color.image, f.color.view, f.color.width, f.color.height};
+        g.depth = {f.depth.image, f.depth.view, f.depth.width, f.depth.height};
+        g.motion = {f.motion.image, f.motion.view, f.motion.width, f.motion.height};
+        g.output = {f.output.image, f.output.view, f.output.width, f.output.height};
+        g.render_width = f.render_width;
+        g.render_height = f.render_height;
+        g.ultra_performance = f.preset >= 4;
+        g.jitter[0] = f.jitter[0];
+        g.jitter[1] = f.jitter[1];
+        g.sharpness = f.sharpness;
+        g.sharpen = f.sharpen && f.sharpness > 0.0f;
+        g.reset = f.reset;
+        g.auto_exposure = f.auto_exposure;
+        if (!fsr411->Record(g)) {
+            // Missing assets are permanent for this session; the menu shows the reason.
+            Fail("FSR 4.1.1: " + fsr411->Error(), fsr411->Error().starts_with("missing"));
+            return false;
+        }
+        fsr411_ticks.push_back(scheduler.CurrentTick());
+        if (const std::string d = fsr411->Describe(); d != fsr411_described) {
+            fsr411_described = d;
+            std::printf("Upscaler: FSR 4.1.1 replay, %s\n", d.c_str());
+        }
+        problem.clear();
+        return true;
+    }
+
+    bool Record(const Frame& f) {
+        if (Gow3Settings::Get().upscaler == Gow3Settings::UpscalerFsr411) {
+            return Record411(f);
+        }
+        if (fatal) {
+            return false;
+        }
+        if (!instance.IsFsr4Int8Supported()) {
+            Fail("the GPU lacks INT8 dot product / compute derivative support", true);
+            return false;
+        }
+        const int preset = std::clamp(f.preset, 0, 4);
+        if (!context_ok || preset != model || f.output.width != out_width ||
+            f.output.height != out_height) {
+            Destroy(true);
+            if (!CreateBackend(preset, f.output.width, f.output.height)) {
+                Destroy(true);
+                return false;
+            }
+        }
+        Retire();
+        const u64 frame_id = next_frame_id++;
+        VkResult begin = ffxFsr4VkBeginFrame(&backend, frame_id);
+        while (begin == VK_NOT_READY && !in_flight.empty()) {
+            scheduler.Wait(in_flight.front().second);
+            Retire();
+            begin = ffxFsr4VkBeginFrame(&backend, frame_id);
+        }
+        if (begin != VK_SUCCESS) {
+            Fail("no free provider frame (" + std::to_string(int(begin)) + ")", false);
+            return false;
+        }
+        // gow3: a frame begun here must reach RetireFrame even when it records nothing,
+        // or every later BeginFrame fails (VK_ERROR_VALIDATION_FAILED_EXT).
+        const auto abandon = [&] { in_flight.emplace_back(frame_id, scheduler.CurrentTick()); };
+        constexpr VkAccessFlags read = VK_ACCESS_SHADER_READ_BIT;
+        const std::array<std::pair<const Image*, VkAccessFlags>, 4> images{{
+            {&f.color, read},
+            {&f.depth, read},
+            {&f.motion, read},
+            {&f.output, read | VK_ACCESS_SHADER_WRITE_BIT},
+        }};
+        static constexpr const char* names[] = {"color", "depth", "motion", "output"};
+        for (u32 i = 0; i < images.size(); ++i) {
+            if (const VkResult result = Register(*images[i].first, images[i].second);
+                result != VK_SUCCESS) {
+                Fail(std::string{"external image registration failed ("} + names[i] + ", " +
+                         std::to_string(int(result)) + ")",
+                     false);
+                abandon();
+                return false;
+            }
+        }
+        const auto resource = [](const Image& image, u32 format, u32 state) {
+            FfxApiResource r{};
+            r.resource = reinterpret_cast<void*>(VkImageView(image.view));
+            r.description.type = FFX_RESOURCE_TYPE_TEXTURE2D;
+            r.description.format = format;
+            r.description.width = image.width;
+            r.description.height = image.height;
+            r.description.depth = 1;
+            r.description.mipCount = 1;
+            r.state = state;
+            return r;
+        };
+        ffxDispatchDescUpscale d{};
+        d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
+        d.commandList = reinterpret_cast<void*>(VkCommandBuffer(f.cmdbuf));
+        d.color = resource(f.color, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                           FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.depth = resource(f.depth, FFX_SURFACE_FORMAT_R32_FLOAT,
+                           FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.motionVectors = resource(f.motion, FFX_SURFACE_FORMAT_R16G16_FLOAT,
+                                   FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        d.output = resource(f.output, FFX_SURFACE_FORMAT_R16G16B16A16_FLOAT,
+                            FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+        d.jitterOffset = {f.jitter[0], f.jitter[1]};
+        // Vectors are in render pixels; the provider divides by the render size.
+        d.motionVectorScale = {1.0f, 1.0f};
+        d.renderSize = {f.render_width, f.render_height};
+        d.upscaleSize = {f.output.width, f.output.height};
+        d.enableSharpening = f.sharpen && f.sharpness > 0.0f;
+        d.sharpness = f.sharpness;
+        d.enableAutoExposure = f.auto_exposure;
+        d.frameTimeDelta = f.frame_ms;
+        d.preExposure = 1.0f;
+        d.reset = f.reset;
+        d.cameraNear = f.near_plane;
+        d.cameraFar = f.far_plane;
+        d.cameraFovAngleVertical = f.vertical_fov;
+        d.viewSpaceToMetersFactor = 1.0f;
+        if (const auto result = ffxFsr4V07Dispatch(&context, &d.header);
+            result != FFX_API_RETURN_OK) {
+            Fail("dispatch failed (" + std::to_string(result) + ")", false);
+            abandon();
+            return false;
+        }
+        in_flight.emplace_back(frame_id, scheduler.CurrentTick());
+        problem.clear();
+        return true;
+    }
+};
+
+Fsr4Upscaler::Fsr4Upscaler(const Instance& instance, Scheduler& scheduler)
+    : impl{std::make_unique<Impl>(instance, scheduler)} {}
+
+Fsr4Upscaler::~Fsr4Upscaler() = default;
+
+bool Fsr4Upscaler::Record(const Frame& frame) {
+    return impl->Record(frame);
 }
 
-} // namespace Vulkan::Fsr4
+const char* Fsr4Upscaler::Problem() const noexcept {
+    return impl->problem.empty() ? nullptr : impl->problem.c_str();
+}
+
+bool Fsr4Upscaler::Fatal() const noexcept {
+    return impl->fatal;
+}
+
+} // namespace Vulkan

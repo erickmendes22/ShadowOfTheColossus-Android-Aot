@@ -3,12 +3,11 @@
 
 #pragma once
 
-#include <condition_variable>
-#include <cstdlib>
+#include <deque>
 
-#include "core/emulator_settings.h"
+#include <condition_variable>
+
 #include "core/libraries/videoout/buffer.h"
-#include <imgui.h> // sotc port: ImTextureID only
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,10 +37,7 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
-    /// sotc: this frame without the HUD (Rasterizer::TakeHudless) for frame generation, or null.
-    Frame* hudless{};
 
-    ImTextureID imgui_texture;
 };
 
 enum SchedulerType {
@@ -81,14 +77,6 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
-        if (const char* white = std::getenv("SOTC_HDR_WHITE"); white && std::atof(white) > 0) {
-            pp_settings.hdr_white = static_cast<float>(std::atof(white));
-        }
-        if (EmulatorSettings.IsSdrToHdr()) {
-            // sotc: the swapchain stays HDR10; an SDR game frame (hdr 2) is expanded by the pp pass.
-            pp_settings.hdr = enable ? 1 : 2;
-            return;
-        }
         swapchain.SetHDR(enable);
         pp_settings.hdr = enable ? 1 : 0;
     }
@@ -111,16 +99,14 @@ public:
     Frame* PrepareBlankFrame(bool present_thread);
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
+    /// gow3: a black frame with the loading screen (Gow3Overlay::SetLoading) only.
+    void PresentLoadingFrame();
     Frame* PrepareLastFrame();
 
 private:
     Frame* GetRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
-
-    /// sotc: FSR 3 frame generation: presents the frame between the last game frame and
-    /// `frame`. False when there is none.
-    bool PresentGenerated(Frame* frame);
 
     void SetExpectedGameSize(s32 width, s32 height);
 
@@ -132,14 +118,12 @@ private:
     Frontend::WindowSDL& window;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
-    /// sotc: the same FSR 1 for the frame without the HUD (frame generation), with its own images:
-    /// fsr_pass's ring holds the game frame's.
-    HostPasses::FsrPass fsr_pass_hudless;
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
+    std::deque<u64> recent_frame_ticks; ///< gow3: GOW3_FRAMES_AHEAD bound (PrepareFrame)
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
     Swapchain swapchain;
@@ -148,7 +132,6 @@ private:
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
-    std::vector<Frame> hudless_frames; ///< sotc: Frame::hudless, one per present frame
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;

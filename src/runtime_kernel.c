@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "guest_cpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
-#include <x86intrin.h>
 #ifndef _WIN32
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -85,41 +85,15 @@ static ABI uint64_t process_time_counter(void) {
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
 }
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
-/* The guest TSC is the host TSC unless the cores disagree on it (probe.c checks at startup);
- * then it is QPC, and the eboot's own rdtsc instructions are patched to read QPC too. */
-static int tsc_from_qpc;
-void runtime_tsc_use_qpc(void) { tsc_from_qpc=1; }
-static uint64_t host_tsc(void) {
-#ifdef _WIN32
-    if (tsc_from_qpc) return compat_qpc_tsc();
-#endif
-    return __rdtsc();
-}
-static ABI uint64_t read_tsc(void) { return host_tsc(); }
-static uint64_t tsc_hz;
-static ABI uint64_t tsc_frequency(void) {
-#ifdef _WIN32
-    if (tsc_from_qpc) return compat_qpc_tsc_frequency();
-#endif
-    if (!tsc_hz) {
-        struct timespec a,b,nap={0,20000000};
-        clock_gettime(CLOCK_MONOTONIC,&a); uint64_t t0=__rdtsc();
-#ifdef _WIN32
-        (void)nap; compat_sleep_ns(20000000);
-#else
-        nanosleep(&nap,NULL);
-#endif
-        clock_gettime(CLOCK_MONOTONIC,&b); uint64_t t1=__rdtsc();
-        uint64_t ns=(uint64_t)(b.tv_sec-a.tv_sec)*1000000000+(uint64_t)(b.tv_nsec-a.tv_nsec);
-        tsc_hz=(t1-t0)*1000000000/(ns ? ns : 1);
-    }
-    return tsc_hz;
-}
+/* RDTSC goes through the boundary: the host's counter on x86-64 hosts, the guest CPU's own on the
+ * JIT (the game reads it for timing, so it must be the guest's view). */
+static ABI uint64_t read_tsc(void) { return guest_cpu_tsc(); }
+static ABI uint64_t tsc_frequency(void) { return guest_cpu_tsc_frequency(); }
 /* Shared with the GPU library so flip/label timestamps use the guest's clock. */
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
-uint64_t runtime_read_tsc(void) { return host_tsc(); }
+uint64_t runtime_read_tsc(void) { return read_tsc(); }
 static int sleep_ns(uint64_t ns) {
 #ifdef _WIN32
     compat_sleep_ns(ns);
@@ -178,6 +152,33 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
 }
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
+    runtime_report();
+    exit(23);
+}
+/* The process was started without arguments other than its own name. */
+static const char *guest_argv[]={"eboot.bin",NULL};
+static ABI int32_t get_argc(void) { return 1; }
+static ABI const char **get_argv(void) { return guest_argv; }
+/* Only the game and its bundled modules exist; nothing was loaded at run time. */
+static ABI int32_t stop_unload_module(int32_t handle,uint64_t args,const void *argp,uint32_t flags,const void *opt,int32_t *result) {
+    (void)args; (void)argp; (void)flags; (void)opt; (void)result;
+    printf("Runtime: sceKernelStopUnloadModule(%d): no such module\n",handle);
+    return ERR(3); /* ESRCH */
+}
+static ABI int32_t module_info_from_addr(uint64_t address,int32_t flags,void *info) {
+    (void)address;
+    if (flags>=3) return ERR(22);
+    if (!info) return ERR(14);
+    return ERR(3); /* ESRCH: the runtime keeps no module records */
+}
+static ABI int32_t kernel_mlock(const void *address,uint64_t size) { (void)address; (void)size; return 0; }
+/* libc's C++ exception unwinder. The game does not throw (no __cxa_throw import): unwinding
+ * finds no frame data, and resuming a context is a stop, never a silent success. */
+static ABI int32_t elf_phdr_match_addr(void *info,uint64_t address) { (void)info; (void)address; return 0; }
+static ABI int32_t is_signal_return(uint64_t pc) { (void)pc; return 0; }
+static ABI void pthread_cxa_finalize(void *dso) { (void)dso; }
+static ABI __attribute__((noreturn)) void unwind_resume(void) {
+    fputs("STOP: guest C++ exception unwinding (sigreturn/__Ux86_64_setcontext) is not supported\n",stderr);
     runtime_report();
     exit(23);
 }
@@ -255,7 +256,7 @@ static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
         int32_t state=__atomic_load_n(once,__ATOMIC_ACQUIRE);
         if (state==1) return 0;
         if (state==0 && __atomic_compare_exchange_n(once,&state,2,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
-            routine();
+            guest_cpu_call((uintptr_t)routine,0,NULL);
             __atomic_store_n(once,1,__ATOMIC_RELEASE);
             return 0;
         }
@@ -299,7 +300,8 @@ void runtime_thread_keys_cleanup(void) {
             void *value=key_values[i];
             if (!value || !keys[i].used || !keys[i].destructor) continue;
             key_values[i]=NULL; any=1;
-            keys[i].destructor(value);
+            guest_cpu_call((uintptr_t)keys[i].destructor,1,
+                           (const uint64_t[]){ (uint64_t)(uintptr_t)value });
         }
         if (!any) break;
     }
@@ -324,6 +326,11 @@ static const RuntimeExport exports[]={
     {"sceKernelDebugRaiseException",raise_exception},
     {"sceKernelDebugRaiseExceptionOnReleaseMode",raise_exception},
     {"sceKernelPrintBacktraceWithModuleInfo",print_backtrace},
+    {"getargc",get_argc}, {"getargv",get_argv}, {"sceKernelStopUnloadModule",stop_unload_module},
+    {"sceKernelGetModuleInfoFromAddr",module_info_from_addr}, {"sceKernelMlock",kernel_mlock},
+    {"__elf_phdr_match_addr",elf_phdr_match_addr}, {"_is_signal_return",is_signal_return},
+    {"__pthread_cxa_finalize",pthread_cxa_finalize}, {"sigreturn",unwind_resume},
+    {"__Ux86_64_setcontext",unwind_resume},
     {"signal",guest_signal}, {"sigprocmask",guest_sigprocmask}, {"_sigprocmask",guest_sigprocmask},
     {"sigfillset",guest_sigfillset}, {"sigemptyset",guest_sigemptyset},
     {"getrusage",guest_getrusage}, {"sysctl",guest_sysctl},

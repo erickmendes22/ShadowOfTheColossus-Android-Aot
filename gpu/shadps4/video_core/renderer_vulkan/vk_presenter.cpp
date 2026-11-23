@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdio>
-#include <cstdlib>
-#include <utility>
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -11,51 +8,45 @@
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
-#include "core/libraries/system/systemservice.h"
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
-#include "video_core/renderer_vulkan/vk_dlssg.h"
-#include "video_core/renderer_vulkan/vk_framegen.h"
-#include "video_core/renderer_vulkan/vk_fsrfg.h"
-#include "video_core/sotc_fps_cap.h"
-#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_ahb_acquire_wait.h"
+#include "gow3_overlay.h"
+#include "gow3_settings.h"
+#include "gow3_graphics.h"
+#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_warmup_inbox.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
-#include "video_core/sotc_live.h"
 #include "video_core/texture_cache/image.h"
-#include "bbport_overlay.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <thread>
 #include <cctype>
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
 #include <cstring>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <span>
 #include <sstream>
 #include <system_error>
 #include <vector>
-#include <imgui.h>
-#include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#ifdef MemoryBarrier
+#undef MemoryBarrier // gow3: winnt.h macro (through fmt), clashes with vk::MemoryBarrier
+#endif
 
 namespace Vulkan {
-
-// sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
-// shared queue the sites take Scheduler::submit_mutex as well.
-static std::mutex present_queue_mutex;
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -138,444 +129,75 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
                          dst_rect.offset.x, dst_rect.offset.y);
 }
 
-enum class ScreenshotKind : u8 {
-    GameOnly,
-    WithOverlays,
-};
-
-struct ScreenshotReadback {
-    ScreenshotKind kind{};
-    std::vector<std::filesystem::path> paths{};
-    VideoCore::Buffer buffer;
-    u32 width{};
-    u32 height{};
-    vk::Format format{};
-    bool hdr_encoded{};
-
-    ScreenshotReadback(const Instance& instance, ScreenshotKind kind_,
-                       std::vector<std::filesystem::path> paths_, const u32 width_,
-                       const u32 height_, const vk::Format format_, const bool hdr_encoded_)
-        : kind{kind_}, paths{std::move(paths_)},
-          buffer{instance, 0, static_cast<u64>(width_) * static_cast<u64>(height_) * 4,
-                 VideoCore::MemoryType::HostCached},
-          width{width_}, height{height_}, format{format_}, hdr_encoded{hdr_encoded_} {}
-};
-
-static std::string SanitizeFilenameComponent(std::string value) {
-    for (char& c : value) {
-        const unsigned char uc = static_cast<unsigned char>(c);
-        if (!std::isalnum(uc) && c != '_' && c != '-') {
-            c = '_';
-        }
-    }
-    if (value.empty()) {
-        return "UNKNOWN";
-    }
-    return value;
-}
-
-static std::vector<std::filesystem::path> BuildScreenshotPaths(const ScreenshotKind kind,
-                                                               const u32 count) {
-    static std::atomic<u64> screenshot_sequence{0};
-    std::vector<std::filesystem::path> paths{};
-    if (count == 0) {
-        return paths;
-    }
-
-    const auto& screenshots_dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir);
-    std::filesystem::create_directories(screenshots_dir);
-
-    const auto game_id =
-        SanitizeFilenameComponent(std::string(Common::ElfInfo::Instance().GameSerial()));
-    const auto now = std::chrono::system_clock::now();
-    const auto now_time = std::chrono::system_clock::to_time_t(now);
-    const auto ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() %
-        1000;
-
-    std::tm local_tm{};
-#ifdef _WIN32
-    localtime_s(&local_tm, &now_time);
-#else
-    localtime_r(&now_time, &local_tm);
-#endif
-
-    std::ostringstream stamp;
-    stamp << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << '_' << std::setw(3) << std::setfill('0')
-          << ms;
-
-    const char* suffix = kind == ScreenshotKind::GameOnly ? "game" : "hud";
-    const auto first_sequence = screenshot_sequence.fetch_add(count, std::memory_order_relaxed);
-
-    paths.reserve(count);
-    const auto stamp_str = stamp.str();
-    for (u32 i = 0; i < count; ++i) {
-        paths.emplace_back(screenshots_dir / fmt::format("{}_{}_{}_{:06}.png", game_id, stamp_str,
-                                                         suffix, first_sequence + i));
-    }
-
-    return paths;
-}
-
-static float PqToNits(const float encoded) {
-    // ST.2084 inverse EOTF
-    constexpr float m1 = 2610.0f / 16384.0f;
-    constexpr float m2 = 2523.0f / 32.0f;
-    constexpr float c1 = 3424.0f / 4096.0f;
-    constexpr float c2 = 2413.0f / 128.0f;
-    constexpr float c3 = 2392.0f / 128.0f;
-
-    const float v = std::clamp(encoded, 0.0f, 1.0f);
-    const float vp = std::pow(v, 1.0f / m2);
-    const float num = std::max(vp - c1, 0.0f);
-    const float den = std::max(c2 - c3 * vp, 1e-6f);
-    return 10000.0f * std::pow(num / den, 1.0f / m1);
-}
-
-static float ToneMapToSdrLinear(const float nits) {
-    // Map absolute HDR luminance into SDR [0,1], preserving 100-nit white.
-    constexpr float sdr_white_nits = 100.0f;
-    const float x = std::max(nits, 0.0f) / sdr_white_nits;
-    const float mapped = (2.0f * x) / (1.0f + x);
-    return std::clamp(mapped, 0.0f, 1.0f);
-}
-
-static float LinearToSrgb(const float linear) {
-    const float x = std::clamp(linear, 0.0f, 1.0f);
-    if (x <= 0.0031308f) {
-        return 12.92f * x;
-    }
-    return 1.055f * std::pow(x, 1.0f / 2.4f) - 0.055f;
-}
-
-static const std::array<float, 1024>& GetPqDecodeNitsLut() {
-    static const std::array<float, 1024> lut = [] {
-        std::array<float, 1024> values{};
-        for (size_t i = 0; i < values.size(); ++i) {
-            values[i] = PqToNits(static_cast<float>(i) / 1023.0f);
-        }
-        return values;
-    }();
-    return lut;
-}
-
-static const std::array<u8, 1024>& GetUnorm10ToU8Lut() {
-    static const std::array<u8, 1024> lut = [] {
-        std::array<u8, 1024> values{};
-        for (size_t i = 0; i < values.size(); ++i) {
-            values[i] = static_cast<u8>((i * 255u + 511u) / 1023u);
-        }
-        return values;
-    }();
-    return lut;
-}
-
-static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image image,
-                                const vk::ImageLayout layout, ScreenshotReadback& readback) {
-    const vk::BufferImageCopy copy_region = {
-        .bufferOffset = 0,
-        .bufferRowLength = 0,
-        .bufferImageHeight = 0,
-        .imageSubresource =
-            {
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-        .imageOffset = {0, 0, 0},
-        .imageExtent = {readback.width, readback.height, 1},
-    };
-    cmdbuf.copyImageToBuffer(image, layout, readback.buffer.Handle(), copy_region);
-}
-
-static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vector<u8>& out_rgba) {
-    const u64 pixel_count = static_cast<u64>(readback.width) * static_cast<u64>(readback.height);
-    const u64 byte_size = pixel_count * 4;
-    if (readback.buffer.mapped_data.size() < byte_size) {
-        LOG_ERROR(Render_Vulkan, "Screenshot readback buffer size mismatch (have {}, need {})",
-                  readback.buffer.mapped_data.size(), byte_size);
-        return false;
-    }
-
-    const auto src =
-        std::span<const u8>{readback.buffer.mapped_data.data(), static_cast<size_t>(byte_size)};
-    out_rgba.resize(static_cast<size_t>(byte_size));
-
-    switch (readback.format) {
-    case vk::Format::eR8G8B8A8Unorm:
-    case vk::Format::eR8G8B8A8Srgb:
-        std::memcpy(out_rgba.data(), src.data(), out_rgba.size());
-        for (u64 i = 0; i < pixel_count; ++i) {
-            out_rgba[static_cast<size_t>(i) * 4 + 3] = 255;
-        }
-        return true;
-    case vk::Format::eB8G8R8A8Unorm:
-    case vk::Format::eB8G8R8A8Srgb:
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            out_rgba[o + 0] = src[o + 2];
-            out_rgba[o + 1] = src[o + 1];
-            out_rgba[o + 2] = src[o + 0];
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    case vk::Format::eA2R10G10B10UnormPack32: {
-        const auto& pq_decode_lut = GetPqDecodeNitsLut();
-        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
-
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
-                               (static_cast<u32>(src[o + 2]) << 16) |
-                               (static_cast<u32>(src[o + 3]) << 24);
-            const u32 b = (packed >> 0) & 0x3FF;
-            const u32 g = (packed >> 10) & 0x3FF;
-            const u32 r = (packed >> 20) & 0x3FF;
-
-            if (readback.hdr_encoded) {
-                // Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
-                const float r2020 = pq_decode_lut[r];
-                const float g2020 = pq_decode_lut[g];
-                const float b2020 = pq_decode_lut[b];
-
-                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
-                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
-                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
-
-                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
-                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
-                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
-
-                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-            } else {
-                out_rgba[o + 0] = unorm10_to_u8[r];
-                out_rgba[o + 1] = unorm10_to_u8[g];
-                out_rgba[o + 2] = unorm10_to_u8[b];
-            }
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    }
-    case vk::Format::eA2B10G10R10UnormPack32: {
-        const auto& pq_decode_lut = GetPqDecodeNitsLut();
-        const auto& unorm10_to_u8 = GetUnorm10ToU8Lut();
-
-        for (u64 i = 0; i < pixel_count; ++i) {
-            const size_t o = static_cast<size_t>(i) * 4;
-            const u32 packed = static_cast<u32>(src[o + 0]) | (static_cast<u32>(src[o + 1]) << 8) |
-                               (static_cast<u32>(src[o + 2]) << 16) |
-                               (static_cast<u32>(src[o + 3]) << 24);
-            const u32 r = (packed >> 0) & 0x3FF;
-            const u32 g = (packed >> 10) & 0x3FF;
-            const u32 b = (packed >> 20) & 0x3FF;
-
-            if (readback.hdr_encoded) {
-                // HDR swapchain path is Rec.2020 + PQ. Convert to SDR Rec.709 for PNG output.
-                const float r2020 = pq_decode_lut[r];
-                const float g2020 = pq_decode_lut[g];
-                const float b2020 = pq_decode_lut[b];
-
-                const float r709_nits = 1.6605f * r2020 - 0.5876f * g2020 - 0.0728f * b2020;
-                const float g709_nits = -0.1246f * r2020 + 1.1329f * g2020 - 0.0083f * b2020;
-                const float b709_nits = -0.0182f * r2020 - 0.1006f * g2020 + 1.1187f * b2020;
-
-                const float r_srgb = LinearToSrgb(ToneMapToSdrLinear(r709_nits));
-                const float g_srgb = LinearToSrgb(ToneMapToSdrLinear(g709_nits));
-                const float b_srgb = LinearToSrgb(ToneMapToSdrLinear(b709_nits));
-
-                out_rgba[o + 0] = static_cast<u8>(std::clamp(r_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 1] = static_cast<u8>(std::clamp(g_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-                out_rgba[o + 2] = static_cast<u8>(std::clamp(b_srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
-            } else {
-                out_rgba[o + 0] = unorm10_to_u8[r];
-                out_rgba[o + 1] = unorm10_to_u8[g];
-                out_rgba[o + 2] = unorm10_to_u8[b];
-            }
-            out_rgba[o + 3] = 255;
-        }
-        return true;
-    }
-    default:
-        LOG_WARNING(Render_Vulkan, "Unsupported screenshot format: {}",
-                    vk::to_string(readback.format));
-        return false;
-    }
-}
-
-static bool WritePng(const std::filesystem::path& path, const std::span<const u8> rgba,
-                     const u32 width, const u32 height) {
-    Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
-    if (!file.IsOpen()) {
-        return false;
-    }
-
-    auto callback = [](void* context, void* data, int size) {
-        const auto* f = static_cast<Common::FS::IOFile*>(context);
-        f->WriteRaw<u8>(data, size);
-    };
-    return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
-}
-
-// sotc: SOTC_SHOT_SEQ=<file>: when the file appears it is removed and the next 12 presents, game
-// and generated frames alike, are saved as "hud" screenshots in the order they reach the screen
-// (checking frame generation's motion and pacing). Presenter thread only.
-static bool TakeSequenceShot() {
-    static const char* trigger = std::getenv("SOTC_SHOT_SEQ");
-    static int left = 0;
-    if (!trigger) {
-        return false;
-    }
-    if (left == 0 && std::remove(trigger) == 0) {
-        left = 12;
-    }
-    if (left == 0) {
-        return false;
-    }
-    --left;
-    return true;
-}
-
-static void SavePendingScreenshot(const ScreenshotReadback& readback) {
-    if (readback.paths.empty()) {
-        return;
-    }
-
-    std::vector<u8> rgba;
-    if (!ConvertReadbackToRgba8(readback, rgba)) {
-        return;
-    }
-
-    const auto& primary_path = readback.paths.front();
-    if (!WritePng(primary_path, rgba, readback.width, readback.height)) {
-        LOG_ERROR(Render_Vulkan, "Failed saving screenshot to {}", primary_path.string());
-        return;
-    }
-
-    LOG_INFO(Render_Vulkan, "Saved screenshot: {}", primary_path.string());
-
-    std::ifstream file(primary_path, std::ios::binary);
-    std::vector<u8> imgdata;
-    if (file) {
-        imgdata =
-            std::vector<u8>(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
-    }
-    (void)imgdata; // sotc port: no notification layer
-
-    for (size_t i = 1; i < readback.paths.size(); ++i) {
-        const auto& path = readback.paths[i];
-        std::error_code ec{};
-        std::filesystem::copy_file(primary_path, path, std::filesystem::copy_options::none, ec);
-        if (ec) {
-            // Fallback for platforms/filesystems where copy_file can fail for transient
-            // reasons.
-            if (!WritePng(path, rgba, readback.width, readback.height)) {
-                LOG_ERROR(Render_Vulkan, "Failed saving screenshot to {}", path.string());
-                continue;
-            }
-        }
-
-        LOG_INFO(Render_Vulkan, "Saved screenshot: {}", path.string());
-        std::ifstream file(path, std::ios::binary);
-        std::vector<u8> imgdata;
-        if (file) {
-            imgdata = std::vector<u8>(std::istreambuf_iterator<char>(file),
-                                      std::istreambuf_iterator<char>());
-        }
-        (void)imgdata; // sotc port: no notification layer
-    }
-}
+// gow3: screenshot capture and ImGui overlays removed; the port presents directly.
 
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance, [] {
-          // sotc: Vulkan commands of the command processor recorded on a thread of their own
-          // (cp_record_thread of Pink-shadPS4, luizgustavs): canyon of the attract demo
-          // 24 -> 28 FPS. SOTC_RECORD_THREAD=0 records them on the command processor.
-          const char* v = std::getenv("SOTC_RECORD_THREAD");
-          return !v || v[0] != '0';
-      }()},
-      present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance, true}, present_scheduler{instance}, flip_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    // sotc: SOTC_TICKWATCH samples the draw scheduler's timeline (FLIPGAP diagnosis).
-    draw_scheduler.StartTickWatch();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
-    // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images, FSR 3 holds a frame
-    // for half a frame: 4 frames in flight so that the command processor does not wait for the
-    // presenter.
-    const u32 num_frames =
-        Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
-    present_frames.resize(num_frames);
-    hudless_frames.resize(num_frames);
-    for (u32 i = 0; i < num_frames; i++) {
+    present_frames.resize(num_images);
+    for (u32 i = 0; i < num_images; i++) {
         Frame& frame = present_frames[i];
         frame.id = i;
-        hudless_frames[i].id = i;
         auto fence = Check<"create present done fence">(
             device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}));
         frame.present_done = fence;
         free_queue.push(&frame);
     }
 
-    fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
-    fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
-    fsr_settings.rcas_attenuation =
-        static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
-
-    fsr_pass.Create(device, instance.GetAllocator(), num_images);
-    fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
+    // Android uses direct guest-resolution patches and never selects a
+    // reconstruction pass. Avoid compiling two unused compute pipelines,
+    // creating descriptors and reserving intermediary render targets.
+    if (!std::getenv("GOW3_ANDROID_PORT")) {
+        fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    }
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
-    if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
-        // sotc: SOTC_HDR_PAPER (nits of SDR white, default 200) and SOTC_HDR_GAIN (extra
-        // brightness of the highlights, 1 = none, default 1.5).
-        pp_settings.hdr = 2;
-        if (const char* v = std::getenv("SOTC_HDR_PAPER") ? std::getenv("SOTC_HDR_PAPER")
-                                                          : std::getenv("SOTC_HDR_WHITE")) {
-            pp_settings.paper_white = std::clamp(static_cast<float>(std::atof(v)), 80.0f, 1000.0f);
-        }
-        if (const char* v = std::getenv("SOTC_HDR_GAIN")) {
-            pp_settings.highlight_gain = std::clamp(static_cast<float>(std::atof(v)), 1.0f, 4.0f);
-        }
-        LOG_INFO(Render_Vulkan, "SOTC HDR: SDR game on HDR10, paper white {} nits, gain {}",
-                 pp_settings.paper_white, pp_settings.highlight_gain);
-    } else if (EmulatorSettings.IsSdrToHdr()) {
-        LOG_WARNING(Render_Vulkan, "SOTC HDR: the display has no HDR10 (turn HDR on in Windows)");
+    Gow3Overlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
+
+    const bool binary_cache = EmulatorSettingsImpl::Flag("GOW3_PIPELINE_BINARIES", true) &&
+                              EmulatorSettings.IsPipelineCacheEnabled();
+    const bool capture_only = EmulatorSettingsImpl::Flag("GOW3_PIPELINE_BINARY_ISOLATED", false) &&
+                              EmulatorSettingsImpl::Flag("GOW3_PIPELINE_CAPTURE_ONLY", false);
+    if (UseOnDemandPipelines(binary_cache, instance.GetPipelineBinaryGlobalKey().keySize != 0,
+                            capture_only)) {
+        rasterizer->GetPipelineCache().StartOnDemand();
+        return;
     }
 
-    // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
-    // the loading screen (moving, with the shader bar) are shown meanwhile. It used to be read in
-    // the PipelineCache constructor with nothing on screen: a still window for seconds, minutes
-    // after a driver update.
-    std::atomic<bool> warming{true};
-    std::thread painter([this, &warming] {
-        while (warming.load(std::memory_order_relaxed)) {
-            Present(PrepareBlankFrame(true), false, false);
-            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+    // gow3: by default the cached pipelines load while the game runs (a corner note shows the
+    // progress). Otherwise rebuilding them takes up to minutes before the first game frame:
+    // show what is happening instead of a black window.
+    const char* background_warmup = std::getenv("GOW3_BACKGROUND_WARMUP");
+    if ((!background_warmup || *background_warmup != '0') &&
+        rasterizer->GetPipelineCache().StartBackgroundWarmUp()) {
+        return;
+    }
+    Gow3Overlay::SetLoading(true, 0, 0);
+    PresentLoadingFrame();
+    auto last = std::chrono::steady_clock::now();
+    rasterizer->GetPipelineCache().WarmUp([&](u32 done, u32 total) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::milliseconds(250)) {
+            return;
         }
+        last = now;
+        Gow3Overlay::SetLoading(true, done, total);
+        PresentLoadingFrame();
     });
-    const auto warm_start = std::chrono::steady_clock::now();
-    rasterizer->GetPipelineCache().WarmUp();
-    std::fprintf(stderr, "SOTC warm-up: %lld ms\n",
-                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - warm_start).count()));
-    rasterizer->GetPipelineCache().SaveDriverCache();
-    SotcStats::warmup_finished.store(true, std::memory_order_relaxed);
-    warming.store(false, std::memory_order_relaxed);
-    painter.join();
+    Gow3Overlay::SetLoading(false, 0, 0);
+
 }
 
 Presenter::~Presenter() {
-    // This thread records the last commands of the rasterizer scheduler.
-    draw_scheduler.ClaimRecorder();
+
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
@@ -589,12 +211,6 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
     }
-    for (auto& frame : hudless_frames) {
-        if (frame.image) {
-            vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
-            device.destroyImageView(frame.image_view);
-        }
-    }
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -603,8 +219,6 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
 
 void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     const vk::Device device = instance.GetDevice();
-    if (false) { // sotc port: no ImGui layer
-    }
     if (frame->image_view) {
         device.destroyImageView(frame->image_view);
     }
@@ -719,7 +333,6 @@ Frame* Presenter::PrepareLastFrame() {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
-    Dlssg::NoInputs(frame->id); // sotc: a repeated frame, no frame generation
     return frame;
 }
 
@@ -740,11 +353,58 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+// gow3: raw copy of an image for GOW3_FRAME_DUMP_TRIGGER, written once the GPU is done.
+static void DumpRaw(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer cmdbuf,
+                    vk::Image image, vk::ImageLayout layout, u32 w, u32 h, const char* name,
+                    int index) {
+    const VkBufferCreateInfo buffer_ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                       .size = VkDeviceSize(w) * h * 4,
+                                       .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    const VmaAllocationCreateInfo alloc_ci{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation,
+                        &info) != VK_SUCCESS) {
+        return;
+    }
+    cmdbuf.copyImageToBuffer(image, layout, buffer,
+                             vk::BufferImageCopy{.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                                                 .imageExtent = {w, h, 1}});
+    const char* dir = std::getenv("GOW3_DUMP_DIR");
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/%s_%03d_%ux%u.raw", dir && *dir ? dir : "out/dump", name,
+                  index, w, h);
+    scheduler.DeferPriorityOperation([allocator = instance.GetAllocator(), buffer, allocation, info,
+                                      size = buffer_ci.size, file = std::string{path}] {
+        vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
+        if (FILE* f = std::fopen(file.c_str(), "wb")) {
+            std::fwrite(info.pMappedData, 1, size, f);
+            std::fclose(f);
+        }
+        vmaDestroyBuffer(allocator, buffer, allocation);
+    });
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
-    auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
-    const auto image_id = texture_cache.FindImage(desc);
-    texture_cache.UpdateImage(image_id);
+    // gow3: GOW3_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
+    // guest display buffer and presented image are written to GOW3_DUMP_DIR (default out/dump)
+    // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
+    static const char* frame_dump_trigger = std::getenv("GOW3_FRAME_DUMP_TRIGGER");
+    static int frame_dump_index = 0;
+    const bool frame_dump = frame_dump_trigger && std::remove(frame_dump_trigger) == 0;
+    // gow3: scaled upscaler presets: the output-size display buffer drawn by the port.
+    TemporalUpscaler::Display display{};
+    const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
+    VideoCore::ImageId image_id{};
+    if (!upscaled) {
+        auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+        image_id = texture_cache.FindImage(desc);
+        texture_cache.UpdateImage(image_id);
+    }
 
     Frame* frame = GetRenderFrame();
 
@@ -779,248 +439,86 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
-    auto& image = texture_cache.GetImage(image_id);
-    auto image_view = *image.FindView(view_info).image_view;
-    const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
-    // sotc: this frame's depth, motion vectors and camera for DLSS Frame Generation.
-    SotcStats::cp_frame.fetch_add(1, std::memory_order_relaxed);
-    Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
-                         image_size.height);
-    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
-    // sotc: SOTC_OUTPUT_RES=WxH (1280x720 ... 3840x2160): the presented frame has this size, the
-    // game's 1080p image is scaled to it (FSR 1 + RCAS with BB_FSR1=1, else bilinear).
-    static const std::pair<s32, s32> output_size = [] {
-        const char* v = std::getenv("SOTC_OUTPUT_RES");
-        s32 w = 0, h = 0;
-        if (v && std::sscanf(v, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 && h <= 4320) {
-            return std::pair{w, h};
-        }
-        return std::pair<s32, s32>{0, 0};
-    }();
-    if (output_size.first) {
-        SetExpectedGameSize(output_size.first, output_size.second);
-        static bool reported = false;
-        if (!std::exchange(reported, true)) {
-            std::fprintf(stderr, "SOTC output %ux%u from a %ux%u game image, FSR 1 %s\n",
-                         expected_frame_width, expected_frame_height, image_size.width,
-                         image_size.height, fsr_settings.enable ? "on" : "off");
-        }
-    }
-
-    const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
-    std::optional<ScreenshotReadback> pending_screenshot;
-
-    // Capture the guest output before any host-side scaling (FSR/PP) is applied.
-    if (capture_game_only_count > 0) {
-        const bool hdr_encoded =
-            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Bt2020Pq;
-        auto& readback = pending_screenshot.emplace(
-            instance, ScreenshotKind::GameOnly,
-            BuildScreenshotPaths(ScreenshotKind::GameOnly, capture_game_only_count),
-            image_size.width, image_size.height, view_info.format, hdr_encoded);
-        const vk::BufferImageCopy copy_region = {
-            .bufferOffset = 0,
-            .bufferRowLength = 0,
-            .bufferImageHeight = 0,
-            .imageSubresource{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .mipLevel = 0,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {readback.width, readback.height, 1},
+    vk::ImageView image_view{};
+    vk::Extent2D image_size{};
+    if (upscaled) {
+        const auto device = instance.GetDevice();
+        image_view = Check(device.createImageView({
+            .image = display.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = view_info.format,
+            .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
+                           vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        }));
+        draw_scheduler.DeferOperation([device, image_view] { device.destroyImageView(image_view); });
+        image_size = vk::Extent2D{display.width, display.height};
+        const vk::ImageMemoryBarrier2 to_read{
+            .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eGeneral,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = display.image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         };
-        runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
-    }
-
-    // Continue with host-side passes that draw the displayed (scaled) frame.
-
-    // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
-    // to the frame's size; the post process pass puts the UI layer back over it. Frames without
-    // that scene (menus, loading screens) are presented as before.
-    Dlssg::SetHdr(pp_settings.hdr != 0);
-    auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
-                                   frame->width, frame->height);
-    // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
-    // rendered frame twice) has nothing new drawn: no composite, no DLSS inputs. That repeat went
-    // out without DLSS and without the vignette (taken out of the game's tonemap to be applied
-    // after upscaling): every other present lost both and the picture shook, the edges most
-    // (27 Oct). It shows the last DLSS output again. SOTC_DLSS_REPEAT=0: as before.
-    static const bool dlss_repeat = [] {
-        const char* v = std::getenv("SOTC_DLSS_REPEAT");
-        return !v || v[0] != '0';
-    }();
-    static Dlssg::Upscaled dlss_last{};
-    static VAddr dlss_last_address = 0;
-    // sotc: once per DLSS picture: a buffer flipped again and again with no new DLSS output
-    // (inputs refused, super resolution off) showed the same picture for good (frozen screen in
-    // PS4 Pro Cinematic mode, 2 Nov).
-    if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
-        upscaled = dlss_last;
-        dlss_last = Dlssg::Upscaled{};
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
     } else {
-        dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
-    }
-    dlss_last_address = cpu_address;
-    if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
-        BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()
-                                    : fsr_settings.enable                 ? "FSR1"
-                                                                          : "Bilinear");
-    }
-    vk::ImageView upscaled_scene; // sotc: the sharpened DLSS output, for the HUD-less frame too
-    if (upscaled.scene) {
-        // DLSS has no sharpening of its own: full-strength RCAS (needed to match FSR1 detail),
-        // unless SOTC_DLSS_SHARPEN (attenuation in stops, 0 = sharpest) or "off" says otherwise.
-        // SOTC_DLSS_UI_SHARPEN and SOTC_DLSS_SKY_SHARPEN: unsharp amounts of the upscaled UI
-        // and of the sky (0 = none).
-        static const auto env = [](const char* name, float fallback) {
-            const char* v = std::getenv(name);
-            if (!v || !*v) {
-                return fallback;
-            }
-            return v[0] == 'o' ? -1.0f : static_cast<float>(std::atof(v));
-        };
-        static const float sharpness = env("SOTC_DLSS_SHARPEN", 0.0f);
-        static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
-        static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
-        vk::ImageView scene = upscaled.scene;
-        vk::Extent2D scene_size{frame->width, frame->height};
-        if (upscaled.scene_low) {
-            // sotc: no DLSS inputs (splash, menus): the scene as FSR1 would scale the frame, only
-            // the UI layer is drawn at the output size.
-            scene_size = {upscaled.scene_width, upscaled.scene_height};
-            scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
-                                    fsr_settings, false);
-            if (DebugState.is_using_fsr) {
-                scene_size = {frame->width, frame->height};
-            }
-        } else if (upscaled.scene_width &&
-                   (upscaled.scene_width != frame->width || upscaled.scene_height != frame->height)) {
-            // sotc: DLSS went 2x (PS4 Pro mode at 4K: 1600x900 -> 3200x1800): FSR 1 the rest
-            scene_size = {upscaled.scene_width, upscaled.scene_height};
-            scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
-                                    fsr_settings, false);
-            if (DebugState.is_using_fsr) {
-                scene_size = {frame->width, frame->height};
-            }
-        } else if (sharpness >= 0.0f) {
-            scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
+        auto& image = texture_cache.GetImage(image_id);
+        if (frame_dump) {
+            runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+            DumpRaw(instance, draw_scheduler, cmdbuf, image.GetImage(),
+                    vk::ImageLayout::eTransferSrcOptimal, image.info.size.width,
+                    image.info.size.height, "display", frame_dump_index);
         }
-        pp_settings.srgb_input = 0;
-        pp_settings.ui = 1;
-        if (!Dlssg::Vignette(pp_settings.vignette.data())) {
-            pp_settings.vignette = {};
-        }
-        pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
-        pp_settings.hdr_curve = Dlssg::HdrCurve();
-        pp_settings.sky_sharpen = sky_sharpen;
-        pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
-        upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
-    } else {
+        image_view = *image.FindView(view_info).image_view;
+        image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eFragmentShader,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
+    }
+    expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
-        // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
-        if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
-            fsr_settings.enable = live != 0;
-        }
-        if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
-            fsr_settings.use_rcas = live >= 0;
-            if (live >= 0) {
-                fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
-            }
-        }
-        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                     {frame->width, frame->height}, fsr_settings,
-                                     frame->is_hdr && pp_settings.hdr != 2);
-
-        // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
-        // the post process pass still sRGB encoded and has to be decoded there instead.
-        pp_settings.srgb_input =
-            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-        pp_settings.ui = 0;
-        pp_settings.vignette = {};
-        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    // gow3: FSR 1, RCAS and its strength come from the in-game menu, every frame.
+    const auto& graphics = Gow3Settings::Get();
+    const bool native_android = std::getenv("GOW3_ANDROID_PORT") != nullptr;
+    fsr_settings.enable = !native_android && graphics.fsr1;
+    fsr_settings.use_rcas = !native_android && graphics.rcas;
+    fsr_settings.rcas_attenuation = Gow3Graphics::RcasAttenuation(graphics.rcas_strength);
+    Gow3Settings::Get().image_width = int(image_size.width);
+    Gow3Settings::Get().image_height = int(image_size.height);
+    Gow3Settings::Get().window_width = int(frame->width);
+    Gow3Settings::Get().window_height = int(frame->height);
+    Gow3Settings::Get().rcas_applied =
+        fsr_settings.use_rcas &&
+        Gow3Graphics::FsrPassRuns(fsr_settings.enable, true, int(image_size.width), int(image_size.height),
+                                  int(frame->width), int(frame->height));
+    // The pass is not created on Android. Never dispatch or touch its
+    // uninitialized descriptor/pipeline resources on that presentation path.
+    if (!native_android) {
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
+                                     fsr_settings, frame->is_hdr);
     }
 
-    // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
-    // HUD of the real frame instead of interpolating it). With FSR 1 it goes through its own FSR
-    // pass, the game frame's images being a ring meant for one frame each: skipping it left the
-    // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
-    // output is the frame without its HUD (the UI layer is only put over it here), so it is used
-    // instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
-        Frame& hudless = hudless_frames[frame->id];
-        if (hudless.width != frame->width || hudless.height != frame->height ||
-            hudless.is_hdr != frame->is_hdr || !hudless.image) {
-            RecreateFrame(&hudless, frame->width, frame->height);
-        }
-        auto hudless_barrier = pre_barrier;
-        hudless_barrier.image = hudless.image;
-        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-            .imageMemoryBarrierCount = 1,
-            .pImageMemoryBarriers = &hudless_barrier,
-        });
-        if (upscaled_scene) {
-            auto scene_only = pp_settings;
-            scene_only.ui = 2; // the vignette, without the UI layer
-            pp_pass.Render(cmdbuf, upscaled_scene, {frame->width, frame->height}, hudless,
-                           scene_only, upscaled.ui, upscaled.sky);
-        } else {
-            const vk::ImageView scaled =
-                fsr_pass_hudless.Render(cmdbuf, hudless_view, image_size,
-                                        {frame->width, frame->height}, fsr_settings,
-                                     frame->is_hdr && pp_settings.hdr != 2);
-            pp_pass.Render(cmdbuf, scaled, image_size, hudless, pp_settings);
-        }
-        frame->hudless = &hudless;
-        Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
-                           swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);
-        // sotc: SOTC_SHOT_HUDLESS=<file>: when the file appears it is removed and this game frame
-        // is saved twice, as shown and without the HUD (two "hud" screenshots, in that order):
-        // checking what frame generation reads as the HUD.
-        static const char* shot_hudless = std::getenv("SOTC_SHOT_HUDLESS");
-        if (shot_hudless && std::remove(shot_hudless) == 0) {
-            for (const vk::Image source : {frame->image, hudless.image}) {
-                auto readback = std::make_shared<ScreenshotReadback>(
-                    instance, ScreenshotKind::WithOverlays,
-                    BuildScreenshotPaths(ScreenshotKind::WithOverlays, 1), frame->width,
-                    frame->height, swapchain.GetSurfaceFormat().format, false);
-                const auto to = [&](vk::ImageLayout from, vk::ImageLayout layout) {
-                    const vk::ImageMemoryBarrier2 barrier{
-                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                        .dstAccessMask =
-                            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                        .oldLayout = from,
-                        .newLayout = layout,
-                        .image = source,
-                        .subresourceRange{frame_subresources}};
-                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-                        .imageMemoryBarrierCount = 1,
-                        .pImageMemoryBarriers = &barrier,
-                    });
-                };
-                to(vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
-                CopyImageToReadback(cmdbuf, source, vk::ImageLayout::eTransferSrcOptimal,
-                                    *readback);
-                to(vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
-                draw_scheduler.DeferPriorityOperation(
-                    [readback] { SavePendingScreenshot(*readback); });
-            }
-        }
-    }
-
-
-    if (pending_screenshot) {
-        draw_scheduler.DeferPriorityOperation(
-            [deferred_screenshot = std::move(pending_screenshot)]() {
-                SavePendingScreenshot(deferred_screenshot.value());
-            });
+    // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
+    // the post process pass still sRGB encoded and has to be decoded there instead.
+    pp_settings.srgb_input =
+        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    if (frame_dump) {
+        // The presented image as the swapchain blit reads it (General after the pass).
+        const vk::MemoryBarrier2 done{.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                                      .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                                      .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                      .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &done});
+        DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
+                frame->width, frame->height, "output", frame_dump_index);
+        ++frame_dump_index;
     }
 
     // Flush frame creation commands.
@@ -1028,7 +526,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
-    Dlssg::FrameSubmitted(frame->id);
+
+    // gow3: the GPU command thread runs at most GOW3_FRAMES_AHEAD (default 1) guest frames
+    // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
+    // bottleneck it finishes frames at an even rate; without this bound the command thread ran
+    // ahead and then blocked wherever a resource ran out, so flips (and the guest's frame
+    // timing) came in bursts: 12.5/25 ms alternation at 80 FPS. 0 turns it off.
+    // The in-game menu changes it live (Gow3Settings::frames_queued; GOW3_FRAMES_AHEAD at start).
+    const u32 frames_ahead = u32(std::max(0, Gow3Settings::Get().frames_queued.load()));
+    if (!frames_ahead) {
+        recent_frame_ticks.clear();
+    } else {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        while (recent_frame_ticks.size() > frames_ahead) {
+            const u64 tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            if (recent_frame_ticks.size() == frames_ahead) {
+                draw_scheduler.Wait(tick);
+            }
+        }
+    }
     return frame;
 }
 
@@ -1102,8 +619,67 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
-    Dlssg::NoInputs(frame->id); // sotc: no game image, no frame generation
     return frame;
+}
+
+void Presenter::PresentLoadingFrame() {
+    if (window.GetWidth() == 0 || window.GetHeight() == 0) {
+        return;
+    }
+    swapchain.UpdateVsync();
+    if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    if (!swapchain.AcquireNextImage()) {
+        return;
+    }
+    const vk::Image image = swapchain.Image();
+    const vk::Extent2D extent = swapchain.GetExtent();
+    const auto cmdbuf = present_scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .levelCount = 1,
+        .layerCount = VK_REMAINING_ARRAY_LAYERS,
+    };
+    const auto acquire_queues = swapchain.AcquireQueues();
+    const auto release_queues = swapchain.ReleaseQueues();
+    const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to, vk::AccessFlags src,
+                             vk::AccessFlags dst) {
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eAllCommands, {}, {}, {},
+                               vk::ImageMemoryBarrier{
+                                   .srcAccessMask = src,
+                                   .dstAccessMask = dst,
+                                   .oldLayout = from,
+                                   .newLayout = to,
+                                   .srcQueueFamilyIndex = from == vk::ImageLayout::eUndefined ? acquire_queues.first
+                                       : to == swapchain.PresentLayout() ? release_queues.first : VK_QUEUE_FAMILY_IGNORED,
+                                   .dstQueueFamilyIndex = from == vk::ImageLayout::eUndefined ? acquire_queues.second
+                                       : to == swapchain.PresentLayout() ? release_queues.second : VK_QUEUE_FAMILY_IGNORED,
+                                   .image = image,
+                                   .subresourceRange = range,
+                               });
+    };
+    barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, {},
+            vk::AccessFlagBits::eTransferWrite);
+    cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal,
+                           vk::ClearColorValue{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}},
+                           range);
+    barrier(vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eColorAttachmentOptimal,
+            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eColorAttachmentWrite);
+    Gow3Overlay::Render(cmdbuf, swapchain.ImageView(), extent);
+    barrier(vk::ImageLayout::eColorAttachmentOptimal, swapchain.PresentLayout(),
+            vk::AccessFlagBits::eColorAttachmentWrite, {});
+    SubmitInfo info{};
+    AddImageAcquiredWait(info, swapchain.GetImageAcquiredSemaphore());
+    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    present_scheduler.Flush(info);
+    {
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        swapchain.Present();
+    }
+    // A few frames a second during start-up: waiting keeps semaphores and the swapchain simple.
+    present_scheduler.Finish();
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
@@ -1117,39 +693,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     };
 
+    // gow3: a minimized window has no pixels on Windows (0x0); keep the swapchain and skip
+    // presenting until the window is restored.
+    if (window.GetWidth() == 0 || window.GetHeight() == 0) {
+        free_frame();
+        return;
+    }
+
     // Recreate the swapchain if the window was resized.
+    swapchain.UpdateVsync();
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        Dlssg::Suspend(); // sotc: frame generation off while the swapchain changes
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
-    // sotc: FSR 3 frame generation: the frame between the last game frame and this one first,
-    // this one half a frame later.
-    if (is_game_frame && !is_reusing_frame) {
-        FrameGen::TestTick();
-        SotcFpsCap::TestTick();
-        FsrFg::NoteGameFrame();
-        if (FrameGen::Current() == FrameGen::Mode::Fsr && PresentGenerated(frame)) {
-            // SOTC_FSRFG_ONLY_GENERATED=1: the game frames are not shown (checking the others).
-            static const bool only_generated = [] {
-                const char* v = std::getenv("SOTC_FSRFG_ONLY_GENERATED");
-                return v && v[0] == '1';
-            }();
-            if (only_generated) {
-                Check(instance.GetDevice().resetFences(frame->present_done));
-                SubmitInfo info{};
-                info.AddWait(frame->ready_semaphore, frame->ready_tick);
-                info.AddSignal(frame->present_done);
-                present_scheduler.Flush(info);
-                free_frame();
-                return;
-            }
-            FsrFg::WaitForGameFrame();
-        }
-    }
-
     if (!swapchain.AcquireNextImage()) {
-        Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -1166,16 +723,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     ASSERT_MSG(reset_result == vk::Result::eSuccess,
                "Unexpected error resetting present done fence: {}", vk::to_string(reset_result));
 
-
+    // gow3: the game frame is blitted (letterboxed) straight into the swapchain image.
     const vk::Image swapchain_image = swapchain.Image();
-    const vk::ImageView swapchain_image_view = swapchain.ImageView();
-
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
-    const u32 capture_with_overlays_count =
-        VideoCore::ConsumeWithOverlaysScreenshotRequests() + (TakeSequenceShot() ? 1 : 0);
-    std::optional<ScreenshotReadback> pending_screenshot;
 
+    const auto acquire_queues = swapchain.AcquireQueues();
+    const auto release_queues = swapchain.ReleaseQueues();
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Present",
@@ -1183,219 +737,97 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 
     {
-        auto* profiler_ctx = instance.GetProfilerContext();
-        TracyVkNamedZoneC(profiler_ctx, renderer_gpu_zone, cmdbuf, "Host frame",
-                          MarkersPalette::GpuMarkerColor, profiler_ctx != nullptr);
-
         const vk::Extent2D extent = swapchain.GetExtent();
+        SetExpectedGameSize(s32(extent.width), s32(extent.height));
+        const vk::ImageSubresourceRange color_range{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = VK_REMAINING_ARRAY_LAYERS,
+        };
         const std::array pre_barriers{
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eNone,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = acquire_queues.first,
+                .dstQueueFamilyIndex = acquire_queues.second,
                 .image = swapchain_image,
-                .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
-                },
+                .subresourceRange = color_range,
             },
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
-                .oldLayout = vk::ImageLayout::eGeneral,
-                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = frame->image,
-                .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
-                },
-            },
-        };
-
-        bool swapchain_copied_for_screenshot = false;
-
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
-
-        { // sotc port: the game image is blitted to the swapchain (no ImGui layer).
-            const auto color_range = vk::ImageSubresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = 1,
-            };
-            const std::array to_transfer{
-                vk::ImageMemoryBarrier{
-                    .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                    .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                    .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = swapchain_image,
-                    .subresourceRange = color_range,
-                },
-                vk::ImageMemoryBarrier{
-                    .srcAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
-                    .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                    .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = frame->image,
-                    .subresourceRange = color_range,
-                },
-            };
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                                   vk::PipelineStageFlagBits::eTransfer,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, to_transfer);
-            cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
-                                   vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
-                                   color_range);
-            // sotc: the clear and the blit both write the swapchain image; without a barrier
-            // between them AMD let the clear land after the blit on part of the image: black
-            // tiles over the lower left of the screen, UI included (issue #43).
-            const vk::ImageMemoryBarrier clear_to_blit{
-                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = swapchain_image,
-                .subresourceRange = color_range,
-            };
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                   vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
-                                   clear_to_blit);
-            const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
-            const vk::ImageBlit blit{
-                .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-                .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                         vk::Offset3D{static_cast<s32>(frame->width),
-                                                      static_cast<s32>(frame->height), 1}},
-                .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-                .dstOffsets = std::array{
-                    vk::Offset3D{rect.offset.x, rect.offset.y, 0},
-                    vk::Offset3D{rect.offset.x + static_cast<s32>(rect.extent.width),
-                                 rect.offset.y + static_cast<s32>(rect.extent.height), 1}},
-            };
-            cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
-                             vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
-            const std::array back{
-                vk::ImageMemoryBarrier{
-                    .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-                    .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-                    .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = swapchain_image,
-                    .subresourceRange = color_range,
-                },
-                vk::ImageMemoryBarrier{
-                    .srcAccessMask = vk::AccessFlagBits::eTransferRead,
-                    .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = frame->image,
-                    .subresourceRange = color_range,
-                },
-            };
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                                   vk::PipelineStageFlagBits::eAllCommands,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, back);
-            // sotc port: the in-game overlay on top (the save/load slot list of
-            // sceSaveDataDialog); draws nothing while it has nothing to show.
-            static bool overlay_ready = false;
-            if (!std::exchange(overlay_ready, true)) {
-                // Up to 2 overlay draws per game frame with FSR 3, and with 8 swapchain images
-                // that many presents really are in flight: the ImGui vertex-buffer ring must
-                // exceed the deepest possible in-flight count or the oldest entry is rewritten
-                // while the GPU still reads it (a flickering overlay).
-                BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format,
-                                std::max(swapchain.GetImageCount() * 2, 16u));
-            }
-            BbOverlay::Render(cmdbuf, swapchain_image_view, extent);
-        }
-
-        if (capture_with_overlays_count > 0) {
-            auto& readback = pending_screenshot.emplace(
-                instance, ScreenshotKind::WithOverlays,
-                BuildScreenshotPaths(ScreenshotKind::WithOverlays, capture_with_overlays_count),
-                extent.width, extent.height,
-                swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
-                                   : swapchain.GetSurfaceFormat().format,
-                swapchain.GetHDR());
-
-            const vk::ImageMemoryBarrier to_transfer{
-                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
                 .dstAccessMask = vk::AccessFlagBits::eTransferRead,
-                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eTransferSrcOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image = swapchain_image,
-                .subresourceRange{
-                    .aspectMask = vk::ImageAspectFlagBits::eColor,
-                    .baseMipLevel = 0,
-                    .levelCount = 1,
-                    .baseArrayLayer = 0,
-                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
-                },
-            };
-
-            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                                   vk::PipelineStageFlagBits::eTransfer,
-                                   vk::DependencyFlagBits::eByRegion, {}, {}, to_transfer);
-            CopyImageToReadback(cmdbuf, swapchain_image, vk::ImageLayout::eTransferSrcOptimal,
-                                readback);
-            swapchain_copied_for_screenshot = true;
-        }
-
-        const vk::AccessFlags post_src_access_mask =
-            swapchain_copied_for_screenshot ? vk::AccessFlagBits::eTransferRead
-                                            : vk::AccessFlagBits::eColorAttachmentWrite;
-        const vk::ImageLayout post_old_layout = swapchain_copied_for_screenshot
-                                                    ? vk::ImageLayout::eTransferSrcOptimal
-                                                    : vk::ImageLayout::eColorAttachmentOptimal;
-        const vk::ImageMemoryBarrier post_barrier{
-            .srcAccessMask = post_src_access_mask,
-            .dstAccessMask = vk::AccessFlagBits::eNone,
-            .oldLayout = post_old_layout,
-            .newLayout = vk::ImageLayout::ePresentSrcKHR,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = swapchain_image,
-            .subresourceRange{
-                .aspectMask = vk::ImageAspectFlagBits::eColor,
-                .baseMipLevel = 0,
-                .levelCount = 1,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                .image = frame->image,
+                .subresourceRange = color_range,
             },
         };
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                               vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+                               {}, {}, pre_barriers);
+        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+        cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
+        const vk::MemoryBarrier clear_done{
+            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
+                         vk::ImageLayout::eTransferDstOptimal,
+                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                         vk::Filter::eLinear);
+        // gow3: the settings menu / FPS counter over the frame, at display resolution.
+        const bool overlay = Gow3Overlay::Visible();
+        const std::array post_barriers{
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = overlay ? vk::AccessFlagBits::eColorAttachmentRead |
+                                               vk::AccessFlagBits::eColorAttachmentWrite
+                                         : vk::AccessFlagBits::eNone,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = overlay ? vk::ImageLayout::eColorAttachmentOptimal
+                                     : swapchain.PresentLayout(),
+                .srcQueueFamilyIndex = overlay ? VK_QUEUE_FAMILY_IGNORED : release_queues.first,
+                .dstQueueFamilyIndex = overlay ? VK_QUEUE_FAMILY_IGNORED : release_queues.second,
+                .image = swapchain_image,
+                .subresourceRange = color_range,
+            },
+            vk::ImageMemoryBarrier{
+                .srcAccessMask = vk::AccessFlagBits::eTransferRead,
+                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = frame->image,
+                .subresourceRange = color_range,
+            },
+        };
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                                vk::PipelineStageFlagBits::eAllCommands,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barrier);
-
-        if (profiler_ctx) {
-            TracyVkCollect(profiler_ctx, cmdbuf);
+                               vk::DependencyFlagBits::eByRegion, {}, {}, post_barriers);
+        if (overlay) {
+            Gow3Overlay::Render(cmdbuf, swapchain.ImageView(), extent);
+            const vk::ImageMemoryBarrier to_present{
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+                .dstAccessMask = vk::AccessFlagBits::eNone,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = swapchain.PresentLayout(),
+                .srcQueueFamilyIndex = release_queues.first,
+                .dstQueueFamilyIndex = release_queues.second,
+                .image = swapchain_image,
+                .subresourceRange = color_range,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                                   vk::PipelineStageFlagBits::eBottomOfPipe,
+                                   vk::DependencyFlagBits::eByRegion, {}, {}, to_present);
         }
     }
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -1403,58 +835,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 
     // Flush vulkan commands.
-    if (pending_screenshot) {
-        scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
-            SavePendingScreenshot(deferred_screenshot.value());
-        });
-    }
 
     SubmitInfo info{};
-    // sotc: with the command recorder the frame's submit may not be on the queue yet; waiting
-    // for it on the same queue before it is there would block the queue.
-    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
-        draw_scheduler.WaitSubmitted(frame->ready_tick, false);
-    }
-    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    AddImageAcquiredWait(info, swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    // Flush submitted the present-ready signal synchronously; no GPU completion wait.
 
     // Present to swapchain.
     {
-        // sotc: DLSS Frame Generation inputs of this frame, and Reflex present markers.
-        const vk::Extent2D extent = swapchain.GetExtent();
-        Dlssg::BeforePresent(frame->id,
-                             FitImage(frame->width, frame->height, extent.width, extent.height),
-                             extent);
-        // sotc: vkQueuePresentKHR can block for tens of ms in the driver; on a dedicated present
-        // queue it only needs the present queue's own lock, so those stalls no longer starve the
-        // schedulers' submits (the ~11 s cadence hitch). Shared queue: submit_mutex as before.
-        const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
-        if (!instance.HasDedicatedPresentQueue()) {
-            submit_lock.lock();
-        }
-        std::scoped_lock present_lock{present_queue_mutex};
-        const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-        const bool presented = swapchain.Present();
-        if (SotcStats::kTickWatch) {
-            const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
-            SotcStats::PushTick(4, 0,
-                                (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
-                                    static_cast<u64>((tw2 - tw1) / 1000));
-        }
-        Dlssg::AfterPresent(frame->id);
-        if (FrameGen::Current() == FrameGen::Mode::Fsr) {
-            FsrFg::NotePresent();
-        }
-        if (!presented) {
-            // Recreate() waits for the whole device to go idle: no submits may race it.
-            if (!submit_lock.owns_lock()) {
-                submit_lock.lock();
-            }
-            Dlssg::Suspend();
+        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        if (!swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
@@ -1462,227 +855,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
-        // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
-        // measuring the frame rate of scripted runs.
-        static const u64 every = [] {
-            const char* v = std::getenv("SOTC_FRAME_LOG");
-            return v ? std::strtoull(v, nullptr, 10) : 0ULL;
-        }();
-        if (every != 0) {
-            static u64 frames = 0;
-            static const auto t0 = std::chrono::steady_clock::now();
-            if (++frames % every == 0) {
-                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                    std::chrono::steady_clock::now() - t0)
-                                    .count();
-                // us: the same time in microseconds, for frame time percentiles.
-                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms us=%lld\n",
-                             static_cast<unsigned long long>(frames),
-                             static_cast<long long>(us / 1000), static_cast<long long>(us));
-                std::fflush(stderr);
-            }
-            // SOTC_STALL_MS (default 70): for slower frames, what happened since the last one.
-            static const long long stall_us = [] {
-                const char* v = std::getenv("SOTC_STALL_MS");
-                return (v ? std::atoll(v) : 70LL) * 1000;
-            }();
-            static long long last_us = -1;
-            static u64 last[11]{};
-            const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - t0)
-                                         .count();
-            const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
-                                SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
-                                SotcStats::images_new.load(), SotcStats::image_ns.load(),
-                                SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
-                                SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
-                                SotcStats::image_dedicated.load()};
-            if (last_us >= 0 && now_us - last_us > stall_us) {
-                // The 5 s stats printer resets these counters with exchange(0): a snapshot taken
-                // across a reset would underflow, so a shrunk counter reads as its new value.
-                const auto d = [&](int i) { return cur[i] >= last[i] ? cur[i] - last[i] : cur[i]; };
-                std::fprintf(stderr,
-                             "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
-                             "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms)\n",
-                             static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
-                             static_cast<unsigned long long>(d(0)), d(1) / 1e6,
-                             static_cast<unsigned long long>(d(2)), d(3) / 1e6,
-                             static_cast<unsigned long long>(d(4)), d(5) / 1e6,
-                             d(8) / 1e6, d(9) / 1e6,
-                             static_cast<unsigned long long>(d(10)),
-                             static_cast<unsigned long long>(d(6)), d(7) / 1e6);
-            }
-            last_us = now_us;
-            std::copy(std::begin(cur), std::end(cur), std::begin(last));
-            if (false) {
-            }
-        }
     }
-}
-
-bool Presenter::PresentGenerated(Frame* frame) {
-    auto& scheduler = present_scheduler;
-    const auto cmdbuf = scheduler.CommandBuffer();
-    const vk::Image generated =
-        FsrFg::Generate(cmdbuf, frame->id, frame->image, frame->width, frame->height,
-                        frame->hudless ? frame->hudless->image : vk::Image{});
-
-    // FSR 3 reads the game frame and its inputs: after the frame's own commands.
-    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
-        draw_scheduler.WaitSubmitted(frame->ready_tick, false);
-    }
-    SubmitInfo info{};
-    info.AddWait(frame->ready_semaphore, frame->ready_tick);
-    const auto submit = [&] {
-        const u64 tick = scheduler.CurrentTick();
-        scheduler.Flush(info);
-        FsrFg::Submitted(scheduler, tick);
-    };
-    if (!generated) {
-        submit(); // FSR 3 history only (first frame, after a cut)
-        return false;
-    }
-    if (!swapchain.AcquireNextImage()) {
-        submit();
-        Dlssg::Suspend();
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        return false;
-    }
-
-    const vk::Image swapchain_image = swapchain.Image();
-    const vk::Extent2D extent = swapchain.GetExtent();
-    const auto color_range = vk::ImageSubresourceRange{
-        .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .baseMipLevel = 0,
-        .levelCount = 1,
-        .baseArrayLayer = 0,
-        .layerCount = 1,
-    };
-    const auto swapchain_barrier = [&](vk::AccessFlags src, vk::AccessFlags dst,
-                                       vk::ImageLayout from, vk::ImageLayout to) {
-        return vk::ImageMemoryBarrier{
-            .srcAccessMask = src,
-            .dstAccessMask = dst,
-            .oldLayout = from,
-            .newLayout = to,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = swapchain_image,
-            .subresourceRange = color_range,
-        };
-    };
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
-                           {}, {},
-                           swapchain_barrier(vk::AccessFlagBits::eNone,
-                                             vk::AccessFlagBits::eTransferWrite,
-                                             vk::ImageLayout::eUndefined,
-                                             vk::ImageLayout::eTransferDstOptimal));
-    cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
-                           vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
-                           color_range);
-    // sotc: the same clear-to-blit barrier as the game frames (issue #43): without it AMD RX 7000
-    // showed the black tiles on the generated frames (KingJhoss).
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                           vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
-                           swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
-                                             vk::AccessFlagBits::eTransferWrite,
-                                             vk::ImageLayout::eTransferDstOptimal,
-                                             vk::ImageLayout::eTransferDstOptimal));
-    const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
-    const vk::ImageBlit blit{
-        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                                 vk::Offset3D{static_cast<s32>(frame->width),
-                                              static_cast<s32>(frame->height), 1}},
-        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-        .dstOffsets =
-            std::array{vk::Offset3D{rect.offset.x, rect.offset.y, 0},
-                       vk::Offset3D{rect.offset.x + static_cast<s32>(rect.extent.width),
-                                    rect.offset.y + static_cast<s32>(rect.extent.height), 1}},
-    };
-    cmdbuf.blitImage(generated, vk::ImageLayout::eGeneral, swapchain_image,
-                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
-    // sotc: SOTC_SHOT_GENERATED=<file>: when the file appears it is removed and the next generated
-    // frame is saved as a screenshot ("hud" file name, without the overlay): checking frame
-    // generation (BB_FRAME_DUMP_TRIGGER saves the game frames).
-    static const char* shot_generated = std::getenv("SOTC_SHOT_GENERATED");
-    std::optional<ScreenshotReadback> pending_screenshot;
-    if ((shot_generated && std::remove(shot_generated) == 0) || TakeSequenceShot()) {
-        auto& readback = pending_screenshot.emplace(
-            instance, ScreenshotKind::WithOverlays,
-            BuildScreenshotPaths(ScreenshotKind::WithOverlays, 1), extent.width, extent.height,
-            swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
-                               : swapchain.GetSurfaceFormat().format,
-            swapchain.GetHDR());
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                               vk::PipelineStageFlagBits::eTransfer,
-                               vk::DependencyFlagBits::eByRegion, {}, {},
-                               swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
-                                                 vk::AccessFlagBits::eTransferRead,
-                                                 vk::ImageLayout::eTransferDstOptimal,
-                                                 vk::ImageLayout::eTransferSrcOptimal));
-        CopyImageToReadback(cmdbuf, swapchain_image, vk::ImageLayout::eTransferSrcOptimal,
-                            readback);
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                               vk::PipelineStageFlagBits::eTransfer,
-                               vk::DependencyFlagBits::eByRegion, {}, {},
-                               swapchain_barrier(vk::AccessFlagBits::eTransferRead,
-                                                 vk::AccessFlagBits::eTransferWrite,
-                                                 vk::ImageLayout::eTransferSrcOptimal,
-                                                 vk::ImageLayout::eTransferDstOptimal));
-        scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
-            SavePendingScreenshot(deferred_screenshot.value());
-        });
-    }
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-                           vk::PipelineStageFlagBits::eAllCommands,
-                           vk::DependencyFlagBits::eByRegion, {}, {},
-                           swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
-                                             vk::AccessFlagBits::eColorAttachmentWrite,
-                                             vk::ImageLayout::eTransferDstOptimal,
-                                             vk::ImageLayout::eColorAttachmentOptimal));
-    BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent, false);
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                           vk::PipelineStageFlagBits::eAllCommands,
-                           vk::DependencyFlagBits::eByRegion, {}, {},
-                           swapchain_barrier(vk::AccessFlagBits::eColorAttachmentWrite,
-                                             vk::AccessFlagBits::eNone,
-                                             vk::ImageLayout::eColorAttachmentOptimal,
-                                             vk::ImageLayout::ePresentSrcKHR));
-    info.AddWait(swapchain.GetImageAcquiredSemaphore());
-    info.AddSignal(swapchain.GetPresentReadySemaphore());
-    submit();
-    // sotc: same locking as the frame-path present above (dedicated present queue).
-    const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-    std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
-    if (!instance.HasDedicatedPresentQueue()) {
-        submit_lock.lock();
-    }
-    std::scoped_lock present_lock{present_queue_mutex};
-    const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
-    const bool presented = swapchain.Present();
-    if (SotcStats::kTickWatch) {
-        const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
-        SotcStats::PushTick(4, 1,
-                            (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
-                                static_cast<u64>((tw2 - tw1) / 1000));
-    }
-    if (!presented) {
-        // Recreate() waits for the whole device to go idle: no submits may race it.
-        if (!submit_lock.owns_lock()) {
-            submit_lock.lock();
-        }
-        Dlssg::Suspend();
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
-    }
-    FsrFg::NotePresent();
-    return true;
 }
 
 Frame* Presenter::GetRenderFrame() {
-    const SotcStats::SplitTimer frame_split{SotcStats::SplitWaitFrame};
     // Wait for free presentation frames
     Frame* frame;
     {
@@ -1717,20 +893,22 @@ Frame* Presenter::GetRenderFrame() {
         frame->is_hdr != swapchain.GetHDR()) {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
-    frame->hudless = nullptr;
 
     return frame;
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {
+    if (width <= 0 || height <= 0) {
+        return; // no surface (minimized window): keep the last frame size
+    }
     const float ratio = (float)width / (float)height;
 
     expected_frame_height = height;
     expected_frame_width = width;
     if (ratio > expected_ratio) {
-        expected_frame_width = static_cast<s32>(std::lround(height * expected_ratio));
+        expected_frame_width = static_cast<s32>(height * expected_ratio);
     } else {
-        expected_frame_height = static_cast<s32>(std::lround(width / expected_ratio));
+        expected_frame_height = static_cast<s32>(width / expected_ratio);
     }
 }
 

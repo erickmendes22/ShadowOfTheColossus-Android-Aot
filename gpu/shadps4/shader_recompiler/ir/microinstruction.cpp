@@ -39,7 +39,6 @@ bool Inst::MayHaveSideEffects() const noexcept {
     switch (op) {
     case Opcode::Barrier:
     case Opcode::WorkgroupMemoryBarrier:
-    case Opcode::SubgroupBarrier:
     case Opcode::DeviceMemoryBarrier:
     case Opcode::ConditionRef:
     case Opcode::Prologue:

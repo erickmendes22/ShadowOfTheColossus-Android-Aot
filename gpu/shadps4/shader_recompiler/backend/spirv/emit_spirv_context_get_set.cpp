@@ -47,20 +47,18 @@ static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribu
 }
 
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
-    const Id ud_reg{ctx.EmitFlatbufferLoad(ctx.ConstU32(static_cast<u32>(reg)))};
+    const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
+    const u32 half = PushData::UdRegsIndex + (index >> 2);
+    const Id ud_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
+                                      ctx.push_data_block, ctx.ConstU32(half),
+                                      ctx.ConstU32(index & 3))};
+    const Id ud_reg{ctx.OpLoad(ctx.U32[1], ud_ptr)};
     ctx.Name(ud_reg, fmt::format("ud_{}", u32(reg)));
     return ud_reg;
 }
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
-    if (flatbuf_off_dw & ReadConstDynamicWindowFlag) {
-        // Runtime index into a window the SRT walker copied into the flattened buffer.
-        const u32 window = flatbuf_off_dw & ~ReadConstDynamicWindowFlag;
-        const Id index =
-            ctx.OpUMin(ctx.U32[1], offset, ctx.ConstU32(ReadConstDynamicWindowDwords - 1));
-        return ctx.EmitFlatbufferLoad(ctx.OpIAdd(ctx.U32[1], ctx.ConstU32(window), index));
-    }
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
@@ -120,9 +118,24 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.gl_in, ctx.ConstU32(index),
                                             ctx.ConstU32(0U), ctx.ConstU32(comp)));
-    case IR::Attribute::FragCoord:
-        return ctx.OpLoad(ctx.F32[1],
-                          ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+    case IR::Attribute::FragCoord: {
+        const Id value = ctx.OpLoad(ctx.F32[1],
+            ctx.OpAccessChain(ctx.input_f32, ctx.frag_coord, ctx.ConstU32(comp)));
+        if (comp >= 2) return value;
+        // Guest shaders still address native-sized textures and constants. Convert the
+        // reduced framebuffer's pixel coordinates back to that logical coordinate space.
+        const Id packed = ctx.OpLoad(ctx.U32[1], ctx.OpAccessChain(
+            ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
+            ctx.push_data_block, ctx.ConstU32(PushData::SceneSizeIndex)));
+        const Id dimension = comp == 0
+            ? ctx.OpBitwiseAnd(ctx.U32[1], packed, ctx.ConstU32(65535u))
+            : ctx.OpShiftRightLogical(ctx.U32[1], packed, ctx.ConstU32(16u));
+        const Id native = ctx.ConstU32(comp == 0 ? 1920u : 1080u);
+        const Id safe = ctx.OpSelect(ctx.U32[1],
+            ctx.OpIEqual(ctx.U1[1], dimension, ctx.u32_zero_value), native, dimension);
+        return ctx.OpFMul(ctx.F32[1], value, ctx.OpFDiv(ctx.F32[1],
+            ctx.OpConvertUToF(ctx.F32[1], native), ctx.OpConvertUToF(ctx.F32[1], safe)));
+    }
     case IR::Attribute::TessellationEvaluationPointU:
         return ctx.OpLoad(ctx.F32[1],
                           ctx.OpAccessChain(ctx.input_f32, ctx.tess_coord, ctx.u32_zero_value));
@@ -290,21 +303,6 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
         const auto& info{ctx.frag_outputs.at(index)};
-        if (element < 3 && ctx.runtime_info.hw.fs.color_buffers[index].blend_self_scale) {
-            // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
-            value = ctx.OpFMul(ctx.F32[1], value, value);
-        }
-        // sotc: SOTC_NAN_GUARD=1 (test, AMD GCN legacy driver: footstep dust drawn as a flashing
-        // white ball): a colour output that is NaN or infinite is written as 0. Shaders are
-        // translated again only after "Clear shader cache".
-        static const bool nan_guard = [] {
-            const char* v = std::getenv("SOTC_NAN_GUARD");
-            return v && v[0] == '1';
-        }();
-        if (nan_guard && !OutputAttrComponentType(ctx, attr).second) {
-            const Id bad = ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], value), ctx.OpIsInf(ctx.U1[1], value));
-            value = ctx.OpSelect(ctx.F32[1], bad, ctx.ConstF32(0.f), value);
-        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {

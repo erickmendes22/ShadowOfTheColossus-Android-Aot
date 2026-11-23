@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include "common/arch.h"
 #include "common/signal_context.h"
 
@@ -26,28 +30,38 @@ void* GetRip(void* ctx) {
     return (void*)((ucontext_t*)ctx)->uc_mcontext.mc_rip;
 #elif defined(ARCH_X86_64)
     return (void*)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP];
+#elif defined(ARCH_ARM64)
+    return (void*)((ucontext_t*)ctx)->uc_mcontext.pc;
 #else
 #error "Unsupported architecture"
 #endif
 }
 
-void SkipLoadAsZero(void* ctx, u8 gpr_index, u64 length) {
-#if defined(_WIN32)
-    // CONTEXT keeps Rax..R15 in x86 encoding order.
-    auto* context = ((EXCEPTION_POINTERS*)ctx)->ContextRecord;
-    (&context->Rax)[gpr_index] = 0;
-    context->Rip += length;
-#elif defined(ARCH_X86_64) && !defined(__APPLE__) && !defined(__FreeBSD__)
-    static constexpr int regs[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP,
-                                     REG_RSI, REG_RDI, REG_R8,  REG_R9,  REG_R10, REG_R11,
-                                     REG_R12, REG_R13, REG_R14, REG_R15};
-    auto& gregs = ((ucontext_t*)ctx)->uc_mcontext.gregs;
-    gregs[regs[gpr_index & 15]] = 0;
-    gregs[REG_RIP] += length;
-#else
-#error "Unsupported architecture"
-#endif
+#if defined(__linux__) && defined(ARCH_ARM64)
+// gow3: the kernel stores the data abort's ESR in a record of the signal frame's reserved area
+// (struct esr_context of <asm/sigcontext.h>, which conflicts with glibc's signal headers).
+static uint64_t FaultEsr(void* ctx) {
+    struct Record {
+        uint32_t magic, size;
+        uint64_t esr;
+    };
+    constexpr uint32_t EsrMagic = 0x45535201;
+    const auto& mcontext = ((ucontext_t*)ctx)->uc_mcontext;
+    const auto* reserved = reinterpret_cast<const unsigned char*>(mcontext.__reserved);
+    for (size_t offset = 0; offset + 8 <= sizeof(mcontext.__reserved);) {
+        Record record;
+        std::memcpy(&record, reserved + offset, std::min(sizeof(record), sizeof(mcontext.__reserved) - offset));
+        if (record.magic == 0 || record.size == 0) {
+            break;
+        }
+        if (record.magic == EsrMagic) {
+            return record.esr;
+        }
+        offset += record.size;
+    }
+    return 0;
 }
+#endif
 
 bool IsWriteError(void* ctx) {
 #if defined(_WIN32)
@@ -60,6 +74,8 @@ bool IsWriteError(void* ctx) {
     return ((ucontext_t*)ctx)->uc_mcontext.mc_err & 0x2;
 #elif defined(ARCH_X86_64)
     return ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_ERR] & 0x2;
+#elif defined(__linux__) && defined(ARCH_ARM64)
+    return FaultEsr(ctx) & 0x40; // ESR_ELx.WnR
 #else
 #error "Unsupported architecture"
 #endif

@@ -356,9 +356,7 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            // sotc: a sharp read from memory the game has not filled yet (a cold shader cache
-            // translates shaders early) can hold any format: it must not end the game.
-            return NumberConversion::None;
+            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
         }
     }
     default:

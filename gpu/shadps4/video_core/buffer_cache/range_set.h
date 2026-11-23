@@ -29,36 +29,21 @@ struct RangeSet {
     explicit RangeSet() = default;
     ~RangeSet() = default;
 
-    /// sotc: returns whether the set grew (false: already contained).
-    bool Add(VAddr base_address, size_t size) {
+    void Add(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
-        // sotc: draws mark the same written buffers again and again; a lookup costs far less
-        // than an insertion that changes nothing.
-        if (const auto it = m_ranges_set.find(interval);
-            it != m_ranges_set.end() && boost::icl::contains(*it, interval)) {
-            return false;
-        }
         m_ranges_set.add(interval);
-        return true;
     }
 
     void Subtract(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
-        // sotc: BbToggle::WriteMarkMemo: a counter of removals; while it is unchanged, what Add
-        // put into the set is still there.
-        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         m_ranges_set.subtract(interval);
     }
 
     void Clear() {
-        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         m_ranges_set.clear();
     }
-
-    /// sotc: removals (Subtract, Clear) so far; read with __atomic_load_n.
-    u64 generation{};
 
     bool Contains(VAddr base_address, size_t size) const {
         const VAddr end_address = base_address + size;

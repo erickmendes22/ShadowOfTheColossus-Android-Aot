@@ -82,15 +82,8 @@ struct UniqueBuffer {
 
 struct Buffer {
     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
-                    MemoryType mem_type, std::string_view debug_name = "");
-
-    /// sotc: wraps a buffer owned elsewhere (an imported chunk of the game's memory,
-    /// SotcGuestMemory). Never destroyed: the owner keeps the handle.
-    Buffer(vk::Device device, vk::Buffer external, u64 size_bytes_)
-        : size_bytes{size_bytes_}, is_coherent{true}, mem_type{MemoryType::HostUncached},
-          buffer{device, nullptr} {
-        buffer.buffer = external;
-    }
+                    MemoryType mem_type, std::string_view debug_name = "",
+                    vk::BufferUsageFlags usage = AllFlags);
 
     Buffer& operator=(const Buffer&) = delete;
     Buffer(const Buffer&) = delete;
@@ -155,12 +148,6 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
-    /// sotc: incremented when the ring wraps and starts overwriting earlier regions
-    /// (SOTC_FAST_BIND reuses descriptors that point into this buffer).
-    [[nodiscard]] u64 WrapGeneration() const noexcept {
-        return wrap_generation;
-    }
-
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -195,7 +182,6 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
-    u64 wrap_generation{};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

@@ -1,22 +1,139 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <cstdlib>
-#include <cstring>
-#include <vector>
-#include "core/memory.h"
 #include "shader_recompiler/info.h"
-#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/host_shaders/buffer_multi_copy_comp.h"
+#include "gow3_toggles.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+// gow3: the copy shader runs ~57 times per frame with ~1024 small ranges each. As one
+// vkCmdCopyBuffer with that many regions it cost ~37 ns of GPU time per range (~2.1 ms per
+// frame) plus the recording; buffer_multi_copy.comp copies all ranges in one dispatch.
+static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
+                      const VideoCore::Buffer* dst, std::span<const vk::BufferCopy> copies) {
+    if (copies.size() < 8 || Gow3Toggle::Disabled(Gow3Toggle::MultiCopyShader)) {
+        return false;
+    }
+    u64 src_min = ~0ull, src_max = 0, dst_min = ~0ull, dst_max = 0;
+    for (const auto& copy : copies) {
+        if ((copy.srcOffset | copy.dstOffset | copy.size) & 3) {
+            return false; // dword copies only
+        }
+        src_min = std::min(src_min, copy.srcOffset);
+        src_max = std::max(src_max, copy.srcOffset + copy.size);
+        dst_min = std::min(dst_min, copy.dstOffset);
+        dst_max = std::max(dst_max, copy.dstOffset + copy.size);
+    }
+    auto& runtime = rasterizer.GetRuntime();
+    auto& scheduler = runtime.GetScheduler();
+    const auto& instance = runtime.GetInstance();
+    const u64 align = instance.StorageMinAlignment();
+    src_min = Common::AlignDown(src_min, align);
+    dst_min = Common::AlignDown(dst_min, align);
+
+    struct Pipeline {
+        vk::UniqueDescriptorSetLayout set_layout;
+        vk::UniquePipelineLayout layout;
+        vk::UniquePipeline pipeline;
+    };
+    static Pipeline pipe = [&] {
+        const auto device = instance.GetDevice();
+        Pipeline p;
+        std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+        for (u32 i = 0; i < 3; ++i) {
+            bindings[i] = {.binding = i,
+                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                           .descriptorCount = 1,
+                           .stageFlags = vk::ShaderStageFlagBits::eCompute};
+        }
+        p.set_layout = Check(device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                          .offset = 0,
+                                          .size = sizeof(u32)};
+        p.layout = Check(device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = &*p.set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        }));
+        const auto module = CompileSPV(BUFFER_MULTI_COPY_COMP, device);
+        p.pipeline = Check(device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                              .module = module,
+                              .pName = "main"},
+                    .layout = *p.layout,
+                }));
+        device.destroyShaderModule(module);
+        return p;
+    }();
+
+    // The region table goes into the stream buffer (host writes, visible at submission).
+    thread_local std::vector<u32> regions;
+    regions.resize(copies.size() * 4);
+    for (size_t i = 0; i < copies.size(); ++i) {
+        regions[i * 4 + 0] = static_cast<u32>((copies[i].srcOffset - src_min) / 4);
+        regions[i * 4 + 1] = static_cast<u32>((copies[i].dstOffset - dst_min) / 4);
+        regions[i * 4 + 2] = static_cast<u32>(copies[i].size / 4);
+        regions[i * 4 + 3] = 0;
+    }
+    auto& stream = rasterizer.GetBufferCache().GetStreamBuffer();
+    const u64 table_size = regions.size() * sizeof(u32);
+    const u64 table_offset = stream.Copy(regions.data(), table_size, align);
+
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->Mark(0xC0B1ull, [] { return std::string{"copy shader HLE: barrier + dispatch"}; });
+    }
+    scheduler.EndRendering();
+    const u64 src_size = src_max - src_min, dst_size = dst_max - dst_min;
+    if (runtime.IsBufferAccessed(src, src_min, src_size) ||
+        runtime.IsBufferAccessed(dst, dst_min, dst_size, true)) {
+        runtime.FlushBarriers();
+    }
+    const u32 count = static_cast<u32>(copies.size());
+    scheduler.Record([src = src->Handle(), dst = dst->Handle(), table = stream.Handle(), src_min,
+                      src_size, dst_min, dst_size, table_offset, table_size,
+                      count](vk::CommandBuffer cmdbuf) {
+        const std::array<vk::DescriptorBufferInfo, 3> infos{{
+            {src, src_min, src_size},
+            {dst, dst_min, dst_size},
+            {table, table_offset, table_size},
+        }};
+        std::array<vk::WriteDescriptorSet, 3> writes{};
+        for (u32 i = 0; i < 3; ++i) {
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eStorageBuffer,
+                         .pBufferInfo = &infos[i]};
+        }
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipe.pipeline);
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipe.layout, 0, writes);
+        cmdbuf.pushConstants(*pipe.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(count),
+                             &count);
+        cmdbuf.dispatch(count, 1, 1);
+    });
+    runtime.AccessBuffer(src, src_min, src_size, vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderRead);
+    runtime.AccessBuffer(dst, dst_min, dst_size, vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderWrite);
+    return true;
+}
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
@@ -51,7 +168,17 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
     }
 
-    static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
+    // gow3: 64 KiB instead of 64 MiB. The copies are a few KiB spread over up to 57 MiB, and
+    // each batch synchronizes (uploads, marks GPU-modified) its whole range: GPU time of the copy
+    // shader 1.5 -> 0.6 ms/frame, GPU busy 85% -> 77%, frame rate no lower.
+    // GOW3_COPY_MERGE_KB overrides it.
+    static const vk::DeviceSize MaxDistanceForMerge = [] {
+        const char* env = std::getenv("GOW3_COPY_MERGE_KB");
+        return env ? vk::DeviceSize(std::strtoull(env, nullptr, 10)) * 1024 : vk::DeviceSize(64_KB);
+    }();
+    static thread_local std::vector<VideoCore::CopyRange> source_ranges, destination_ranges;
+    source_ranges.reserve(copies.size());
+    destination_ranges.reserve(copies.size());
     u32 batch_start = 0;
     u32 batch_end = 0;
 
@@ -85,24 +212,20 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             dst_offset_max = new_dst_offset_max;
         }
 
-        // Obtain buffers for the total source and destination ranges.
-        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
-            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
-        // sotc: the merged range is obtained for reading only and just the copied pieces are
-        // marked GPU-written. Marking the whole range made readbacks bring back the gaps between
-        // the copies from the GPU's stale copy, over what the CPU wrote there since (the game
-        // moves streamed textures with this shader; its allocator keeps free-list nodes in the
-        // gaps: heap corruption). SOTC_COPY_HLE_WHOLE=1 marks the whole range (as before).
-        static const bool mark_whole = std::getenv("SOTC_COPY_HLE_WHOLE") != nullptr;
-        const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
-            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min,
-            mark_whole);
-        if (!mark_whole) {
-            for (u32 i = batch_start; i < batch_end; ++i) {
-                buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + copies[i].dstOffset,
-                                          static_cast<u32>(copies[i].size), true);
-            }
+        // Preserve the 64 KiB grouping and MultiCopy shader, but upload/mark only the
+        // intervals actually copied instead of every byte between the batch bounds.
+        source_ranges.clear();
+        destination_ranges.clear();
+        for (const auto& region : std::span{copies}.subspan(batch_start, batch_end - batch_start)) {
+            source_ranges.emplace_back(u32(region.srcOffset - src_offset_min), u32(region.size));
+            destination_ranges.emplace_back(u32(region.dstOffset - dst_offset_min), u32(region.size));
         }
+        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBufferRanges(
+            src_buf_sharp.base_address + src_offset_min, u32(src_offset_max - src_offset_min),
+            source_ranges, false);
+        const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBufferRanges(
+            dst_buf_sharp.base_address + dst_offset_min, u32(dst_offset_max - dst_offset_min),
+            destination_ranges, true);
 
         // Apply found buffer base.
         const auto vk_copies = std::span{copies}.subspan(batch_start, batch_end - batch_start);
@@ -114,237 +237,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         // Execute buffer copies.
         LOG_TRACE(Render_Vulkan, "HLE buffer copy: src_size = {}, dst_size = {}",
                   src_offset_max - src_offset_min, dst_offset_max - dst_offset_min);
-        runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
+        if (!MultiCopy(rasterizer, src_buf, dst_buf, vk_copies)) {
+            runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
+        }
         batch_start = batch_end;
     }
 
-    return true;
-}
-
-// sotc: Shadow of the Colossus fills small tables every frame with a compute shader:
-// dst[i] = src[i % m] (32-bit elements) for i < min(n, user SGPR6, the dispatched threads),
-// n and m read from the constant buffer. The command processor then reads those tables (SRT
-// walker), and with the shader on the GPU every read waited for the GPU (readback): about a
-// third of all readbacks in the open world. With a CPU-written source the fill is done here,
-// in stream order, so the tables stay CPU-side. SOTC_FILL_HLE=0 runs the shader on the GPU.
-static constexpr u64 REPLICATE_SHADER_HASH = 0x50784801;
-
-// sotc: SOTC_FILL_HLE_PAGES (default on, 0 replaces whole tables): a changed table usually
-// differs in a few of its 4 KiB pages (at the Shrine 1.5 of the 8.4 MB of changed tables per
-// frame). Only the pages that differ are replaced, so only they are invalidated, marked
-// CPU-written and uploaded again. The caller checked that no byte of the table is GPU-written,
-// so `current` (the backing) is what the guest sees, and the unchanged pages already hold the
-// result: the same state as a table that did not change at all. If a replace is refused (other
-// GPU-written bytes on a page), false runs the shader on the GPU, which writes the whole table.
-// The bytes a fill writes: `direct` (contiguous), or `pattern` repeated with `period` (the buffer
-// holds period + 4 KiB bytes, so At(o) is valid for the rest of o's 4 KiB page).
-struct TableData {
-    const u8* direct = nullptr;
-    const u8* pattern = nullptr;
-    u64 period = 0;
-    const u8* At(u64 offset) const {
-        return direct ? direct + offset : pattern + offset % period;
-    }
-    const u8* Run(u64 offset, u64 size) const { // contiguous bytes of [offset, offset + size)
-        if (direct) {
-            return direct + offset;
-        }
-        static std::vector<u8> run;
-        run.resize(size);
-        for (u64 done = 0; done < size;) {
-            const u64 chunk = std::min<u64>(size - done, 4096 - (offset + done) % 4096);
-            std::memcpy(run.data() + done, At(offset + done), chunk);
-            done += chunk;
-        }
-        return run.data();
-    }
-};
-
-static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
-                                const TableData& data, u64 size) {
-    auto& buffer_cache = rasterizer.GetBufferCache();
-    VAddr run_start = 0;
-    VAddr run_end = 0; // the pending run of changed pages, empty while run_end == run_start
-    const auto flush = [&] {
-        if (run_end == run_start) {
-            return true;
-        }
-        const u64 offset = run_start - address;
-        const u64 run_size = run_end - run_start;
-        run_start = run_end;
-        if (!buffer_cache.TryWriteThroughFromCpu(address + offset, data.Run(offset, run_size),
-                                                 run_size)) {
-            return false;
-        }
-        if (SotcStats::kCmdStats) {
-            SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
-        }
-        rasterizer.GetTextureCache().InvalidateMemory(address + offset, run_size);
-        return true;
-    };
-    const VAddr end = address + size;
-    for (VAddr lo = address; lo < end;) {
-        const VAddr hi = std::min<VAddr>((lo & ~VAddr{4095}) + 4096, end);
-        if (std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0) {
-            if (run_end != lo && !flush()) {
-                return false;
-            }
-            if (run_end == run_start) {
-                run_start = lo;
-            }
-            run_end = hi;
-        }
-        lo = hi;
-    }
-    return flush();
-}
-
-// The whole table: the pattern of src_count elements, repeated (no division per element).
-static std::vector<u32> data;
-static void BuildTable(const u32* source, u64 src_count, u64 count) {
-    if (data.size() < count) {
-        data.resize(count); // grow only: data[0, count) is all that is read
-    }
-    std::memcpy(data.data(), source, src_count * 4);
-    for (u64 done = src_count; done < count;) {
-        const u64 chunk = std::min(done, count - done);
-        std::memcpy(data.data() + done, data.data(), chunk * 4);
-        done += chunk;
-    }
-}
-
-static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
-                                      const AmdGpu::ComputeProgram& cs_program,
-                                      Rasterizer& rasterizer) {
-    static const bool enabled = [] {
-        const char* v = std::getenv("SOTC_FILL_HLE");
-        return !v || v[0] != '0';
-    }();
-    if (!enabled || info.buffers.size() < 3 || cs_program.dim_y > 1 || cs_program.dim_z > 1) {
-        return false;
-    }
-    auto& buffer_cache = rasterizer.GetBufferCache();
-    const auto ctl = info.buffers[0].GetSharp(info);
-    const auto src = info.buffers[1].GetSharp(info);
-    const auto dst = info.buffers[2].GetSharp(info);
-    const u32 src_stride = src.GetStride() ? src.GetStride() : 4;
-    const u32 dst_stride = dst.GetStride() ? dst.GetStride() : 4;
-    if (src_stride != 4 || dst_stride != 4 || ctl.GetSize() < 8) {
-        return false;
-    }
-    if (buffer_cache.IsRegionGpuModified(ctl.base_address, 8)) {
-        return false;
-    }
-    const u32* control = std::bit_cast<const u32*>(ctl.base_address);
-    const u32 n = control[0];
-    const u32 m = control[1];
-    const u64 threads = u64(cs_program.dim_x) * 64;
-    const u64 count = std::min<u64>({n, cs_program.user_data[6], threads, dst.GetSize() / 4});
-    if (count == 0) {
-        return true;
-    }
-    const u64 src_count = m ? std::min<u64>(m, count) : count;
-    if (src_count * 4 > src.GetSize() ||
-        buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
-        return false;
-    }
-    const u32* source = std::bit_cast<const u32*>(src.base_address);
-    const VAddr address = dst.base_address;
-    // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
-    // written (so its pages are not read-protected and the backing is authoritative) and it
-    // already holds this data, the result of the replace below is already in place: skip its
-    // tracking updates, unprotects and invalidations (~9% of the GPU command thread).
-    // Tables larger than one clean page (or straddling one) are compared through the backing
-    // view of their mapping run, under the same condition (no byte GPU-written: the backing is
-    // what the guest sees). SOTC_FILL_HLE_FAST=0 keeps the one-page check only.
-    static const bool fast = [] {
-        const char* v = std::getenv("SOTC_FILL_HLE_FAST");
-        return !v || v[0] != '0';
-    }();
-    static const bool page_replace = [] {
-        const char* v = std::getenv("SOTC_FILL_HLE_PAGES");
-        return !v || v[0] != '0';
-    }();
-    if (!SotcStats::OptOff() && !buffer_cache.IsRegionGpuModified(address, count * 4)) {
-        bool same = false;
-        VAddr run_start = 0;
-        u64 run_size = 0;
-        const u8* run = fast ? Core::Memory::Instance()->GetBackingRun(address, &run_start, &run_size)
-                             : nullptr;
-        const bool in_run =
-            run && run_size && address >= run_start && address + count * 4 <= run_start + run_size;
-        // sotc: with page replaces, the table is compared page by page against its source (a
-        // copy: the source itself; a repeated pattern of up to 64 KiB: one page past one
-        // period of it), without building it first: ~15 MB of copying per frame at the Shrine.
-        const u64 period = src_count * 4;
-        const bool overlap = src.base_address < address + count * 4 &&
-                             address < src.base_address + period;
-        if (in_run && page_replace && !overlap && (src_count == count || period <= 64_KB)) {
-            TableData table{};
-            if (src_count == count) {
-                table.direct = reinterpret_cast<const u8*>(source);
-            } else {
-                static std::vector<u8> pattern;
-                pattern.resize(period + 4096);
-                std::memcpy(pattern.data(), source, period);
-                for (u64 done = period; done < pattern.size();) {
-                    const u64 chunk = std::min<u64>(done, pattern.size() - done);
-                    std::memcpy(pattern.data() + done, pattern.data(), chunk);
-                    done += chunk;
-                }
-                table.pattern = pattern.data();
-                table.period = period;
-            }
-            return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
-                                       count * 4);
-        }
-        BuildTable(source, src_count, count);
-        if (in_run) {
-            const u8* current = run + (address - run_start);
-            same = std::memcmp(current, data.data(), count * 4) == 0;
-            if (!same && page_replace) {
-                return ReplaceChangedPages(rasterizer, address, current,
-                                           TableData{reinterpret_cast<const u8*>(data.data())},
-                                           count * 4);
-            }
-        } else {
-            static std::vector<u32> current;
-            if (current.size() < count) {
-                current.resize(count);
-            }
-            same = buffer_cache.ReadClean(address, current.data(), static_cast<u32>(count * 4)) &&
-                   std::memcmp(current.data(), data.data(), count * 4) == 0;
-        }
-        if (same) {
-            return true;
-        }
-    } else {
-        BuildTable(source, src_count, count);
-    }
-    // sotc: SOTC_FILL_HLE_GPU (default on, =0 off; HiddenUserHere, upstream PR #339). A destination
-    // resident in one arena gets the table from the GPU (a fill, or a seed doubled by copies)
-    // instead of being marked CPU-written, which the next DMA sweep or bind copied through staging
-    // again (one 8 MiB table, ~33 times per area load). The backing is still written.
-    static const bool fill_gpu = [] {
-        const char* v = std::getenv("SOTC_FILL_HLE_GPU");
-        return !(v && v[0] == '0');
-    }();
-    if (fill_gpu) {
-        if (!buffer_cache.TryFillThroughFromCpu(address, data.data(), count * 4, src_count * 4)) {
-            return false;
-        }
-        if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
-        // The guest bytes changed: the reused-bind epoch moves as with InvalidateMemory, and
-        // textures over the range are invalidated; the arena already holds the table.
-        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed);
-        rasterizer.GetTextureCache().InvalidateMemory(address, count * 4);
-        return true;
-    }
-    if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
-        return false;
-    }
-    if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
-    rasterizer.InvalidateMemory(address, count * 4);
     return true;
 }
 
@@ -353,8 +251,6 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
-    case REPLICATE_SHADER_HASH:
-        return ExecuteReplicateShaderHLE(info, cs_program, rasterizer);
     default:
         return false;
     }

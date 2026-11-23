@@ -5,7 +5,6 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
-#include "runtime_event.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,7 +13,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -24,7 +22,7 @@ typedef struct _stat64 HostStat;
 #define host_stat(path,s) _stat64(path,s)
 #define host_fstat(fd,s) _fstat64(fd,s)
 #define host_lseek _lseeki64
-#define O_DIRECTORY 0x40000000 /* bbport marker, removed before _open */
+#define O_DIRECTORY 0x40000000 /* gow3 marker, removed before _open */
 #else
 typedef struct stat HostStat;
 #define host_stat(path,s) stat(path,s)
@@ -55,16 +53,6 @@ static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
-/* sotc: time guest threads spend in host reads (SOTC_FPS frame report, videoout/driver.cpp). */
-static uint64_t read_ns;
-static uint64_t read_clock_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
-}
-#define TIMED_READ(expr) ({ uint64_t t0_=read_clock_ns(); ssize_t r_=(expr); \
-    __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); r_; })
-uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0,__ATOMIC_RELAXED); }
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
 int runtime_file_mount(const char *guest,const char *host) {
@@ -88,27 +76,12 @@ void runtime_file_unmount(const char *guest) {
     pthread_mutex_unlock(&lock);
 }
 static char user_root[512]="user";
-/* sotc: the game update, as shadPS4 uses it: files of <app0>-UPDATE or <app0>-patch (or
- * SOTC_UPDATE_DIR) take the place of the base game's under /app0 and /hostapp. */
-static char update_root[512];
-const char *runtime_file_update_dir(void) { return update_root; }
 const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
     char path[600];
     snprintf(user_root,sizeof(user_root),"%s",user);
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
-    const char *update=getenv("SOTC_UPDATE_DIR");
-    if (update && *update) snprintf(update_root,sizeof(update_root),"%s",update);
-    else {
-        static const char *const suffixes[]={"-UPDATE","-patch"};
-        for (int i=0;i<2 && !update_root[0];++i) {
-            snprintf(path,sizeof(path),"%s%s",app0,suffixes[i]);
-            HostStat st;
-            if (!host_stat(path,&st) && S_ISDIR(st.st_mode)) snprintf(update_root,sizeof(update_root),"%s",path);
-        }
-    }
-    if (update_root[0]) printf("Runtime: game update overlaid from %s\n",update_root);
     const char *writable[]={"temp0","download0","data"};
     mkdir(user,0755);
     for (int i=0;i<3;++i) {
@@ -135,14 +108,7 @@ static int translate(const char *guest,char *out,size_t size) {
     int result=0;
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
-    const int game_path=m && (!strcmp(m->guest,"/app0") || !strcmp(m->guest,"/hostapp"));
     pthread_mutex_unlock(&lock);
-    if (!result && game_path && update_root[0] && buffer[best]) {
-        char updated[1100];
-        HostStat st;
-        if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated) &&
-            !host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
-    }
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
 }
@@ -223,8 +189,8 @@ static File *get(int fd) {
     if (fd<3 || fd>=MAX_FILES || !files[fd].used) return NULL;
     return &files[fd];
 }
-/* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
-static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
+/* GOW3_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
+static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("GOW3_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
 /* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
@@ -233,37 +199,11 @@ static int game_path(const char *p) {
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
-/* sotc: SOTC_DEBUG_MENU=1 (launcher option): the game reads gameversion.txt with +RetailBuild=0,
- * which turns on Bluepoint's debug menu (upper left of the touchpad, F6 in the port). The copy is
- * written to the user folder; the game's own file is left as it is. */
-static void debug_gameversion(const char *guest, char *path, size_t size) {
-    const char *on=getenv("SOTC_DEBUG_MENU");
-    const size_t n=strlen(guest);
-    if (!on || on[0]!='1' || n<15 || strcmp(guest+n-15,"gameversion.txt")) return;
-    FILE *in=fopen(path,"rb");
-    if (!in) return;
-    char text[4096];
-    const size_t len=fread(text,1,sizeof(text)-1,in);
-    fclose(in);
-    text[len]=0;
-    char *flag=strstr(text,"+RetailBuild=1");
-    if (flag) flag[13]='0';
-    const char *dir=getenv("BB_GPU_USER_DIR");
-    char copy[1024];
-    snprintf(copy,sizeof(copy),"%s/debug_gameversion.txt",dir && dir[0] ? dir : ".");
-    FILE *out=fopen(copy,"wb");
-    if (!out) return;
-    fwrite(text,1,len,out);
-    fclose(out);
-    snprintf(path,size,"%s",copy);
-    fprintf(stderr,"Runtime: debug menu on (+RetailBuild=0 from %s)\n",copy);
-}
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
-    debug_gameversion(guest,path,sizeof(path));
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;
@@ -281,10 +221,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         host=open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
         if (host<0) {
             e=errno;
-            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found %s\n",guest,getenv("SOTC_FILE_DEBUG") ? path : ""); }
-            /* sotc: a save that cannot be written (read-only folder, Controlled Folder Access...) */
-            else if (!strncmp(guest,"/savedata",9))
-                fprintf(stderr,"Runtime: cannot open save file %s (%s): errno %d\n",guest,path,e);
+            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
@@ -309,7 +246,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     ++opens;
     pthread_mutex_unlock(&lock);
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
-    const char *mod_trace=getenv("BB_MOD_TRACE"), *mod_root=getenv("BB_MODS_DIR");
+    const char *mod_trace=getenv("GOW3_MOD_TRACE"), *mod_root=getenv("GOW3_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
         char actual[PATH_MAX],root[PATH_MAX];
         static unsigned traced;
@@ -357,37 +294,11 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
-/* sotc: reads land in a bounce buffer and are copied into guest memory in user mode. Touching
- * the pages first is not enough: the GPU tracker may protect a page again (after an upload)
- * before the kernel's copy, which then fails with EFAULT or, worse, lands without the tracker
- * noticing, and the GPU keeps a stale copy (Shadow of the Colossus streams shaders, textures
- * and descriptors straight from the pak files into GPU-read memory while loading). */
-#define BOUNCE_LIMIT (UINT64_C(64) << 20)
-static _Thread_local unsigned char *bounce;
-static _Thread_local uint64_t bounce_size;
-static unsigned char *bounce_buffer(uint64_t size) {
-    if (size>BOUNCE_LIMIT) return NULL;
-    if (bounce_size<size) {
-        uint64_t want=size<UINT64_C(1)<<20 ? UINT64_C(1)<<20 : size;
-        unsigned char *next=realloc(bounce,want);
-        if (!next) return NULL;
-        bounce=next; bounce_size=want;
-    }
-    return bounce;
-}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    unsigned char *staging=bounce_buffer(size);
-    if (staging) {
-        ssize_t n=TIMED_READ(host_read(h,staging,size));
-        if (n<0) return -errno;
-        memcpy(buffer,staging,(size_t)n);
-        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-        return n;
-    }
     touch_for_write(buffer,size);
-    ssize_t n=TIMED_READ(host_read(h,buffer,size));
+    ssize_t n=host_read(h,buffer,size);
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -395,44 +306,15 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    unsigned char *staging=bounce_buffer(size);
-    if (staging) {
-        ssize_t n=TIMED_READ(pread(h,staging,size,offset));
-        if (n<0) return -errno;
-        memcpy(buffer,staging,(size_t)n);
-        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-        return n;
-    }
     touch_for_write(buffer,size);
-    ssize_t n=TIMED_READ(pread(h,buffer,size,offset));
+    ssize_t n=pread(h,buffer,size,offset);
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
-/* sotc: the game logs "st_gameflow() starting game" on stdout when it loads a save or a new area;
- * the texture cache then drops its unused images (bbgpu_request_texture_flush, sotc_stats.h:
- * stale images over reused texture memory, green blocks). SOTC_LOAD_FLUSH=0 turns it off. */
-void bbgpu_request_texture_flush(void) __attribute__((weak));
-static void note_game_load(const void *buffer,uint64_t size) {
-    static int on=-1;
-    if (on<0) { const char *v=getenv("SOTC_LOAD_FLUSH"); on=!v || v[0]!='0'; }
-    static const char key[]="st_gameflow() starting game";
-    const uint64_t n=sizeof(key)-1;
-    if (!on || !bbgpu_request_texture_flush || size<n) return;
-    const char *b=buffer;
-    for (uint64_t i=0;i+n<=size;++i) {
-        if (b[i]=='s' && !memcmp(b+i,key,n)) {
-            sotc_event("GAME",SOTC_T("Carregando um save ou uma área nova (texturas sem uso descartadas)",
-                                     "Loading a save or a new area (unused textures dropped)"));
-            bbgpu_request_texture_flush();
-            return;
-        }
-    }
-}
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    if (fd==1 || fd==2) note_game_load(buffer,size);
     ssize_t n=host_write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);

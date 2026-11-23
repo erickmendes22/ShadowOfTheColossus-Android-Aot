@@ -72,7 +72,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
     else {
         /* Priority-ordered semaphores (attr 2) are served FIFO: there is no
            PS4 priority scheduler, host threads run at equal priority. */
-        if (getenv("BB_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count); /* deadlock diagnosis */
+        if (getenv("GOW3_TRACE_SEMA")) fprintf(stderr,"Runtime: blocking wait on semaphore %u (need %d, count %d)\n",id,need,s->count); /* deadlock diagnosis */
         Waiter w={.need=need};
         pthread_condattr_t attr;
         host_check(pthread_condattr_init(&attr));
@@ -168,12 +168,12 @@ unsigned runtime_sema_waiters(uint32_t id) {
     return n;
 }
 uintptr_t runtime_sema_resolve(const char *name) {
-    if (!strcmp(name,"188x57JYp0g")) return (uintptr_t)sem_create;
-    if (!strcmp(name,"Zxa0VhQVTsk")) return (uintptr_t)sem_wait;
-    if (!strcmp(name,"4czppHBiriw")) return (uintptr_t)sem_signal;
-    if (!strcmp(name,"12wOHk8ywb0")) return (uintptr_t)sem_poll;
-    if (!strcmp(name,"4DM06U2BNEY")) return (uintptr_t)sem_cancel;
-    if (!strcmp(name,"R1Jvn8bSCW8")) return (uintptr_t)sem_delete;
+    if (!strcmp(name,"188x57JYp0g#libkernel")) return (uintptr_t)sem_create;
+    if (!strcmp(name,"Zxa0VhQVTsk#libkernel")) return (uintptr_t)sem_wait;
+    if (!strcmp(name,"4czppHBiriw#libkernel")) return (uintptr_t)sem_signal;
+    if (!strcmp(name,"12wOHk8ywb0#libkernel")) return (uintptr_t)sem_poll;
+    if (!strcmp(name,"4DM06U2BNEY#libkernel")) return (uintptr_t)sem_cancel;
+    if (!strcmp(name,"R1Jvn8bSCW8#libkernel")) return (uintptr_t)sem_delete;
     return 0;
 }
 void runtime_sema_report(void) {

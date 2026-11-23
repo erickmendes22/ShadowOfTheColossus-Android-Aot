@@ -47,15 +47,13 @@ struct Profile {
     bool has_broken_spirv_clamp{};
     bool lower_left_origin_mode{};
     bool needs_manual_interpolation{};
+    /// gow3: NVIDIA without fragment shader barycentrics (Pascal and older).
+    bool needs_integer_interpolation_fix{};
     bool needs_lds_barriers{};
     bool needs_buffer_offsets{};
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
-    /// sotc: supports_fragment_shader_barycentric emulated by an auxiliary geometry shader
-    /// (EmitBarycentricGeometryShader): per-vertex inputs and barycentrics become plain inputs.
-    /// Last, so the profiles stored in older caches still compare equal.
-    bool barycentric_via_gs{};
 
     bool operator==(const Profile&) const = default;
 };

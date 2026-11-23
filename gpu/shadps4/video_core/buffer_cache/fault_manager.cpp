@@ -18,7 +18,7 @@ static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
 
 FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
                            BufferCache& buffer_cache_, u32 sparse_pagebits, u64 sparse_num_pages_)
-    : instance{instance}, scheduler{scheduler_}, buffer_cache{buffer_cache_}, sparse_pagesize{1ULL << sparse_pagebits},
+    : scheduler{scheduler_}, buffer_cache{buffer_cache_}, sparse_pagesize{1ULL << sparse_pagebits},
       sparse_num_pages{sparse_num_pages_}, fault_buffer_size{sparse_num_pages_ / 8},
       fault_buffer{instance, 0, fault_buffer_size, MemoryType::DeviceLocal},
       download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached} {
@@ -153,7 +153,7 @@ void FaultManager::ProcessFaultBuffer() {
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = sparse_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);
-    instance.Dispatch1D(cmdbuf, num_workgroups);
+    cmdbuf.dispatch(num_workgroups, 1, 1);
 
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
@@ -172,7 +172,6 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
-            buffer_cache.NoteFaultRebind(start, end - start); // sotc: before the rebind
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
         });
         fault_areas[area] = 0;

@@ -1,26 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <mutex>
-#include <optional>
-#include <cstdlib>
-#include <vector>
-#include <string>
-#include <map>
-#include <cstdio>
-#include <chrono>
-#include <algorithm>
+#include "gow3_toggles.h"
 #include <ranges>
-#include <unordered_map>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
-#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -44,9 +33,10 @@ static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                 usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
             }
             // Always create images with storage flag to avoid needing re-creation in case of e.g
-            // compute clears This sacrifices a bit of performance but is less work. ExtendedUsage
-            // flag is also used. The exception here is for multisample images when storage is not
-            // supported, where even with ExtendedUsage we may get only one supported sample back.
+            // compute clears. This sacrifices a bit of performance but is less work. ExtendedUsage
+            // flag is also used. The exception is multisample images when storage is not supported
+            // (shaderStorageImageMultisample): with ExtendedUsage a driver that cannot store to a
+            // multisample image may return only one supported sample, losing the MSAA render.
             if (info.num_samples == 1 || instance.IsMultisampleStorageImageSupported())
                 usage |= vk::ImageUsageFlagBits::eStorage;
         }
@@ -64,10 +54,10 @@ static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
+        return vk::ImageType::e1D;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
     case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Cube:
         return vk::ImageType::e2D;
     case AmdGpu::ImageType::Color3D:
         return vk::ImageType::e3D;
@@ -99,7 +89,9 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    Destroy();
+    if (image) {
+        vmaDestroyImage(allocator, image, allocation);
+    }
 }
 
 void UniqueImage::Destroy() {
@@ -107,32 +99,14 @@ void UniqueImage::Destroy() {
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
-        SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
-        SotcStats::image_count.fetch_sub(1, std::memory_order_relaxed);
-        size_bytes = 0;
     }
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
-    // sotc: SOTC_IMAGE_DEDICATED=1: images of 2048x2048 texels and more (per layer, x layers)
-    // get memory of their own. Shared 64 MiB blocks kept up to 1.7 GB of free space after an
-    // area's textures went (blocks only go back to the driver when empty), over the budget on
-    // 8 GB cards (T48, 05/11). SOTC_IMAGE_DEDICATED_TEXELS sets the threshold.
-    static const u64 dedicated_texels = [] {
-        const char* v = std::getenv("SOTC_IMAGE_DEDICATED");
-        if (!v || v[0] != '1') {
-            return ~u64{0};
-        }
-        const char* t = std::getenv("SOTC_IMAGE_DEDICATED_TEXELS");
-        return t ? std::strtoull(t, nullptr, 10) : u64{2048} * 2048;
-    }();
-    const u64 texels = u64{image_ci.extent.width} * image_ci.extent.height *
-                       image_ci.extent.depth * image_ci.arrayLayers;
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
-                 (texels >= dedicated_texels ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0u),
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,
@@ -143,74 +117,22 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
-    const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-        // Over the video memory budget (loading screens peak before the cache collects old
-        // images). Going over budget lets the driver page memory out instead of aborting.
-        static bool warned = false;
-        if (!std::exchange(warned, true)) {
-            LOG_WARNING(Render_Vulkan, "Video memory budget exceeded, allocating images past it");
-        }
-        VmaAllocationCreateInfo over_budget_ci = alloc_ci;
-        over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &over_budget_ci, &unsafe_image,
-                                &allocation, &alloc_info);
-    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
-    SotcStats::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
-    SotcStats::image_count.fetch_add(1, std::memory_order_relaxed);
-    VmaAllocationInfo2 alloc_info2{};
-    vmaGetAllocationInfo2(allocator, allocation, &alloc_info2);
-    if (alloc_info2.dedicatedMemory) {
-        SotcStats::image_dedicated.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-// sotc: vkGetPhysicalDeviceImageFormatProperties2 takes about 5 ms per call on a Radeon (driver
-// 32.0.21045), and the game creates dozens of images in a frame when the camera turns: frames of
-// 200-500 ms. The answer only depends on these parameters, so it is asked once per combination
-// (and the unsupported-format error is logged once).
-struct FormatQuery {
-    vk::Result result;
-    vk::SampleCountFlags sample_counts;
-};
-static FormatQuery QueryImageFormat(const Vulkan::Instance& instance,
-                                    const vk::PhysicalDeviceImageFormatInfo2& format_info) {
-    static std::mutex mutex;
-    static std::unordered_map<u64, FormatQuery> answers;
-    const u64 key = (u64(format_info.format) << 40) ^ (u64(format_info.type) << 36) ^
-                    (u64(u32(format_info.flags)) << 20) ^ u64(u32(format_info.usage));
-    std::scoped_lock lock{mutex};
-    if (const auto it = answers.find(key); it != answers.end()) {
-        return it->second;
-    }
-    const SotcStats::ScopedTimer query_timer{SotcStats::image_query_ns};
-    const auto properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(format_info.format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    const FormatQuery answer{properties.result,
-                             properties.result == vk::Result::eSuccess
-                                 ? properties.value.imageFormatProperties.sampleCounts
-                                 : vk::SampleCountFlags{}};
-    answers.emplace(key, answer);
-    return answer;
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
              Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
-    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+    : guest_begin{info_.guest_address}, guest_end{info_.guest_address + info_.guest_size},
+      info{info_}, runtime{&runtime_}, slot_image_views{&slot_image_views_} {
+    Gow3Stats::Timer timer{Gow3Stats::t_image_create};
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
-    const SotcStats::FrameTimer frame_timer{SotcStats::FrameImage};
 
     image_uid = global_image_uid.Next();
     mip_hashes.resize(info.resources.levels);
@@ -237,31 +159,36 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
-    FormatQuery format_query = QueryImageFormat(instance, format_info);
-    // sotc: storage usage is speculative (see ImageUsageFlags). AMD's Windows driver refuses it for
-    // BC5/BC6H; creating that combination anyway corrupts the texture or loses the device later,
-    // so such images are created without storage when the driver accepts them that way (as in
-    // gow3_pc).
-    if (format_query.result == vk::Result::eErrorFormatNotSupported &&
+    auto image_format_properties =
+        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    // gow3: storage usage is speculative (see ImageUsageFlags). Drivers that refuse it for a
+    // format (AMD's Windows driver for BC6H) get the image without it: creating the unsupported
+    // combination anyway loses the device a few frames later.
+    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported &&
         (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
-        auto without_storage = format_info;
-        without_storage.usage = usage_flags & ~vk::ImageUsageFlagBits::eStorage;
-        const FormatQuery retry = QueryImageFormat(instance, without_storage);
-        if (retry.result == vk::Result::eSuccess) {
-            usage_flags = without_storage.usage;
+        format_info.usage = usage_flags & ~vk::ImageUsageFlagBits::eStorage;
+        image_format_properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+        if (image_format_properties.result == vk::Result::eSuccess) {
+            usage_flags = format_info.usage;
             format_features = FormatFeatureFlags(usage_flags);
-            format_query = retry;
+        } else {
+            format_info.usage = usage_flags;
         }
     }
-    supported_samples = format_query.result == vk::Result::eSuccess
-                            ? format_query.sample_counts
+    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
+        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
+                  vk::to_string(supported_format), vk::to_string(format_info.type),
+                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+    }
+    supported_samples = image_format_properties.result == vk::Result::eSuccess
+                            ? image_format_properties.value.imageFormatProperties.sampleCounts
                             : vk::SampleCountFlagBits::e1;
 
     const vk::ImageCreateInfo image_ci = {
@@ -299,98 +226,20 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
     }
-    // sotc: consecutive binds of an image mostly ask for the same view: compare against the
-    // view returned last before the linear search. Exact: views are never duplicated or
-    // removed from a backing, so the first match of the search is that same entry
-    // (SOTC_TEX_BIND_P1=0: always search).
-    static const bool last_view_enabled = [] {
-        const char* v = std::getenv("SOTC_TEX_BIND_P1");
-        return !v || v[0] != '0';
-    }();
     const auto& view_infos = backing->image_view_infos;
-    if (last_view_enabled) {
-        const u32 last = backing->last_view;
-        if (last < view_infos.size() && view_infos[last] == view_info) {
-            return (*slot_image_views)[backing->image_view_ids[last]];
-        }
+    if (backing->last_view < view_infos.size() && view_infos[backing->last_view] == view_info) {
+        return (*slot_image_views)[backing->image_view_ids[backing->last_view]];
     }
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {
-        const auto index = std::distance(view_infos.begin(), it);
-        backing->last_view = static_cast<u32>(index);
-        const auto view_id = backing->image_view_ids[index];
+        backing->last_view = static_cast<u32>(std::distance(view_infos.begin(), it));
+        const auto view_id = backing->image_view_ids[backing->last_view];
         return (*slot_image_views)[view_id];
     }
     const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
-    backing->last_view = static_cast<u32>(backing->image_view_infos.size());
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];
-}
-
-bool Image::TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
-                          vk::PipelineStageFlags2 dst_stage,
-                          const std::optional<SubresourceRange>& subres_range) const {
-    // sotc: mirrors GetBarriers below without writing. Both of its branches end by storing
-    // (layout, access, stage) into the whole-image state, so that state must already be it; the
-    // partial branch also must not find a subresource in another state or a pending write.
-    const auto& last_state = backing->state;
-    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                 vk::AccessFlagBits2::eShaderWrite |
-                                 vk::AccessFlagBits2::eMemoryWrite;
-    if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
-        last_state.pl_stage != dst_stage || (last_state.access_mask & write_flags)) {
-        return false;
-    }
-    const auto& subresource_states = backing->subresource_states;
-    const bool needs_partial_transition =
-        subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
-    if (subresource_states.empty()) {
-        return !needs_partial_transition; // a partial one would split the state first
-    }
-    if (!needs_partial_transition) {
-        return false; // the full transition would merge the subresource states
-    }
-    for (u32 mip = subres_range->base.level;
-         mip < subres_range->base.level + subres_range->extent.levels; ++mip) {
-        for (u32 layer = subres_range->base.layer;
-             layer < subres_range->base.layer + subres_range->extent.layers; ++layer) {
-            const auto subres_idx = mip * info.resources.layers + layer;
-            if (subres_idx >= subresource_states.size()) {
-                return false;
-            }
-            const auto& state = subresource_states[subres_idx];
-            if (state.layout != dst_layout || state.access_mask != dst_mask ||
-                (state.access_mask & write_flags)) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-// sotc: GCN does not order UAV writes between draws by itself; the game inserts an end-of-pipe label
-// where it needs the writes visible. A GENERAL image that was written and is used again with the
-// same access therefore only needs the barrier once per fence epoch (the first use after a label),
-// not before every draw: each of those barriers ends the dynamic render pass (~20k/s in the Shrine).
-// SOTC_GENERAL_SYNC=0 restores a barrier at every use.
-u64 g_sotc_fence_epoch = 0;
-
-static bool SkipSameGeneral(Image& image, vk::ImageLayout a, vk::ImageLayout b, vk::AccessFlags2 ma,
-                            vk::AccessFlags2 mb) {
-    static const bool on = [] {
-        const char* v = std::getenv("SOTC_GENERAL_SYNC");
-        return !(v && v[0] == '0');
-    }();
-    if (!on || a != vk::ImageLayout::eGeneral || b != a || ma != mb) {
-        return false;
-    }
-    if (image.general_epoch == g_sotc_fence_epoch) {
-        return true;
-    }
-    image.general_epoch = g_sotc_fence_epoch;
-    return false;
 }
 
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
@@ -436,8 +285,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                              vk::AccessFlagBits2::eShaderWrite |
                                              vk::AccessFlagBits2::eMemoryWrite;
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask ||
-                    (is_write && !SkipSameGeneral(*this, state.layout, dst_layout, state.access_mask, dst_mask))) {
+                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
@@ -471,10 +319,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                      vk::AccessFlagBits2::eShaderWrite |
                                      vk::AccessFlagBits2::eMemoryWrite;
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask &&
-            (!is_write || SkipSameGeneral(*this, last_state.layout, dst_layout, last_state.access_mask, dst_mask))) {
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
             return;
         }
+
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
             .srcAccessMask = last_state.access_mask,
@@ -498,16 +346,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
-}
-
-void NoteMipTailWrite(const Image& image) {
-    // The image stays usable: it is GPU-modified now, so it is not freed without a download.
-    SotcStats::rebase_violations.fetch_add(1, std::memory_order_relaxed);
-    static std::atomic<int> shown{0};
-    if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
-        LOG_ERROR(Render_Vulkan, "Mip-tail image {:#x} (from mip {}) written by the GPU",
-                  image.info.guest_address, image.info.sotc_first_mip);
-    }
 }
 
 } // namespace VideoCore

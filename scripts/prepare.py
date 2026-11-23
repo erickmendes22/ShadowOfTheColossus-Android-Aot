@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 import struct
+import sys
 
 
 def span(data, offset, size):
@@ -23,31 +24,7 @@ def unpack(fmt, data, offset):
     return struct.unpack(fmt, span(data, offset, struct.calcsize(fmt)))
 
 
-def parse_elf(data):
-    """A decrypted module (the user's own firmware dump): a plain ELF, same result as parse_self."""
-    header = unpack('<16sHHIQQQIHHHHHH', data, 0)
-    if header[0][:7] != b'\x7fELF\x02\x01\x01' or header[2] != 62:
-        raise ValueError("expected little-endian x86-64 ELF")
-    if header[9] != 56 or not 0 < header[10] < 256:
-        raise ValueError("unsupported program headers")
-    ph = [dict(zip(('type', 'flags', 'offset', 'vaddr', 'paddr', 'filesz', 'memsz', 'align'),
-                   unpack('<IIQQQQQQ', data, header[5] + i * 56)))
-          for i in range(header[10])]
-    end = max(p['offset'] + p['filesz'] for p in ph)
-    return bytearray(span(data, 0, end)), header, ph, [], []
-
-
-def parse_named_self(path, data):
-    """parse_self of a file's bytes; errors name the file (an encrypted eboot or module, issue #52)."""
-    try:
-        return parse_self(data)
-    except ValueError as error:
-        raise ValueError(f'{path}: {error}') from None
-
-
 def parse_self(data):
-    if span(data, 0, 4) == b'\x7fELF':
-        return parse_elf(data)
     if span(data, 0, 4) != b'O\x15=\x1d':
         raise ValueError("expected PS4 SELF")
     count, = unpack('<H', data, 24)
@@ -74,8 +51,7 @@ def parse_self(data):
         if not flags & 0x800:
             continue
         if flags & 10:
-            raise ValueError("the file is still encrypted (or compressed): the game dump and the "
-                             "firmware modules must be decrypted copies")
+            raise ValueError("encrypted/compressed SELF segment is unsupported")
         index = (flags >> 20) & 4095
         if index >= len(ph):
             raise ValueError("invalid segment index")
@@ -95,6 +71,8 @@ def parse_self(data):
 
 
 def sfo(data):
+    if not data:
+        raise ValueError('param.sfo is empty (0 bytes): the game files are incomplete')
     magic, version, keys, values, count = unpack('<4sIIII', data, 0)
     if magic != b'\0PSF':
         raise ValueError('bad SFO signature')
@@ -107,6 +85,32 @@ def sfo(data):
     return result
 
 
+SFO_LIMIT = 1 << 20  # a param.sfo is a few KiB; whatever lies beyond this under that name is not one
+
+
+def load_sfo(path):
+    """The values of a param.sfo file: OSError when it cannot be read, ValueError when it is not
+    one. At most SFO_LIMIT bytes are read."""
+    with Path(path).open('rb') as stream:
+        data = stream.read(SFO_LIMIT)
+    try:
+        return sfo(data)
+    except (TypeError, IndexError, struct.error) as error:
+        raise ValueError(f'bad SFO: {error}') from error
+
+
+def read_sfo(path):
+    """The values of a param.sfo, or None when the file is missing, unreadable, empty or not one."""
+    try:
+        return load_sfo(path)
+    except (OSError, ValueError):
+        return None
+
+
+def write_report(path, report):
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+
+
 def nid(name):
     salt = bytes.fromhex('518d64a635ded8c1e6b039b1c3e55230')
     digest = hashlib.sha1(name.encode('ascii') + salt).digest()[:8][::-1]
@@ -116,7 +120,7 @@ def nid(name):
 def inspect_libc(path):
     """Prove that this dump's _init_env is exactly RET; never assume it."""
     source = path.read_bytes()
-    elf, header, ph, _, missing = parse_named_self(path, source)
+    elf, header, ph, _, missing = parse_self(source)
     dynamic = next(p for p in ph if p['type'] == 2)
     tags = dict(unpack('<QQ', elf, pos) for pos in
                 range(dynamic['offset'], dynamic['offset'] + dynamic['filesz'], 16))
@@ -147,7 +151,7 @@ def inspect_libc(path):
 
 def prepare(game, out):
     source = (game / 'eboot.bin').read_bytes()
-    elf, header, ph, segments, missing = parse_named_self(game / 'eboot.bin', source)
+    elf, header, ph, segments, missing = parse_self(source)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):
         return any(p['vaddr'] <= addr and addr + size <= p['vaddr'] + p['memsz'] for p in loads)
@@ -232,7 +236,7 @@ def prepare(game, out):
     out.mkdir(parents=True, exist_ok=True)
     # A deliberately small format, consumed by probe.c; no host struct packing.
     with (out / 'boot.bin').open('wb') as f:
-        f.write(struct.pack('<8sQQQQQQ', b'BBPROBE2', size, header[4], len(loads), len(relocs), len(names),
+        f.write(struct.pack('<8sQQQQQQ', b'G3PROBE2', size, header[4], len(loads), len(relocs), len(names),
                             int(libc_evidence['init_env_is_ret'])))
         for p in loads:
             f.write(struct.pack('<QQQ', p['vaddr'], p['memsz'], p['flags']))
@@ -262,7 +266,7 @@ def prepare(game, out):
                   bundled_modules=sorted(p.name for p in (game / 'sce_module').iterdir()),
                   resources=dict(resources), resource_bytes=total_bytes,
                   status='Prepared only; execution and Vulkan are tested separately.')
-    (out / 'analysis.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    write_report(out / 'analysis.json', report)
     print(f"{report['sfo'].get('TITLE')} | entry={header[4]:#x} | image={size:,} bytes")
     print(f"{len(names)} imported symbols; {sum(counts.values()):,} relocations; {len(report['needed'])} required modules")
     print(f"Unavailable non-loadable metadata headers: {missing}; not a byte-exact ELF reconstruction")
@@ -275,6 +279,8 @@ if __name__ == '__main__':
     parser.add_argument('game', type=Path)
     parser.add_argument('--out', type=Path, default=Path(__file__).resolve().parent.parent / 'out')
     args = parser.parse_args()
+    # The title is printed; a console or pipe in a legacy code page cannot encode every language.
+    sys.stdout.reconfigure(errors='replace')
     try:
         prepare(args.game, args.out)
     except (ValueError, OSError, StopIteration, KeyError, IndexError) as error:

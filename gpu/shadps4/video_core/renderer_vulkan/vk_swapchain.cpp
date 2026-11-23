@@ -1,19 +1,28 @@
+#ifndef __ANDROID__
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "gow3_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
-#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
+
+namespace {
+// gow3：LSFG 失败路径专用的退出码。run-gow3.sh 用它把「lsfg-vk layer 挂了」和普通崩溃区分开，
+// 从而只在这种情况下清掉 LSFG 状态并最多重试一次普通 Vulkan（OpenSpec harden-gow3-lsfg-integration
+// 任务 2.3）。必须与 tools/android/device/run-gow3.sh 里的数字保持一致。
+constexpr int kLsfgFailureExitCode = 46;
+} // namespace
 
 static constexpr vk::SurfaceFormatKHR SURFACE_FORMAT_HDR = {
     .format = vk::Format::eA2B10G10R10UnormPack32,
@@ -24,11 +33,9 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     : instance{instance_}, window{window_}, surface{CreateSurface(instance.GetInstance(), window)} {
     FindPresentFormat();
     FindPresentMode();
-    // sotc: the SDR-to-HDR mode starts on the HDR10 swapchain, so every pass is built for its format.
-    needs_hdr = supports_hdr && EmulatorSettings.IsSdrToHdr();
 
     Create(window.GetWidth(), window.GetHeight());
-    ImGui::Core::Initialize(instance, window, image_count, GetSurfaceFormat().format);
+    ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
 }
 
 Swapchain::~Swapchain() {
@@ -75,6 +82,19 @@ void Swapchain::Create(u32 width_, u32 height_) {
     };
 
     auto [swapchain_result, chain] = instance.GetDevice().createSwapchainKHR(swapchain_info);
+    // gow3：lsfg-vk layer（run-gow3.sh 加载）在它的 DLL 或驱动不可用时会创建 swapchain 失败。
+    // 这里不能像 Bloodborne 的 run-thor.sh 那样就地 execv 重启（gow3-probe 由 run-gow3.sh 原生
+    // 启动，并持有 launcher 管的 audio / input / display bridge，就地重启会把这些句柄全废掉）。
+    // 改为：打一条明确诊断到 logs/android-game.log，然后以专用退出码退出，交给 run-gow3.sh 清掉
+    // LSFG 状态并最多重试一次普通 Vulkan（见 OpenSpec harden-gow3-lsfg-integration 任务 2.3）。
+    if (swapchain_result != vk::Result::eSuccess && std::getenv("GOW3_LSFG") &&
+        !std::getenv("DISABLE_LSFG")) {
+        std::printf("Swapchain: Lossless Scaling frame generation failed to create (%s); exiting "
+                    "%d so run-gow3.sh retries once without it\n",
+                    vk::to_string(swapchain_result).c_str(), kLsfgFailureExitCode);
+        std::fflush(nullptr);
+        std::_Exit(kLsfgFailureExitCode);
+    }
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
@@ -144,6 +164,19 @@ bool Swapchain::Present() {
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
+        // gow3：在 lsfg-vk 已加载时（GOW3_LSFG 已设且未被 DISABLE_LSFG 关闭）present 失败，说明是
+        // layer 的插帧产出了无效结果。与 Create() 相同处理：打一条诊断，然后以专用退出码退出，交给
+        // run-gow3.sh 清掉 LSFG 状态并最多重试一次普通 Vulkan（任务 2.3）。绝不 execv()（原因见
+        // Create()）；一次失败的 layer present 也不等于 swapchain 过期，因此 needs_recreation 保持
+        // false：不静默重试、也不会有重启循环。
+        if (result != vk::Result::eSuccess && std::getenv("GOW3_LSFG") &&
+            !std::getenv("DISABLE_LSFG")) {
+            std::printf("Swapchain: Lossless Scaling frame generation failed to present (%s); "
+                        "exiting %d so run-gow3.sh retries once without it\n",
+                        vk::to_string(result).c_str(), kLsfgFailureExitCode);
+            std::fflush(nullptr);
+            std::_Exit(kLsfgFailureExitCode);
+        }
         ASSERT_MSG(result == vk::Result::eSuccess, "Swapchain presentation failed: {}",
                    vk::to_string(result));
     }
@@ -202,31 +235,27 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
-    const auto requested_mode = EmulatorSettings.GetPresentMode();
-    if (requested_mode == "Mailbox") {
-        present_mode = vk::PresentModeKHR::eMailbox;
-    } else if (requested_mode == "Fifo") {
-        present_mode = vk::PresentModeKHR::eFifo;
-    } else if (requested_mode == "Immediate") {
-        present_mode = vk::PresentModeKHR::eImmediate;
-    } else {
-        LOG_ERROR(Render_Vulkan, "Unknown present mode {}, defaulting to Mailbox.",
-                  EmulatorSettings.GetPresentMode());
-        present_mode = vk::PresentModeKHR::eMailbox;
-    }
+    // gow3: VSync on is Fifo (no tearing, waits for the display); off is Mailbox when the
+    // driver has it, else Immediate (tearing allowed), else Fifo.
+    vsync = Gow3Settings::Get().vsync;
+    const auto has = [&](vk::PresentModeKHR mode) { return std::ranges::find(modes, mode) != modes.cend(); };
+    present_mode = vsync ? vk::PresentModeKHR::eFifo
+                   : has(vk::PresentModeKHR::eMailbox) ? vk::PresentModeKHR::eMailbox
+                   : has(vk::PresentModeKHR::eImmediate) ? vk::PresentModeKHR::eImmediate
+                                                         : vk::PresentModeKHR::eFifo;
+    std::printf("Swapchain: VSync %s (%s)\n", vsync ? "on" : "off", vk::to_string(present_mode).c_str());
+}
 
-    if (std::ranges::find(modes, present_mode) == modes.cend()) {
-        // FIFO is guaranteed to be supported by the Vulkan spec.
-        constexpr auto fallback = vk::PresentModeKHR::eFifo;
-        LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
-                    vk::to_string(present_mode), vk::to_string(fallback));
-        present_mode = fallback;
+void Swapchain::UpdateVsync() {
+    if (Gow3Settings::Get().vsync == vsync) {
+        return;
     }
-    // sotc: DLSS Frame Generation on Vulkan needs vsync off (Streamline paces the frames).
-    if (Dlssg::WantsImmediatePresent() &&
-        std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend()) {
-        present_mode = vk::PresentModeKHR::eImmediate;
+    if (const auto result = instance.GetDevice().waitIdle(); result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "Failed to wait for the device before a VSync change: {}",
+                    vk::to_string(result));
     }
+    FindPresentMode();
+    Recreate(width, height);
 }
 
 void Swapchain::SetSurfaceProperties() {
@@ -243,23 +272,11 @@ void Swapchain::SetSurfaceProperties() {
                                  std::min(capabilities.maxImageExtent.height, height));
     }
 
-    // sotc: 8 images instead of the usual minImageCount + 1. NVIDIA blocks vkQueuePresentKHR for
-    // up to ~140 ms every ~11 s; with 3 images acquire runs dry ~2 frames in and the GPU idles for
-    // the rest of the stall (a visible hitch at high fps). 8 bridge it (the frame pool sizes from
-    // this too), and under Mailbox/Immediate they add no steady-state latency: the queue only
-    // fills while a present is stuck. SOTC_SWAP_IMAGES overrides (=3 for the old behaviour).
-    // FIFO queues every image for the display: a game faster than the refresh would be shown up to
-    // 8 frames late, so it keeps the usual count (#128).
-    u32 wanted_images = present_mode == vk::PresentModeKHR::eFifo
-                            ? capabilities.minImageCount + 1
-                            : std::max(capabilities.minImageCount + 1, 8u);
-    if (const char* env = std::getenv("SOTC_SWAP_IMAGES"); env && env[0]) {
-        wanted_images = static_cast<u32>(std::strtoul(env, nullptr, 10));
+    // Select number of images in swap chain, we prefer one buffer in the background to work on
+    image_count = capabilities.minImageCount + 1;
+    if (capabilities.maxImageCount > 0) {
+        image_count = std::min(image_count, capabilities.maxImageCount);
     }
-    image_count = std::clamp(wanted_images, capabilities.minImageCount,
-                             capabilities.maxImageCount > 0 ? capabilities.maxImageCount : 16u);
-    std::fprintf(stderr, "GPU swapchain images: %u (driver min %u, max %u)\n", image_count,
-                 capabilities.minImageCount, capabilities.maxImageCount);
 
     // Prefer identity transform if possible
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;
@@ -362,3 +379,5 @@ void Swapchain::SetupImages() {
 }
 
 } // namespace Vulkan
+
+#endif

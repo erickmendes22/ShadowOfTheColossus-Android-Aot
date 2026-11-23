@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <utility>
 #include <boost/container/small_vector.hpp>
 
@@ -9,14 +11,27 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "common/elf_info.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
 
 using Shader::Backend::SPIRV::AuxShaderType;
+
+// gow3: where pipeline construction time goes (reported when the background warm-up ends).
+std::atomic<u64> g_gow3_pipeline_total_ns, g_gow3_pipeline_driver_ns;
+std::atomic<u32> g_gow3_pipelines_built;
+namespace {
+using Clock = std::chrono::steady_clock;
+u64 NsSince(Clock::time_point start) {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+}
+} // namespace
 
 static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eFragment,
@@ -32,18 +47,14 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata, bool preloading, bool async_build)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
-    if (fetch_shader_) {
-        fetch_shader = *fetch_shader_;
-    }
-
+    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
+      fetch_shader{std::move(fetch_shader_)} {
+    const auto started = Clock::now();
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
-    // sotc: built on a pipeline worker (SOTC_ASYNC_SHADERS), the guest registers already belong
-    // to later draws: skip the buffer sharp reads, whose result is unused (as when preloading).
-    BuildDescSetLayout(preloading || async_build);
+    BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -227,30 +238,6 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    // sotc: Profile::barycentric_via_gs: the geometry shader that hands the pixel shader its
-    // per-vertex inputs and barycentrics, on triangles without a guest geometry/tess stage.
-    const Shader::Info* fs_stage_info = infos[u32(Shader::SwStage::Fragment)];
-    const bool triangles = topology == vk::PrimitiveTopology::eTriangleList ||
-                           topology == vk::PrimitiveTopology::eTriangleStrip ||
-                           topology == vk::PrimitiveTopology::eTriangleFan || is_rect_list ||
-                           is_quad_list;
-    // Preloaded pipelines take it from the cache: the interpolation data it needs is not stored.
-    if (!preloading && profile.barycentric_via_gs && fs_stage_info && triangles &&
-        !infos[u32(Shader::SwStage::Geometry)] &&
-        !infos[u32(Shader::SwStage::TessellationEval)]) {
-        const auto& fs_runtime = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
-        if (Shader::Backend::SPIRV::NeedsBarycentricGs(fs_runtime, *fs_stage_info)) {
-            sdata.gs = Shader::Backend::SPIRV::EmitBarycentricGeometryShader(fs_runtime,
-                                                                             *fs_stage_info);
-        }
-    }
-    if (!sdata.gs.empty()) {
-        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
-            .stage = vk::ShaderStageFlagBits::eGeometry,
-            .module = CompileSPV(sdata.gs, instance.GetDevice()),
-            .pName = "main",
-        });
-    }
     stage = u32(Shader::SwStage::Fragment);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -271,15 +258,11 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
-    // sotc: 64 where every stage can be pinned to it; on Intel the recompiler's lane count
-    // (Instance::RequiredSubgroupSize).
-    std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, MaxShaderStages>
-        subgroup_size_cis{};
-    for (size_t i = 0; i < shader_stages.size(); ++i) {
-        auto& stage = shader_stages[i];
-        const u32 size = instance.RequiredSubgroupSize(stage.stage);
-        subgroup_size_cis[i].requiredSubgroupSize = size;
-        stage.pNext = size != 0 ? &subgroup_size_cis[i] : nullptr;
+    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+        .requiredSubgroupSize = 64,
+    };
+    for (auto& stage : shader_stages) {
+        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
     }
 
     const auto depth_format =
@@ -325,79 +308,71 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
+    // gow3: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
+    // MIN/MAX is drawn twice: native, then this pipeline squares the destination.
+    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
+    bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend_controls[i];
-
-        const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
-        const auto dst_color = LiverpoolToVK::BlendFactor(control.color_dst_factor);
-        const auto color_blend = LiverpoolToVK::BlendOp(control.color_func);
-
-        const auto src_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_src_factor)
-                                   : src_color;
-        const auto dst_alpha = control.separate_alpha_blend
-                                   ? LiverpoolToVK::BlendFactor(control.alpha_dst_factor)
-                                   : dst_color;
-        const auto alpha_blend =
-            control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
-
-        // Vulkan ignores blend factors for min/max, but a factor that zeroes one operand
-        // makes the operation collapse to a plain selection: min(s, 0) is 0 and max(s, 0)
-        // is s for normalized alpha. Rewrite those to the equivalent add so the result is
-        // exact instead of leaving the other operand to survive.
-        auto eff_src_alpha = src_alpha;
-        auto eff_dst_alpha = dst_alpha;
-        auto eff_alpha_blend = alpha_blend;
-        if (alpha_blend == vk::BlendOp::eMin || alpha_blend == vk::BlendOp::eMax) {
-            const bool takes_max = alpha_blend == vk::BlendOp::eMax;
-            if (src_alpha == vk::BlendFactor::eOne && dst_alpha == vk::BlendFactor::eZero) {
-                eff_alpha_blend = vk::BlendOp::eAdd;
-                eff_src_alpha = takes_max ? vk::BlendFactor::eOne : vk::BlendFactor::eZero;
-                eff_dst_alpha = vk::BlendFactor::eZero;
-            } else if (src_alpha == vk::BlendFactor::eZero && dst_alpha == vk::BlendFactor::eOne) {
-                eff_alpha_blend = vk::BlendOp::eAdd;
-                eff_src_alpha = vk::BlendFactor::eZero;
-                eff_dst_alpha = takes_max ? vk::BlendFactor::eOne : vk::BlendFactor::eZero;
-            }
+        const auto target_format = key.color_buffers[i].num_format;
+        BlendEquation color_equation{control.color_src_factor, control.color_func,
+                                     control.color_dst_factor};
+        BlendEquation alpha_equation{
+            control.separate_alpha_blend ? control.alpha_src_factor : control.color_src_factor,
+            control.separate_alpha_blend ? control.alpha_func : control.color_func,
+            control.separate_alpha_blend ? control.alpha_dst_factor : control.color_dst_factor};
+        const auto color_rewrite =
+            RewriteScaledMinMaxBlend(color_equation, target_format, BlendChannel::Color);
+        const auto alpha_rewrite =
+            RewriteScaledMinMaxBlend(alpha_equation, target_format, BlendChannel::Alpha);
+        const bool writes_color = bool(key.write_masks[i] & (vk::ColorComponentFlagBits::eR |
+                                                             vk::ColorComponentFlagBits::eG |
+                                                             vk::ColorComponentFlagBits::eB));
+        const bool writes_alpha = bool(key.write_masks[i] & vk::ColorComponentFlagBits::eA);
+        if (control.enable &&
+            ((writes_color && color_rewrite == BlendRewriteResult::Unsupported) ||
+             (writes_alpha && alpha_rewrite == BlendRewriteResult::Unsupported))) {
+            LOG_WARNING(Render_Vulkan,
+                        "Scaled MIN/MAX blend on attachment {} has no Vulkan equivalent "
+                        "(format {}, color {}/{}/{}, alpha {}/{}/{})",
+                        i, u32(target_format), u32(color_equation.src_factor),
+                        u32(color_equation.function), u32(color_equation.dst_factor),
+                        u32(alpha_equation.src_factor), u32(alpha_equation.function),
+                        u32(alpha_equation.dst_factor));
         }
+        const bool square_color =
+            control.enable && writes_color && color_rewrite == BlendRewriteResult::Squared;
+        const bool square_alpha =
+            control.enable && writes_alpha && alpha_rewrite == BlendRewriteResult::Squared;
+        needs_square_pass |= square_color || square_alpha;
 
-        const auto color_scaled_min_max =
-            (color_blend == vk::BlendOp::eMin || color_blend == vk::BlendOp::eMax) &&
-            (src_color != vk::BlendFactor::eOne || dst_color != vk::BlendFactor::eOne) &&
-            !key.color_buffers[i].blend_self_scale;
-        const auto alpha_scaled_min_max =
-            (eff_alpha_blend == vk::BlendOp::eMin || eff_alpha_blend == vk::BlendOp::eMax) &&
-            (eff_src_alpha != vk::BlendFactor::eOne || eff_dst_alpha != vk::BlendFactor::eOne);
-        if (color_scaled_min_max || alpha_scaled_min_max) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Unimplemented use of min/max blend op with blend factor not equal to one.");
-        }
+        const auto src_color = LiverpoolToVK::BlendFactor(color_equation.src_factor);
+        const auto dst_color = LiverpoolToVK::BlendFactor(color_equation.dst_factor);
 
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
             .srcColorBlendFactor = src_color,
             .dstColorBlendFactor = dst_color,
-            .colorBlendOp = color_blend,
-            .srcAlphaBlendFactor = eff_src_alpha,
-            .dstAlphaBlendFactor = eff_dst_alpha,
-            .alphaBlendOp = eff_alpha_blend,
+            .colorBlendOp = LiverpoolToVK::BlendOp(color_equation.function),
+            .srcAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.src_factor),
+            .dstAlphaBlendFactor = LiverpoolToVK::BlendFactor(alpha_equation.dst_factor),
+            .alphaBlendOp = LiverpoolToVK::BlendOp(alpha_equation.function),
             .colorWriteMask =
                 instance.IsDynamicColorWriteMaskSupported()
                     ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
                           vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
                     : key.write_masks[i],
         };
-
-        // The shader squares its color output for this attachment (see PsColorBuffer), so the
-        // factors must not scale the operands again.
-        if (key.color_buffers[i].blend_self_scale) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Emulating scaled min/max blend with squared shader output on attachment {}", i);
-            attachments[i].srcColorBlendFactor = vk::BlendFactor::eOne;
-            attachments[i].dstColorBlendFactor = vk::BlendFactor::eOne;
-        }
+        square_attachments[i] = vk::PipelineColorBlendAttachmentState{
+            .blendEnable = true,
+            .srcColorBlendFactor = vk::BlendFactor::eZero,
+            .dstColorBlendFactor = square_color ? vk::BlendFactor::eDstColor : vk::BlendFactor::eOne,
+            .colorBlendOp = vk::BlendOp::eAdd,
+            .srcAlphaBlendFactor = vk::BlendFactor::eZero,
+            .dstAlphaBlendFactor = square_alpha ? vk::BlendFactor::eDstAlpha : vk::BlendFactor::eOne,
+            .alphaBlendOp = vk::BlendOp::eAdd,
+            .colorWriteMask = attachments[i].colorWriteMask,
+        };
 
         // On GCN GPU there is an additional mask which allows to control color components exported
         // from a pixel shader. A situation possible, when the game may mask out the alpha channel,
@@ -453,41 +428,32 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    // sotc: SOTC_PIPE_TRACE=1: the resources the layout was made from, per stage, right before
-    // the pipeline is created (a validation error about the layout follows its own line).
-    static const bool pipe_trace = std::getenv("SOTC_PIPE_TRACE") != nullptr;
-    if (pipe_trace) {
-        std::string line;
-        for (const auto* stage : stages) {
-            if (stage) {
-                line += fmt::format(" [stage {} {:#x}: buffers {} images {} samplers {}]",
-                                    u32(stage->sw_stage), stage->pgm_hash, stage->buffers.size(),
-                                    stage->images.size(), stage->samplers.size());
-            }
-        }
-        std::fprintf(stderr, "SOTC PIPE TRACE pipeline%s%s\n", preloading ? " (preload)" : "",
-                     line.c_str());
-    }
+    const auto binary_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+        Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
     auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
-    if (pipeline_result != vk::Result::eSuccess && preloading) {
-        // sotc: the driver can refuse a pipeline rebuilt from the cache (ErrorUnknown on AMD).
-        // Left without a handle, the preload drops it and the game compiles it when it is drawn.
-        LOG_WARNING(Render_Vulkan, "Cached graphics pipeline {} failed to build: {}", debug_str,
-                    vk::to_string(pipeline_result));
-        return;
-    }
-    if (pipeline_result != vk::Result::eSuccess) {
-        // sotc: a driver that refuses a pipeline (ErrorUnknown on a Radeon RX 6750 XT near the
-        // 4th colossus, AjncSystem issue #397) ended the game here with an assertion. Left
-        // without a handle, its draws are skipped (PipelineCache::GetGraphicsPipeline) and it is
-        // not saved in the pipeline cache: a missing effect instead of a crash.
-        std::fprintf(stderr, "SOTC PIPELINE FAILED graphics %s: %s (its draws are skipped)\n",
-                     debug_str.c_str(), vk::to_string(pipeline_result).c_str());
-        return;
-    }
+        CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
+                                     instance.GetPipelineBinaryGlobalKey(), binary_directory);
+    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
+               vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+
+    if (needs_square_pass) {
+        auto square_blending = color_blending;
+        square_blending.logicOpEnable = false;
+        square_blending.pAttachments = square_attachments.data();
+        auto square_info = pipeline_info;
+        square_info.pColorBlendState = &square_blending;
+        auto [square_result, square] =
+            CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
+                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
+        ASSERT_MSG(square_result == vk::Result::eSuccess,
+                   "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
+        square_pipeline = std::move(square);
+        SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
+    }
+    g_gow3_pipeline_total_ns += NsSince(started);
+    ++g_gow3_pipelines_built;
 }
 
 GraphicsPipeline::~GraphicsPipeline() = default;
@@ -498,36 +464,21 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
+    if (!fetch_shader || fetch_shader->attributes.empty()) {
         return;
     }
     const auto& vs_info = GetStage(Shader::SwStage::Vertex);
-    for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
-        const auto& attrib = fetch_shader.attributes[semantic];
+    for (const auto& attrib : fetch_shader->attributes) {
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
-        const auto format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
-        // sotc: SOTC_FORMAT_LOG=1: a vertex format the driver cannot fetch (AMD legacy driver)
-        static const bool format_log = [] {
-            const char* v = std::getenv("SOTC_FORMAT_LOG");
-            return v && v[0] == '1';
-        }();
-        if (format_log && !instance.IsFormatSupported(format, vk::FormatFeatureFlagBits2::eVertexBuffer)) {
-            static std::atomic<u32> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
-                std::fprintf(stderr, "SOTC FORMAT unsupported vertex attribute: %s (data %u, number %u, stride %u)\n",
-                             vk::to_string(format).c_str(), u32(buffer.GetDataFmt()),
-                             u32(buffer.GetNumberFmt()), u32(buffer.GetStride()));
-            }
-        }
         attributes.push_back(Attribute{
-            .location = semantic,
-            .binding = semantic,
-            .format = format,
+            .location = attrib.semantic,
+            .binding = attrib.semantic,
+            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
             .offset = 0,
         });
         bindings.push_back(Binding{
-            .binding = semantic,
+            .binding = attrib.semantic,
             .stride = buffer.GetStride(),
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
@@ -539,7 +490,7 @@ void GraphicsPipeline::GetVertexInputs(
             bindings.back().divisor = divisor;
         } else if (step_rate != InstanceIdType::None) {
             divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
-                .binding = semantic,
+                .binding = attrib.semantic,
                 .divisor = divisor,
             });
         }
