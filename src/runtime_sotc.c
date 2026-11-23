@@ -186,6 +186,10 @@ static ABI int32_t http_uri_escape(char *out, uint64_t *require, uint64_t prepar
 }
 static ABI int32_t net_unavailable(void) { return (int32_t)0x80410101; }
 
+/* The Android runtime uses src/runtime_ngs2.c (upstream built-in mixer).
+ * Keep the historical desktop stubs guarded away from native ARM64 so
+ * a missing NGS2 export can never silently zero the game's PCM. */
+#ifndef __ANDROID__
 /* --- Silent audio (temporary): libSceNgs2 renders silence, libSceAudio3d accepts objects and
  * paces the audio thread. Real sound will come from the user's own firmware modules. --- */
 typedef struct { uint32_t magic, kind; uint64_t rack_id; } AudioHandle;
@@ -233,6 +237,8 @@ static ABI int32_t ngs2_voice_state(void *voice, void *state, uint64_t size) {
     return 0;
 }
 static ABI int32_t ngs2_voice_flags(void *voice, uint32_t *flags) { (void)voice; if (flags) *flags=0; return 0; }
+#endif /* !__ANDROID__: no silent NGS2 HLE on Android */
+
 static ABI int32_t audio3d_port_open(int32_t user, const void *params, uint32_t *port) {
     (void)user; (void)params;
     if (!port) return (int32_t)0x80ec0004;
@@ -467,12 +473,14 @@ static const RuntimeExport exports[]={
     {"scePngEncDelete",ok_args}, {"scePngEncEncode",png_encode},
     {"sceHttpUriEscape",http_uri_escape}, {"sceHttpGetAllResponseHeaders",net_unavailable},
     {"sceNetGetSockInfo",net_unavailable},
+#ifndef __ANDROID__
     {"sceNgs2SystemCreateWithAllocator",ngs2_system_create}, {"sceNgs2SystemDestroy",ok_args},
     {"sceNgs2SystemRender",ngs2_system_render}, {"sceNgs2RackQueryBufferSize",ngs2_rack_query_buffer_size},
     {"sceNgs2RackCreate",ngs2_rack_create}, {"sceNgs2RackCreateWithAllocator",ngs2_rack_create},
     {"sceNgs2RackDestroy",ok_args}, {"sceNgs2RackGetVoiceHandle",ngs2_rack_voice},
     {"sceNgs2VoiceControl",ok_args}, {"sceNgs2VoiceGetState",ngs2_voice_state},
     {"sceNgs2VoiceGetStateFlags",ngs2_voice_flags},
+#endif /* real mixer must win on Android */
     {"sceAudio3dInitialize",ok_args}, {"sceAudio3dTerminate",ok_ignored},
     {"sceAudio3dPortOpen",audio3d_port_open}, {"sceAudio3dPortClose",ok_args},
     {"sceAudio3dObjectReserve",audio3d_object_reserve}, {"sceAudio3dObjectUnreserve",ok_args},
