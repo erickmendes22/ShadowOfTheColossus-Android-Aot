@@ -1,4 +1,4 @@
-# Shadow of the Colossus Android — Daedalus AOT 0.2.1
+# Shadow of the Colossus Android — Daedalus AOT 0.2.0
 
 [English](README.en.md) · [Créditos completos](CREDITS.md) · [Licença GPL-2.0-or-later](LICENSE)
 
@@ -6,7 +6,7 @@ Port **experimental para Android ARM64** mantido por **[erickmendes22 / Daedalus
 
 > **Não contém jogo, PKGs, arquivos da Sony, chaves nem dumps.** Use sua cópia própria de Shadow of the Colossus (PS4). Projeto não afiliado à Sony Interactive Entertainment ou Bluepoint Games.
 
-## Recursos da versão 0.2.1
+## Recursos da versão 0.2.0
 
 - **Edições no port Android:** CUSA08809 (**EU 1.00**) e CUSA08034 (**US 1.00**), com verificação de hash e bytes do executável antes de aplicar patches. Executáveis diferentes não são aceitos automaticamente.
 - **CPU:** ARM64 AOT nativo, sem FEX e sem TSO; compilação no aparelho, reutilização de perfis válidos após atualização e recompilação somente quando a validação exigir.
@@ -44,7 +44,7 @@ O port Android é uma adaptação derivada das implementações abaixo. Os autor
 
 Os demais colaboradores e avisos estão em **[CREDITS.md](CREDITS.md)** e **[THIRD_PARTY_LICENSES.txt](android-launcher/app/src/main/assets/THIRD_PARTY_LICENSES.txt)**. Licença de código derivado **[GPL-2.0-or-later](LICENSE)** onde aplicável; os componentes de terceiros preservam suas licenças.
 
-## Melhorias 0.2.1
+## Melhorias 0.2.0
 
 A tela inicial exibe a arte original em um banner responsivo, sem cortar o pôster principal. A aba Sobre reúne créditos organizados com links. No menu durante o jogo, a resolução e os patches podem ser alterados com reinício e verificação AOT; a tela cheia e os modos de HUD podem ser alterados imediatamente, sem reiniciar.
 
