@@ -501,6 +501,12 @@ static const struct { const char *nid; void *function; } by_nid[]={
     {"pztV4AF18iI",guest_sincosf}, /* sincosf (libSceLibcInternal, libSceNgs2) */
 };
 uintptr_t runtime_sotc_resolve(const char *name) {
+    /* If the owner supplied firmware libSceNgs2.sprx, its native exports
+     * must be preferred over the original silent fallbacks. */
+    if (runtime_ngs2_native()) {
+        const char *symbol=runtime_symbol(name);
+        if (symbol && !strncmp(symbol,"sceNgs2",7)) return 0;
+    }
     for (size_t i=0;i<sizeof(by_nid)/sizeof(*by_nid);++i)
         if (!strcmp(name,by_nid[i].nid)) return (uintptr_t)by_nid[i].function;
     return RUNTIME_LOOKUP(exports,name);
