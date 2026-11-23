@@ -21,7 +21,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[3]
 EXPECTED_BASE = "0.1.69-aot-ux"
-RELEASE = "0.2.1"
+RELEASE = "0.2.0"
 ROOTPATHS = {
     "sotcport/run-sotc-bionic.sh": ROOT / "ports/sotc/android/run-sotc-bionic.sh",
     "sotcport/scripts/sotc_prepare_game.py": ROOT / "ports/sotc/android/prepare_game.py",
@@ -92,7 +92,7 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
             }
             manifest["gamehub_dd_turnip_bundled"] = True
             manifest["version"] = RELEASE
-            manifest["runtime_name"] = "sotc-daedalus-aot-0.2.1"
+            manifest["runtime_name"] = "sotc-daedalus-aot-0.2.0"
             manifest_bytes = (json.dumps(manifest, indent=2, ensure_ascii=False)+"\n").encode()
             stream = io.BytesIO()
             with tarfile.open(fileobj=stream, mode="w:gz", format=tarfile.GNU_FORMAT) as modified:
@@ -165,7 +165,7 @@ def repack(base_apk: Path, asset_dir: Path, jni_root: Path, driver_zip: Path) ->
         for old in ("gen8", "adreno7xx"):
             if any(f"/drivers/{old}/" in n for n in verify.getnames()):
                 raise ValueError(f"Old {old} driver survived repack")
-    print("PASS 0.2.1: native host/render unchanged; verified GameHub bundled and CUSA08034 patch gate fixed")
+    print("PASS 0.2.0: native host/render unchanged; verified GameHub bundled and CUSA08034 patch gate fixed")
     print(f"Runtime payload: {len(new_payload)} bytes, SHA256 {hashlib.sha256(new_payload).hexdigest()}")
 
 
