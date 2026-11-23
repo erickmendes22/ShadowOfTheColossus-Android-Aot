@@ -71,6 +71,14 @@ jobs:
           git config user.name 'Daedalus Android AOT migration'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
+          # GITHUB_TOKEN cannot push *workflow* files. Commit every source
+          # component now; the SotC 0.2.0 build workflow is created through
+          # the authenticated GitHub app after this migration succeeds.
+          git restore --staged -- .github/workflows/sotc-020-apk.yml .github/workflows/sotc-074-fast-apk.yml
+          if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
+            echo 'Workflow was accidentally staged (forbidden by Actions token)' >&2
+            exit 1
+          fi
           if git diff --cached --quiet; then
             echo 'Source already imported'
           else
