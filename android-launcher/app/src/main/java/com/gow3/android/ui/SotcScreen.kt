@@ -372,8 +372,8 @@ internal fun SotcScreen(tabIndex:Int,onStartGame:()->Unit,onChooseGameFolder:()-
                     Text(if(pt) "SOBRE O PROJETO" else "ABOUT THE PROJECT",
                         color=SotcPalette.accent,fontWeight=FontWeight.Bold)
                     Text(if(pt)
-                        "Port Android experimental com Vulkan e compilação ARM64 nativa no aparelho, baseado no trabalho de AjncSystem para PC."
-                        else "Experimental Android port using Vulkan and native ARM64 compilation on-device, derived from AjncSystem's PC project.",
+                        "Port Android experimental com Vulkan e compilação AOT ARM64 nativa no aparelho, baseado no trabalho de AjncSystem para PC. O jogo utiliza código ARM64 pré-compilado."
+                        else "Experimental Android port using Vulkan and native ARM64 AOT compilation on-device, derived from AjncSystem's PC project. The game runs ahead-of-time compiled ARM64 code.",
                         color=SotcPalette.secondary,fontSize=12.sp)
                     SotcCreditLink(ctx,
                         if(pt) "Projeto original para PC" else "Original PC project",
@@ -394,9 +394,9 @@ internal fun SotcScreen(tabIndex:Int,onStartGame:()->Unit,onChooseGameFolder:()-
                         if(pt) "Supermedo, deadinside28 e colaboradores • base do carregador"
                         else "Supermedo, deadinside28 & contributors • loader foundation",
                         "https://github.com/Supermedo/bloodborne_pc")
-                    SotcCreditLink(ctx,"shadPS4 / Pink-shadPS4",
-                        if(pt) "Renderização Vulkan e correções gráficas"
-                        else "Vulkan rendering and graphics corrections",
+                    SotcCreditLink(ctx,"shadPS4",
+                        if(pt) "Base de renderização Vulkan e colaboradores"
+                        else "Vulkan rendering foundation and contributors",
                         "https://github.com/shadps4-emu/shadPS4")
                     SotcCreditLink(ctx,"Pink-shadPS4",
                         if(pt) "Fork e correções de luizgustavs" else "Fork and fixes by luizgustavs",
@@ -405,10 +405,6 @@ internal fun SotcScreen(tabIndex:Int,onStartGame:()->Unit,onChooseGameFolder:()-
                         if(pt) "ducvd89 e comunidade • referências ARM64/Bionic"
                         else "ducvd89 & community • ARM64/Bionic references",
                         "https://github.com/ducvd89/Bloodborne-Android")
-                    SotcCreditLink(ctx,"fexdroid",
-                        if(pt) "Infraestrutura Android de exibição e controles"
-                        else "Android display and input infrastructure",
-                        "https://github.com/cobrabm12/fexdroid")
                     SotcCreditLink(ctx,"Mesa / Turnip + DD GameHub",
                         if(pt) "Driver Vulkan e componentes do WinlatorComponents"
                         else "Vulkan driver and WinlatorComponents integration",
@@ -418,8 +414,8 @@ internal fun SotcScreen(tabIndex:Int,onStartGame:()->Unit,onChooseGameFolder:()-
                     Text(if(pt) "LICENÇAS E ATRIBUIÇÕES" else "LICENSES & ATTRIBUTIONS",
                         color=SotcPalette.accent,fontWeight=FontWeight.Bold)
                     Text(if(pt)
-                        "Código derivado GPL-2.0-ou-posterior, preservando licenças de terceiros. O aplicativo não distribui arquivos do jogo. Todos os colaboradores originais permanecem creditados."
-                        else "GPL-2.0-or-later derivative code, preserving third-party licenses. No game files are distributed. All original contributors retain their credits.",
+                        "Código derivado GPL-2.0-ou-posterior, com licenças e créditos históricos preservados em CREDITS.md. O aplicativo não distribui arquivos do jogo."
+                        else "GPL-2.0-or-later derivative code; historical attributions and third-party licenses are preserved in CREDITS.md. No game files are distributed.",
                         color=SotcPalette.secondary,fontSize=12.sp)
                     SotcCreditLink(ctx,
                         if(pt) "Ver todos os créditos" else "View all credits",
