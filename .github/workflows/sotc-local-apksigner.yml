@@ -1,0 +1,25 @@
+name: SotC local signing utility (no keys)
+on:
+  push:
+    branches: [fix/sotc-020-native-ngs2-audio]
+    paths: ['.github/workflows/sotc-local-apksigner.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  signer:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: android-actions/setup-android@v3
+      - name: Install Android build-tools 35 apksigner library
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager 'build-tools;35.0.0'
+          test -s "$ANDROID_HOME/build-tools/35.0.0/lib/apksigner.jar"
+          cp "$ANDROID_HOME/build-tools/35.0.0/lib/apksigner.jar" /tmp/apksigner.jar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SotC-Android-apksigner-35-JAR-only-NO-KEYS
+          path: /tmp/apksigner.jar
+          retention-days: 7
